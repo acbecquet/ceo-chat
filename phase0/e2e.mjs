@@ -10,9 +10,10 @@
 //   5. stream the narration into MiniMax streaming TTS → spoken audio   (lib/minimax)
 //
 // CREDS: legs 1-4 run for real with no API key (speakability falls back to the
-// locally-authenticated `claude -p`). Leg 5 needs MINIMAX_API_KEY + GroupId; if
-// blank, we still produce the narration and STUB only the MiniMax call with a
-// clear TODO + run instructions (per task spec).
+// locally-authenticated `claude -p`). Leg 5 attempts the live MiniMax call
+// whenever MINIMAX_API_KEY is present (even if GroupId is blank, like spike1);
+// only a missing MINIMAX_API_KEY STUBs the call — we still produce the narration
+// and print a clear TODO + run instructions (per task spec).
 //
 // RUN:   node phase0/e2e.mjs ["typed text to send to firstmate"]
 // OUT:   phase0/out/e2e-narration.txt  (+ e2e.wav when MiniMax creds present)
