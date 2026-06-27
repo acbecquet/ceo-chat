@@ -157,7 +157,7 @@ export function tailTranscript(path, onEvent, { startOffset = 0, opts } = {}) {
     if (size <= offset) return;
     const fd = readFileSync(path); // simple + fine for spike-scale files
     const chunk = fd.subarray(offset).toString('utf8');
-    offset = size;
+    offset = fd.length;
     buf += chunk;
     const lines = buf.split('\n');
     buf = lines.pop(); // keep trailing partial
