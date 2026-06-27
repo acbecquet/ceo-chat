@@ -225,6 +225,10 @@ export function synthStreaming(opts: SynthOptions): Promise<SynthResult> {
 
     ws.addEventListener('error', (e: { message?: string; error?: { message?: string } }) =>
       fail(new Error('ws error: ' + (e.error?.message || e.message || 'connection failed before any frame'))));
-    ws.addEventListener('close', () => clearTimeout(timer));
+    ws.addEventListener('close', () => {
+      if (settled) { clearTimeout(timer); return; }
+      if (frames > 0) done();
+      else fail(new Error('MiniMax closed before completing the task'));
+    });
   });
 }
