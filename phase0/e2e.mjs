@@ -128,20 +128,18 @@ process.exit(exitCode);
 // returns to idle (turn complete), then return the concatenated new say text.
 async function waitForReply(transcript, sayBefore, { timeoutMs }) {
   const start = performance.now();
-  let lastSeen = sayBefore;
   while (performance.now() - start < timeoutMs) {
     const says = parseTranscript(transcript).filter((e) => e.kind === 'say');
-    if (says.length > lastSeen) {
+    if (says.length > sayBefore) {
       // give the turn a beat to finish, then confirm the harness is idle again
       // (claude shows "esc to interrupt" while a turn is still streaming).
       await sleep(2000);
       const pane = capturePane();
       const idle = !/esc to interrupt/i.test(pane);
       const after = parseTranscript(transcript).filter((e) => e.kind === 'say');
-      if (after.length >= says.length && idle) {
+      if (after.length > sayBefore && idle) {
         return after.slice(sayBefore).map((e) => e.text).join('\n').trim();
       }
-      lastSeen = says.length;
     }
     await sleep(1000);
   }

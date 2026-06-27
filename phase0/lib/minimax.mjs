@@ -146,7 +146,6 @@ export function synthStreaming({
           ws.send(JSON.stringify({ event: 'task_continue', text: t }));
         }
         ws.send(JSON.stringify({ event: 'task_finish' }));
-        return;
       }
 
       // Audio frames can ride on task_started or task_continue events.
