@@ -1,0 +1,16 @@
+{
+  "name": "ceo-chat-phase0",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 0 de-risking spikes for ceo-chat (MiniMax TTS, transcript tap, fm-send injection, e2e).",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "spike1": "node spike1-minimax-tts.mjs",
+    "spike2": "node spike2-transcript-tap.mjs",
+    "spike3": "node spike3-fm-send.mjs",
+    "e2e": "node e2e.mjs"
+  }
+}
