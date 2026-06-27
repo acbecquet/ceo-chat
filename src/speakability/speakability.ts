@@ -78,8 +78,11 @@ export async function speakify(
 
 const URL_RE = /\bhttps?:\/\/[^\s)]+/gi;
 const CODE_SPAN_RE = /`[^`]+`/g;
-// A path-ish token: has a slash and looks like a file/dir (not a sentence).
-const PATH_RE = /(?:\.{0,2}\/)?(?:[\w.-]+\/)+[\w.-]+(?:\.\w+)?/g;
+// A real file/dir path, NOT ordinary slash-joined English (read/write, TCP/IP).
+// Requires a strong signal: a leading ./ ../ or / dir marker, OR a slashed token
+// ending in a real file extension (e.g. src/server.ts).
+const PATH_RE =
+  /(?<![\w/])(?:\.{1,2}\/|\/)[\w.-]+(?:\/[\w.-]+)*|(?<![\w/])(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]\w*/g;
 const ON_SCREEN = 'on your screen';
 const DECISION_RE =
   /\b(merge|deploy|delete|drop|push|revert|confirm|approve|proceed|cancel|overwrite|yes\b|no\b|should i|want me to|shall i|ok to)\b/i;
@@ -89,7 +92,7 @@ export function dropForVoice(input: string): string {
   let s = input;
   s = s.replace(CODE_SPAN_RE, ON_SCREEN);
   s = s.replace(URL_RE, ON_SCREEN);
-  s = s.replace(PATH_RE, (m) => (m.includes('/') ? ON_SCREEN : m));
+  s = s.replace(PATH_RE, ON_SCREEN);
   // collapse "on your screen, and on your screen" style repeats
   s = s.replace(/(on your screen)(\W+on your screen)+/gi, ON_SCREEN);
   s = s.replace(/[ \t]{2,}/g, ' ').trim();
