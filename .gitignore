@@ -5,11 +5,16 @@
 .env.*
 secrets.env
 
-# Generated audio output from the spikes
+# Generated audio + narration output (spikes and the broker)
 phase0/out/
+out/
 *.wav
 *.pcm
 
 # Node
 node_modules/
 npm-debug.log*
+
+# TypeScript build artifacts (we run .ts directly on Node >=22; build is typecheck)
+dist/
+*.tsbuildinfo
