@@ -19,7 +19,8 @@ streaming TTS. Decision-ready plan:
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
   (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `ANTHROPIC_API_KEY`). Never hardcode or
-  commit. `.gitignore` covers `*.env`, `phase0/out/`, `*.wav`/`*.pcm`, `node_modules/`.
+  commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
+  `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
 
 ## MiniMax integration gotchas (CONFIRMED live, 2026-06-27)
 - International platform only: `wss://api.minimax.io/ws/v1/t2a_v2` (NOT `minimaxi.com`).
