@@ -1,0 +1,15 @@
+# Local env / secrets — secrets live OUTSIDE the repo (~/.config/ceo-chat/secrets.env)
+# but never let a stray copy get committed.
+*.env
+.env
+.env.*
+secrets.env
+
+# Generated audio output from the spikes
+phase0/out/
+*.wav
+*.pcm
+
+# Node
+node_modules/
+npm-debug.log*
