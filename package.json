@@ -1,0 +1,28 @@
+{
+  "name": "ceo-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phone-call-style voice interface to firstmate: text-in -> firstmate -> transcript tap -> speakability rewrite -> MiniMax TTS -> audio out.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "validate": "node test/validate.ts",
+    "validate:live": "node test/validate.ts --live",
+    "dev": "node src/cli/dev.ts",
+    "start": "node src/cli/dev.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "node test/validate.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}

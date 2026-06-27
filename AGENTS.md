@@ -19,7 +19,8 @@ streaming TTS. Decision-ready plan:
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
   (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `ANTHROPIC_API_KEY`). Never hardcode or
-  commit. `.gitignore` covers `*.env`, `phase0/out/`, `*.wav`/`*.pcm`, `node_modules/`.
+  commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
+  `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
 
 ## MiniMax integration gotchas (CONFIRMED live, 2026-06-27)
 - International platform only: `wss://api.minimax.io/ws/v1/t2a_v2` (NOT `minimaxi.com`).
@@ -63,8 +64,41 @@ streaming TTS. Decision-ready plan:
 ## Phase 0 spikes
 - `phase0/` — runnable, zero-dependency (Node ≥22 global `WebSocket`/`fetch`). Run
   `node phase0/spike{1,2,3}-*.mjs` or `node phase0/e2e.mjs`; see `phase0/README.md` and
-  `phase0/FINDINGS.md`. The `phase0/lib/` modules encode every gotcha above and are the
-  intended starting point for the Phase 1 broker.
+  `phase0/FINDINGS.md`. The `phase0/lib/` modules encode every gotcha above and are
+  PRESERVED as the historical record; the live code is now the `src/` port below.
+
+## Phase 1 — integrated product + validation harness (TypeScript, `src/`)
+- **Runtime:** Node ≥22 runs `.ts` directly (type-stripping) — `npm run dev`/`validate`
+  invoke `node *.ts`, no build step. Constraints: NO `enum`, NO parameter properties,
+  NO namespaces (strip-only mode rejects them); relative imports MUST use the `.ts`
+  extension. `npm run build`/`lint`/`typecheck` are all `tsc --noEmit`.
+- **One injected pipeline.** `src/broker/pipeline.ts#runPipeline` is the single
+  orchestration (inject → readReply → speakify → synth). Both the product
+  (`src/broker/broker.ts`) and the harness drive the SAME function with different
+  injected deps — the harness tests real integration, not a parallel copy.
+- **Mock MiniMax server is a product component** (`src/tts/mock-server.ts`, uses `ws`):
+  speaks the real WS protocol (Bearer header, GroupId query, hex PCM, task_start/
+  continue/finish) and returns synthetic sine PCM. The broker stands it up as the
+  creds-free TTS backend, AND `npm run validate` asserts the protocol against it.
+- **Speakability has a `mock` backend** (`src/speakability/speakability.ts#mockSpeakify`):
+  a deterministic rule-based rewriter encoding the §7.3 contract (drop code/paths/URLs
+  → "on your screen", keep questions/decisions, ≤3 sentences). It is the offline
+  reference the harness asserts; `--live`/product use anthropic-api or claude-cli.
+- **Reply latch / fm-send / tail are injectable** so regressions test them deterministically:
+  `transcript/reply.ts#waitForReply` (readSays/isIdle/now/sleep injected),
+  `session/session.ts#verifiedSubmit` (sendOnce/holdsText/clear/sleep injected).
+- **Broker safety:** owns a dedicated `ceo-chat` tmux session in a temp cwd, refuses to
+  start if one exists, tears down on SIGINT/SIGTERM. `--mock`/`CEOCHAT_MOCK=1` forces
+  the fully-offline path (mock TTS + mock speak) even when creds exist.
+
+## Validation harness — `npm run validate` (the gate)
+- `test/validate.ts`: per-leg PASS/FAIL/PENDING/SKIP report. MUST be green in mock mode
+  (no creds, no network) before shipping. Legs: config, transcript, speakability,
+  MiniMax protocol, full e2e. Regressions: the 3 fixed bugs + fm-send false-negative.
+  Edge cases: drop-code/keep-question, confirmation flow, long-op/thinking.
+- `--live` (`npm run validate:live`): runs the same legs against real services where
+  `~/.config/ceo-chat/secrets.env` has creds; the live MiniMax leg reports **PENDING**
+  (not FAIL) on 1004/1008/transport errors until the captain pairs creds at home.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.
