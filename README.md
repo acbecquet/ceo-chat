@@ -29,7 +29,7 @@ your REAL first mate in tmux (CEOCHAT_TARGET)    ← attach mode; or a dedicated
    │  transcript JSONL tap  (prompt-anchored)  ← clean source, not the scraped TUI
    ▼
 agent reply (clean assistant text)
-   │  speakability rewrite  (Haiku-class LLM)   ← drop code/paths/URLs, keep questions
+   │  speakability rewrite  (Gemini Flash / Haiku LLM)  ← drop code/paths/URLs, keep questions
    ▼
 ≤2–3 spoken sentences
    │  MiniMax streaming TTS  (hex PCM → WAV)     ← voice-OUT
@@ -209,7 +209,7 @@ It covers:
 
 | Group | What it asserts |
 |---|---|
-| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
+| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · **Gemini backend (selection precedence, request shape incl. `thinkingBudget:0`, fail-safe fallback; faked HTTP)** · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Streaming & robustness** | prompt-anchored transcript tap (ignores concurrent sessions in a shared project dir) · incremental speakable units (audio starts mid-turn) · `runStreamingPipeline` emits chunks before completion + aborts on barge-in · benign-modal auto-dismiss · web progressive chunks + `notice` + reconnect replay |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
@@ -251,9 +251,13 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
   speech, no key; else the mock synthetic tone (still a real, playable WAV). `--mock`
   (or `CEOCHAT_MOCK=1`) forces the mock tone even when creds/voice exist — handy for
   exercising the firstmate/transcript legs without depending on live MiniMax.
-- **Speakability backend is automatic.** `ANTHROPIC_API_KEY` present → Anthropic
-  Messages API; otherwise the locally-authenticated `claude -p` pure-rewriter
-  fallback.
+- **Speakability backend is automatic.** Precedence: `GEMINI_API_KEY` present →
+  Google Gemini Flash (`gemini-2.5-flash`) — the PREFERRED rewriter (fast, free-tier,
+  no Anthropic key, the hub default); else `ANTHROPIC_API_KEY` present → Anthropic
+  Messages API; else the locally-authenticated `claude -p` pure-rewriter (whole-turn)
+  or the deterministic rule-based rewriter (streaming path). `--mock`/`CEOCHAT_MOCK=1`
+  forces the rule-based rewriter. The Gemini backend fails SAFE per chunk: any
+  error/timeout falls back to the rule-based rewriter so speech never breaks.
 
 ### Detailed manual testing
 
@@ -271,6 +275,8 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    ```env
    MINIMAX_API_KEY=...
    MINIMAX_GROUP_ID=...
+   # optional — the PREFERRED speakability backend (fast, free-tier, no Anthropic key):
+   GEMINI_API_KEY=...
    # optional — switches speakability to the Anthropic Messages API:
    ANTHROPIC_API_KEY=...
    ```
@@ -292,7 +298,7 @@ src/
   session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror + benign-modal dismiss
   transcript/transcript.ts JSONL tap (normalize/parse/tail; prompt-anchored resolution)
   transcript/reply.ts      reply-wait latch + incremental streamReply (injectable, regression-guarded)
-  speakability/            rewrite-for-the-ear (anthropic-api | claude-cli | mock)
+  speakability/            rewrite-for-the-ear (gemini | anthropic-api | claude-cli | mock)
   tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec)
   tts/local-tts.ts         LOCAL piper neural voice — the default offline TTS
   tts/mock-server.ts       in-process MiniMax mock (real protocol, synthetic PCM)
