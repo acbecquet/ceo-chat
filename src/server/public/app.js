@@ -232,7 +232,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   // ---- mic button + server STT (tap-to-talk fallback) ----
   els.micToggle.addEventListener('click', function () {
     micWanted = !micWanted;
-    if (micWanted) { if (webSpeechOk) speech.start(); } else { speech.pause(); stopServerCapture(); }
+    if (micWanted) { if (webSpeechOk) speech.start(); } else { speech.stop(); stopServerCapture(); }
     refreshMicUi();
   });
   els.mic.addEventListener('click', function () {
@@ -260,6 +260,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
       capSource = capCtx.createMediaStreamSource(capStream);
       capNode = new AudioWorkletNode(capCtx, 'ceo-capture');
       capNode.port.onmessage = function (e) {
+        if (audio.speaking) return;                         // half-duplex: don't record first mate's reply
         var f32 = e.data;                                   // Float32 at capCtx.sampleRate
         var down = downsampleFloat32(f32, capCtx.sampleRate, STT_SAMPLE_RATE);
         sendJson({ type: 'stt-audio', pcm: bytesToBase64(float32ToPcmS16le(down)), sampleRate: STT_SAMPLE_RATE });
