@@ -18,7 +18,7 @@
 import { mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../config/secrets.ts';
+import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, type Secrets } from '../config/secrets.ts';
 import {
   spawnCeoChat, attachTarget, resolveTargetFromEnv, teardown, waitForComposer, fmSend,
   capturePane, capturePaneAnsi, sendKey, dismissBenignModals, sleep,
@@ -29,7 +29,7 @@ import {
   latestTranscriptWithPrompt, findPromptAnchor, saysAfterAnchor,
 } from '../transcript/transcript.ts';
 import { streamReply } from '../transcript/reply.ts';
-import { speakify, type SpeakabilityBackend } from '../speakability/speakability.ts';
+import { speakify, GEMINI_MODEL, type SpeakabilityBackend } from '../speakability/speakability.ts';
 import { synthStreaming, toWav, INTL_WS, DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
 import { findPiper, synthLocal, type LocalVoice } from '../tts/local-tts.ts';
 import {
@@ -39,6 +39,16 @@ import { startMockMinimax, type MockMinimax } from '../tts/mock-server.ts';
 import type { TtsMode } from '../server/protocol.ts';
 
 export type { TtsMode };
+
+// Pure precedence for the PROGRESSIVE/streaming speakability backend (exported so the
+// validation harness can assert it without disk secrets). Gemini Flash is PREFERRED on
+// hub — fast, free-tier, no Anthropic key needed; then the Anthropic API; else the
+// deterministic rule-based rewriter. `--mock`/CEOCHAT_MOCK forces 'mock'.
+export function pickStreamSpeakBackend(secrets: Secrets, forceMock: boolean): SpeakabilityBackend {
+  if (forceMock) return 'mock';
+  if (hasGeminiCreds(secrets)) return 'gemini';
+  return has(secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'mock';
+}
 
 export interface BrokerOptions {
   outDir: string;
@@ -86,17 +96,18 @@ export class Broker {
 
   // The speakability backend used for the PROGRESSIVE/streaming path. We deliberately
   // avoid `claude -p` here: spawning it per speakable unit costs seconds each and would
-  // defeat the whole point of incremental speak. So: Anthropic API when a key is paired
-  // (fast, best rewrite), otherwise the deterministic rule-based rewriter (instant, and
-  // it still honors the §7.3 contract — drops code/paths/URLs, keeps questions). The
-  // mock tone path forces 'mock' too.
+  // defeat the whole point of incremental speak. Precedence: Gemini Flash when a key is
+  // paired (fast, free-tier, no Anthropic key — the hub default and PREFERRED), else
+  // Anthropic API, else the deterministic rule-based rewriter (instant, still honors the
+  // §7.3 contract — drops code/paths/URLs, keeps questions). Gemini fails SAFE per chunk
+  // (errors fall back to the rule rewriter). The mock tone path forces 'mock' too.
   private streamSpeakBackend(): SpeakabilityBackend {
-    if (this.forceMock) return 'mock';
-    return has(this.secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'mock';
+    return pickStreamSpeakBackend(this.secrets, this.forceMock);
   }
 
   speakBackendHint(): string {
-    return this.streamSpeakBackend();
+    const backend = this.streamSpeakBackend();
+    return backend === 'gemini' ? `gemini (${GEMINI_MODEL})` : backend;
   }
 
   /** Human label of the TTS voice/backend in use (for logs + the UI). */
@@ -189,6 +200,7 @@ export class Broker {
       streamReply: (onUnit) => this.streamReplyFor(target, typed, () => baselineTs, onUnit, opts.signal),
       speakify: (text) => speakify(text, {
         apiKey: has(this.secrets, 'ANTHROPIC_API_KEY') ? this.secrets.ANTHROPIC_API_KEY : null,
+        geminiApiKey: hasGeminiCreds(this.secrets) ? this.secrets.GEMINI_API_KEY : null,
         backend: this.streamSpeakBackend(),
         log: this.log,
       }),

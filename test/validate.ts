@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../src/config/secrets.ts';
+import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, type Secrets } from '../src/config/secrets.ts';
 import {
   parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
   findPromptAnchor, saysAfterAnchor, latestTranscriptWithPrompt,
@@ -26,7 +26,10 @@ import {
 import { waitForReply, streamReply, splitCompleteUnits } from '../src/transcript/reply.ts';
 import { runStreamingPipeline, type PipelineChunk as PipelineChunkT } from '../src/broker/pipeline.ts';
 import { detectBenignModal, dismissBenignModals } from '../src/session/session.ts';
-import { speakify, mockSpeakify } from '../src/speakability/speakability.ts';
+import {
+  speakify, mockSpeakify, geminiRequestBody, GEMINI_MODEL, GEMINI_ENDPOINT,
+} from '../src/speakability/speakability.ts';
+import { pickStreamSpeakBackend } from '../src/broker/broker.ts';
 import {
   synthStreaming, toWav, wavHeader, INTL_WS, type SynthResult,
 } from '../src/tts/minimax.ts';
@@ -145,6 +148,82 @@ await reporter.leg('speakability — rewrite for the ear (backend wiring)', asyn
   t.ok(sentenceCount(narration) <= 3, '<= 3 spoken sentences', `got ${sentenceCount(narration)}`);
   const empty = await speakify('   ', { backend: 'mock' });
   t.eq(empty.backend, 'noop', 'empty input -> noop (nothing to speak)');
+});
+
+// ───────────── leg 3b: Gemini speakability backend (faked HTTP) ──────────────
+// The PREFERRED streaming rewriter on hub. Asserted against a faked fetch — NO real
+// Gemini network call — for: backend-selection precedence, the documented request
+// shape (thinkingBudget:0!), a clean spoken result, and the fail-safe fallback.
+await reporter.leg('speakability — Gemini backend (selection, request shape, fail-safe)', async (t) => {
+  // 1) streaming backend precedence (pure; no disk secrets, no network).
+  t.eq(pickStreamSpeakBackend({ GEMINI_API_KEY: 'g' }, false), 'gemini',
+    'GEMINI_API_KEY set -> gemini (preferred)');
+  t.eq(pickStreamSpeakBackend({ GEMINI_API_KEY: 'g', ANTHROPIC_API_KEY: 'a' }, false), 'gemini',
+    'gemini wins over anthropic when both present');
+  t.eq(pickStreamSpeakBackend({ ANTHROPIC_API_KEY: 'a' }, false), 'anthropic-api',
+    'no gemini key -> anthropic-api');
+  t.eq(pickStreamSpeakBackend({}, false), 'mock', 'no keys -> rule-based mock');
+  t.eq(pickStreamSpeakBackend({ GEMINI_API_KEY: 'g' }, true), 'mock', '--mock overrides everything');
+  t.ok(hasGeminiCreds({ GEMINI_API_KEY: 'g' }) && !hasGeminiCreds({}), 'hasGeminiCreds present vs absent');
+
+  // 2) the gemini backend against a faked HTTP response (the model's clean spoken text).
+  let sentUrl = '';
+  let sentBody: { generationConfig: { thinkingConfig: { thinkingBudget: number }; maxOutputTokens: number };
+    contents: Array<{ parts: Array<{ text: string }> }> } | null = null;
+  let sentHeaders: Record<string, string> = {};
+  const okFetch = (async (url: string, init: { body: string; headers: Record<string, string> }) => {
+    sentUrl = url;
+    sentBody = JSON.parse(init.body);
+    sentHeaders = init.headers;
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text:
+          'I opened a pull request that refactors the broker. All tests passed.' }] } }],
+        finishReason: 'STOP',
+      }),
+      text: async () => '',
+    };
+  }) as unknown as typeof fetch;
+
+  const good = await speakify(SAMPLE_AGENT_TURN, {
+    backend: 'gemini', geminiApiKey: 'fake-key', fetchImpl: okFetch,
+  });
+  t.eq(good.backend, 'gemini', 'gemini backend used when key present');
+  t.ok(good.narration.length > 0, 'non-empty narration from gemini');
+  t.ok(sentenceCount(good.narration) <= 3, '<= 3 spoken sentences', `got ${sentenceCount(good.narration)}`);
+  t.notIncludes(good.narration, 'http', 'spoken output has no URL');
+  t.notIncludes(good.narration, '/', 'spoken output has no file path / slash');
+  t.notIncludes(good.narration, '`', 'spoken output has no code span');
+
+  // 3) the documented request shape (the live-verified gotcha: thinking MUST be off).
+  t.eq(sentUrl, `${GEMINI_ENDPOINT}/${GEMINI_MODEL}:generateContent`, 'posts to gemini-2.5-flash:generateContent');
+  t.eq(sentBody!.generationConfig.thinkingConfig.thinkingBudget, 0,
+    'thinkingBudget:0 sent (CRITICAL — else truncated/empty text)');
+  t.eq(sentBody!.generationConfig.maxOutputTokens, 200, 'maxOutputTokens:200 sent');
+  t.ok(typeof sentBody!.contents?.[0]?.parts?.[0]?.text === 'string',
+    'documented contents[].parts[].text body shape');
+  t.eq(sentHeaders['x-goog-api-key'], 'fake-key', 'api key in x-goog-api-key header (never the body)');
+  const body = geminiRequestBody('hi') as { generationConfig: { thinkingConfig: { thinkingBudget: number } } };
+  t.eq(body.generationConfig.thinkingConfig.thinkingBudget, 0, 'geminiRequestBody() disables thinking');
+
+  // 4) FAIL SAFE: a Gemini error falls back to the rule-based rewriter, no throw.
+  const errFetch = (async () => { throw new Error('network down'); }) as unknown as typeof fetch;
+  const fellBack = await speakify(SAMPLE_AGENT_TURN, {
+    backend: 'gemini', geminiApiKey: 'fake-key', fetchImpl: errFetch,
+  });
+  t.eq(fellBack.backend, 'mock', 'gemini error -> rule-based fallback (no throw)');
+  t.ok(fellBack.narration.length > 0, 'fallback still produces speakable narration');
+  t.notIncludes(fellBack.narration, 'https://example.com/pr/42', 'fallback still drops URLs');
+
+  // a non-200 (e.g. rate limit) also falls back rather than throwing.
+  const badFetch = (async () => ({
+    ok: false, status: 429, text: async () => 'rate limited', json: async () => ({}),
+  })) as unknown as typeof fetch;
+  const rateLimited = await speakify('Quick update from the agent.', {
+    backend: 'gemini', geminiApiKey: 'k', fetchImpl: badFetch,
+  });
+  t.eq(rateLimited.backend, 'mock', 'non-200 -> rule-based fallback');
 });
 
 // ─────────────────── leg 4: MiniMax TTS protocol (mock server) ──────────────

@@ -6,6 +6,10 @@
 // while preserving meaning and any question/decision the captain must answer.
 //
 // Backends (selected by `backend`, default 'auto'):
+//   gemini        : Google Gemini Flash (gemini-2.5-flash) — the PREFERRED streaming
+//                   rewriter on hub (fast, free-tier, no Anthropic key). Fails SAFE:
+//                   any error/timeout falls back to the rule-based rewriter for that
+//                   chunk so speech never breaks.
 //   anthropic-api : Anthropic Messages API, Haiku-class — the production path.
 //   claude-cli    : local `claude -p` as a PURE rewriter — hub fallback (no key).
 //   mock          : deterministic, offline rule-based rewriter — the CONTRACT
@@ -32,18 +36,34 @@ export const SYSTEM_PROMPT =
 // Haiku-class model id. Latest small Claude at build time.
 export const SPEAKABILITY_MODEL = 'claude-haiku-4-5';
 
-export type SpeakabilityBackend = 'auto' | 'anthropic-api' | 'claude-cli' | 'mock';
+// Google Gemini Flash — the streaming rewriter on hub. gemini-2.5-flash "thinks" by
+// default, which consumes the output budget and yields truncated/empty text — so we
+// DISABLE it (thinkingConfig.thinkingBudget = 0). See geminiRequestBody().
+export const GEMINI_MODEL = 'gemini-2.5-flash';
+export const GEMINI_ENDPOINT =
+  'https://generativelanguage.googleapis.com/v1beta/models';
+// Per-chunk network timeout: incremental speak must stay low-latency, so a slow/hung
+// Gemini call aborts and falls back to the rule-based rewriter rather than stalling.
+export const GEMINI_TIMEOUT_MS = 8000;
+
+export type SpeakabilityBackend = 'auto' | 'gemini' | 'anthropic-api' | 'claude-cli' | 'mock';
 
 export interface SpeakifyOptions {
   apiKey?: string | null;
+  /** Google Gemini API key — gates the 'gemini' backend. Never hardcoded/committed. */
+  geminiApiKey?: string | null;
   model?: string;
   backend?: SpeakabilityBackend;
+  /** Injected fetch (defaults to global). Lets `npm run validate` fake the HTTP. */
+  fetchImpl?: typeof fetch;
+  /** Per-call network timeout for the Gemini backend. */
+  timeoutMs?: number;
   log?: (msg: string) => void;
 }
 
 export interface SpeakifyResult {
   narration: string;
-  backend: 'anthropic-api' | 'claude-cli' | 'mock' | 'noop';
+  backend: 'gemini' | 'anthropic-api' | 'claude-cli' | 'mock' | 'noop';
 }
 
 // Returns { narration, backend }. Throws only if a chosen network backend fails.
@@ -51,17 +71,38 @@ export async function speakify(
   agentTurnText: string,
   opts: SpeakifyOptions = {},
 ): Promise<SpeakifyResult> {
-  const { apiKey, model = SPEAKABILITY_MODEL, backend = 'auto' } = opts;
+  const { apiKey, geminiApiKey, model = SPEAKABILITY_MODEL, backend = 'auto' } = opts;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? GEMINI_TIMEOUT_MS;
   const log = opts.log ?? (() => {});
   const text = (agentTurnText || '').trim();
   if (!text) return { narration: '', backend: 'noop' };
 
+  // auto precedence: Gemini (preferred, fast/free) -> Anthropic API -> local claude -p.
   const resolved: SpeakabilityBackend =
-    backend !== 'auto' ? backend : apiKey ? 'anthropic-api' : 'claude-cli';
+    backend !== 'auto' ? backend
+      : geminiApiKey ? 'gemini'
+      : apiKey ? 'anthropic-api'
+      : 'claude-cli';
 
   if (resolved === 'mock') {
     log('speakability: mock (deterministic, offline)');
     return { narration: mockSpeakify(text), backend: 'mock' };
+  }
+  if (resolved === 'gemini') {
+    if (!geminiApiKey) throw new Error('gemini backend requires GEMINI_API_KEY');
+    const geminiModel = opts.model ?? GEMINI_MODEL;
+    log('speakability: Gemini API (' + geminiModel + ')');
+    // FAIL SAFE: on any error/timeout, fall back to the deterministic rewriter for this
+    // chunk so the spoken stream never breaks. The failure is logged (broker diagnostics).
+    try {
+      const narration = await viaGemini(text, geminiApiKey, geminiModel, fetchImpl, timeoutMs);
+      return { narration: narration.trim(), backend: 'gemini' };
+    } catch (e) {
+      log('speakability: Gemini failed (' + (e as Error).message +
+        ') — falling back to rule-based rewriter');
+      return { narration: mockSpeakify(text), backend: 'mock' };
+    }
   }
   if (resolved === 'anthropic-api') {
     if (!apiKey) throw new Error('anthropic-api backend requires ANTHROPIC_API_KEY');
@@ -124,6 +165,56 @@ export function mockSpeakify(text: string): string {
 }
 
 // ---- network backends -------------------------------------------------------
+
+// The Gemini request body, exactly as VERIFIED working live (2026-06-28). The system
+// instruction is folded into the single prompt part. thinkingConfig.thinkingBudget = 0
+// is CRITICAL: gemini-2.5-flash thinks by default, eating the output budget and
+// returning truncated/empty text. maxOutputTokens/temperature keep it short + steady.
+export function geminiRequestBody(text: string): unknown {
+  return {
+    contents: [
+      { parts: [{ text: SYSTEM_PROMPT + '\n\n<agent-turn>\n' + text + '\n</agent-turn>' }] },
+    ],
+    generationConfig: {
+      maxOutputTokens: 200,
+      temperature: 0.3,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  };
+}
+
+// POST to the Gemini generateContent endpoint. Key goes in the x-goog-api-key header
+// (equivalent to ?key=…). Aborts after timeoutMs so a hung call can't stall the stream.
+async function viaGemini(
+  text: string,
+  apiKey: string,
+  model: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<string> {
+  const url = `${GEMINI_ENDPOINT}/${model}:generateContent`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify(geminiRequestBody(text)),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
+    const data = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const out = (data.candidates?.[0]?.content?.parts || [])
+      .map((p) => p.text ?? '')
+      .join('');
+    if (!out.trim()) throw new Error('Gemini returned empty text');
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function viaApi(text: string, apiKey: string, model: string): Promise<string> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {

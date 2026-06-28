@@ -20,7 +20,8 @@ streaming TTS. Decision-ready plan:
 
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
-  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `ANTHROPIC_API_KEY`). Never hardcode or
+  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
+  Never hardcode or
   commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
   `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
 
@@ -355,6 +356,37 @@ streaming TTS. Decision-ready plan:
   sessions), incremental speakable units (audio starts mid-turn), runStreamingPipeline emits
   chunks before completion + abort, benign-modal auto-dismiss, and web progressive-chunks +
   notice + reconnect replay. The real-audio e2e (piper→whisper) leg still passes.
+
+## Phase 6 — Gemini speakability backend (the hub default for streaming rewrite)
+- **`gemini` is the PREFERRED streaming speakability backend** (`src/speakability/
+  speakability.ts`). On hub there is no Anthropic API key, so the incremental/streaming
+  spoken-summary path used to fall back to the deterministic rule rewriter (`mock`).
+  Google Gemini Flash gives LLM-quality summaries for free, no Anthropic key.
+- **Streaming precedence** (`pickStreamSpeakBackend` in `src/broker/broker.ts`, exported
+  pure + asserted by validate): `--mock`/`CEOCHAT_MOCK` → `mock`; else `GEMINI_API_KEY`
+  present → `gemini`; else `ANTHROPIC_API_KEY` present → `anthropic-api`; else `mock`.
+  The whole-turn `speakify` `'auto'` resolution mirrors it (gemini → anthropic-api →
+  claude-cli). `speakBackendHint()`/startup log/UI show `gemini (gemini-2.5-flash)`.
+- **Endpoint:** `POST https://generativelanguage.googleapis.com/v1beta/models/
+  gemini-2.5-flash:generateContent`. Key via `x-goog-api-key: $GEMINI_API_KEY` header
+  (equivalently `?key=`). Response text: `candidates[0].content.parts[0].text`,
+  `finishReason: STOP`.
+- **CRITICAL gotcha — disable thinking.** gemini-2.5-flash "thinks" by default, which
+  eats the output budget and returns truncated/empty text. MUST send
+  `generationConfig.thinkingConfig.thinkingBudget = 0` (also `maxOutputTokens: 200`,
+  `temperature: 0.3`). The exact body is `geminiRequestBody()`; the §7.3 SYSTEM_PROMPT is
+  folded into the single `contents[].parts[].text`. Body shape + thinkingBudget:0 are
+  asserted by the validate leg against a faked fetch.
+- **Fail-safe per chunk.** `speakify(backend:'gemini')` NEVER throws on a network/HTTP
+  error or timeout (`GEMINI_TIMEOUT_MS`, AbortController): it logs and returns the
+  rule-based `mockSpeakify` rewrite (`backend:'mock'`) so the incremental spoken stream
+  never breaks. Low-latency by design (thinking off, short output, hard timeout).
+- **`GEMINI_API_KEY`** lives in the gitignored `~/.config/ceo-chat/secrets.env` (loaded
+  by `src/config/secrets.ts`, `hasGeminiCreds()`). Never hardcode/commit/echo it.
+- **DI for tests:** `SpeakifyOptions.fetchImpl` (defaults to global `fetch`) +
+  `geminiApiKey`/`timeoutMs` keep the backend DOM-free; `npm run validate` exercises
+  selection, request shape, clean output, and the fail-safe fallback with a faked HTTP —
+  NO real Gemini call. MiniMax stays off; piper TTS + whisper STT remain the voice stack.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

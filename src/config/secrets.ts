@@ -2,7 +2,7 @@
 //
 // Secrets live at ~/.config/ceo-chat/secrets.env (KEY=value, one per line). They
 // are NEVER committed and NEVER hardcoded. The broker loads them here. Recognized
-// names: MINIMAX_API_KEY, MINIMAX_GROUP_ID, ANTHROPIC_API_KEY.
+// names: MINIMAX_API_KEY, MINIMAX_GROUP_ID, ANTHROPIC_API_KEY, GEMINI_API_KEY.
 //
 // A blank/absent key does NOT throw — callers decide whether to run the real
 // credentialed call or gracefully fall back to the mock path. This is what lets
@@ -49,4 +49,11 @@ export function has(secrets: Secrets, key: string): boolean {
 // recommended but empirically not strictly required for WS auth — plan §6.1.)
 export function hasMinimaxCreds(secrets: Secrets): boolean {
   return has(secrets, 'MINIMAX_API_KEY');
+}
+
+// Is the Google Gemini speakability key available? It gates the PREFERRED streaming
+// rewriter on hub (fast, free-tier, no Anthropic key needed) — see the 'gemini'
+// backend in src/speakability/speakability.ts.
+export function hasGeminiCreds(secrets: Secrets): boolean {
+  return has(secrets, 'GEMINI_API_KEY');
 }
