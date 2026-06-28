@@ -203,6 +203,15 @@ export class Broker {
   // Wait for the COMPLETE agent reply on the transcript tap (idle latch). `baseline`
   // is the say-count captured just before this turn's inject, so we read only the
   // new say blocks this turn produced.
+  //
+  // The transcript can ALSO rotate mid-turn: the captain types /clear as the turn
+  // injects, or auto-compaction / a new session UUID starts a fresh JSONL while the
+  // agent is replying. So readSays re-resolves the NEWEST transcript on every poll and
+  // adopts it if it changed — the reply lands in the new file, which starts fresh, so
+  // the effective say-baseline for the adopted file is 0. Count is reported relative to
+  // `baseline` (sayBefore) so the latch's `count > sayBefore` "a new say arrived" check
+  // holds across a rotation. We only ever move FORWARD: latestTranscriptIn returns the
+  // most-recent file by mtime, so adopting it never steps back to an older transcript.
   private async readReply(target: string, baseline: number): Promise<string> {
     // The transcript is written lazily — discover it after the first inject.
     for (let i = 0; i < 120 && !this.transcriptPath; i++) {
@@ -210,12 +219,21 @@ export class Broker {
       if (!this.transcriptPath) await sleep(500);
     }
     if (!this.transcriptPath) throw new Error('no transcript appeared under ' + this.projectDir);
-    const path = this.transcriptPath;
+    let activePath = this.transcriptPath;
+    let activeBaseline = baseline;
 
     return waitForReply({
       readSays: () => {
-        const says = parseTranscript(path).filter((e) => e.kind === 'say') as Extract<TranscriptEvent, { kind: 'say' }>[];
-        return { count: says.length, text: says.slice(baseline).map((e) => e.text).join('\n') };
+        const latest = latestTranscriptIn(this.projectDir);
+        if (latest && latest !== activePath) {
+          this.log(`transcript rotated mid-turn -> ${latest}`);
+          activePath = latest;
+          activeBaseline = 0; // fresh file starts from zero says
+          this.transcriptPath = latest;
+        }
+        const says = parseTranscript(activePath).filter((e) => e.kind === 'say') as Extract<TranscriptEvent, { kind: 'say' }>[];
+        const fresh = says.slice(activeBaseline);
+        return { count: baseline + fresh.length, text: fresh.map((e) => e.text).join('\n') };
       },
       isIdle: () => !/esc to interrupt/i.test(capturePane(target)),
       sleep,

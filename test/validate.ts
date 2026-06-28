@@ -299,6 +299,50 @@ await reporter.leg('attach — broker targets an existing tmux session (mirror +
     rmSync(projDir, { recursive: true, force: true });
   }
 
+  // Mid-turn rotation (pure — always runs). The rotation can also land DURING the
+  // up-to-150s wait: the captain types /clear as the turn injects, or compaction / a
+  // new session UUID starts a fresh JSONL while the agent is replying. The reply then
+  // lands in the NEW file. This mirrors the broker's readReply readSays closure: it
+  // re-resolves latestTranscriptIn each poll, adopts a newer file (baseline 0 — the
+  // fresh file starts from zero), and reports count relative to sayBefore so the latch
+  // still fires. It must return B's text, not time out on the stale A.
+  const midDir = mkdtempSync(join(tmpdir(), 'ceochat-midrotate-'));
+  try {
+    const fileA = join(midDir, 'aaaa-session.jsonl');
+    writeFileSync(fileA, assistantSay('old backlog one') + '\n' + assistantSay('old backlog two') + '\n');
+    utimesSync(fileA, new Date(1000), new Date(1000));
+    const baseline = parseTranscript(latestTranscriptIn(midDir)!).filter((e) => e.kind === 'say').length;
+    t.eq(baseline, 2, 'baseline captured on file A (pre-rotation backlog)');
+
+    let activePath = latestTranscriptIn(midDir)!;
+    let activeBaseline = baseline;
+    let poll = 0;
+    let clock = 0;
+    const ROTATE_AT = 3;
+    const REPLY = 'post-clear fresh reply';
+    const got = await waitForReply({
+      readSays: () => {
+        if (poll === ROTATE_AT) {
+          const fileB = join(midDir, 'bbbb-session.jsonl');
+          writeFileSync(fileB, assistantSay(REPLY) + '\n');
+          utimesSync(fileB, new Date(2000), new Date(2000));
+        }
+        poll++;
+        const latest = latestTranscriptIn(midDir);
+        if (latest && latest !== activePath) { activePath = latest; activeBaseline = 0; }
+        const fresh = parseTranscript(activePath).filter((e) => e.kind === 'say').slice(activeBaseline);
+        return { count: baseline + fresh.length, text: fresh.map((e) => (e as Extract<TranscriptEvent, { kind: 'say' }>).text).join('\n') };
+      },
+      isIdle: () => true,
+      sleep: (ms) => { clock += ms; return Promise.resolve(); },
+      now: () => clock,
+    }, { sayBefore: baseline });
+    t.eq(got, REPLY, 'mid-turn rotation followed: reply read from the NEW file (no 150s timeout)');
+    t.notIncludes(got, 'old backlog', 'stale file A backlog is never spoken after a mid-turn rotation');
+  } finally {
+    rmSync(midDir, { recursive: true, force: true });
+  }
+
   let tmuxOk = true;
   try { execFileSync('tmux', ['-V'], { stdio: 'pipe' }); } catch { tmuxOk = false; }
   if (!tmuxOk) {
