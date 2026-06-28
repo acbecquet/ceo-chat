@@ -30,6 +30,10 @@ import { verifiedSubmit, paneHoldsText } from '../src/session/session.ts';
 import { runPipeline } from '../src/broker/pipeline.ts';
 import { Reporter } from './harness/report.ts';
 import { startMockMinimax } from '../src/tts/mock-server.ts';
+import { createWebApp } from '../src/server/app.ts';
+import { WS_PATH, AUDIO_FORMAT } from '../src/server/protocol.ts';
+import type { Driver } from '../src/server/driver.ts';
+import { WebSocket as WsClient } from 'ws';
 import {
   assistantSay, assistantThinking, assistantToolUse, userPrompt, userToolResult,
   bookkeeping, SAMPLE_AGENT_TURN, CONFIRM_TURN, LONG_CODE_TURN,
@@ -159,6 +163,95 @@ await reporter.leg('end-to-end — runPipeline (inject -> reply -> speak -> TTS)
     t.ok(typeof result.audio.ttfbMs === 'number', 'leg 5: time-to-first-audio measured', `${result.audio.ttfbMs}ms`);
     t.ok(!!result.terminal && result.terminal.includes('ceo-chat'), 'terminal view captured alongside audio');
   } finally {
+    await mock.close();
+  }
+});
+
+// ─────────────────── leg 6: web server + WS contract ───────────────────────
+// Stand up the REAL web transport (src/server/app.ts) over an in-memory driver that
+// drives the SAME runPipeline with mock deps — no tmux, no agent session, no creds.
+// Asserts the page is served and the browser <-> broker WS contract holds end-to-end.
+await reporter.leg('web server — serves the page + brokers the WS pipeline', async (t) => {
+  const mock = await startMockMinimax();
+  // In-memory driver: same pipeline the product runs, mock-injected.
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async (text, _turnIndex, hooks) => {
+      const r = await runPipeline(text, {
+        inject: async () => {},
+        readReply: async () => SAMPLE_AGENT_TURN,
+        speakify: (s) => speakify(s, { backend: 'mock' }),
+        synth: (chunks) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: chunks, endpoint: mock.endpoint, timeoutMs: 8000 }),
+        onStage: hooks.onStage,
+      });
+      return {
+        reply: r.reply, narration: r.narration, speakBackend: r.speakBackend,
+        audio: { pcm: r.audio.pcm, sampleRate: r.audio.sampleRate, ttfbMs: r.audio.ttfbMs, bytes: r.audio.bytes },
+      };
+    },
+    terminalSnapshot: () => '\x1b[32m┌─ ceo-chat ─┐\x1b[0m\r\n❯ (idle)\r\n└────────────┘',
+    stop: async () => {},
+  };
+  const app = await createWebApp({ driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // --- the page is served ---
+    const page = await fetch(app.url);
+    t.eq(page.status, 200, 'GET / -> 200');
+    const html = await page.text();
+    t.includes(html, 'ceo-chat', 'index page identifies ceo-chat');
+    t.includes(html, '/vendor/xterm.js', 'page loads xterm.js for the terminal view');
+    t.includes(html, '/app.js', 'page loads the client app');
+    const xterm = await fetch(app.url + 'vendor/xterm.js');
+    t.eq(xterm.status, 200, 'vendored xterm.js is served (no CDN needed)');
+    t.ok((await fetch(app.url + 'app.js')).status === 200, 'client app.js served');
+    t.ok((await fetch(app.url + 'styles.css')).status === 200, 'styles.css served');
+    t.ok((await fetch(app.url + '../../package.json')).status === 404, 'path traversal is refused');
+
+    // --- the WS contract: connect, send a line, observe the full turn ---
+    const msgs: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('WS turn timed out')); }, 12000);
+      let sent = false;
+      client.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        msgs.push(m);
+        if (m.type === 'hello' && !sent) { sent = true; client.send(JSON.stringify({ type: 'send', text: 'drive one turn' })); }
+        if (m.type === 'turn-done') { clearTimeout(timer); client.close(); resolve(); }
+      });
+      client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+
+    const first = (type: string) => msgs.find((m) => m.type === type);
+    const statuses = msgs.filter((m) => m.type === 'status').map((m) => m.state as string);
+
+    const hello = first('hello') as { ttsMode?: string; audioFormat?: string; sampleRate?: number } | undefined;
+    t.ok(!!hello, 'server greets with a hello frame');
+    t.eq(hello?.ttsMode, 'mock', 'hello advertises the TTS mode');
+    t.eq(hello?.audioFormat, AUDIO_FORMAT, 'hello advertises the PCM audio format the player expects');
+
+    const terminal = first('terminal') as { data?: string } | undefined;
+    t.ok(!!terminal && (terminal.data || '').includes('ceo-chat'), 'live terminal snapshot pushed to the browser');
+
+    const narration = first('narration') as { text?: string } | undefined;
+    t.ok(!!narration, 'narration frame delivered');
+    t.notIncludes(narration?.text || '', 'https://example.com/pr/42', 'narration over the wire drops the URL');
+    t.includes(narration?.text || '', '?', 'the decision question survives to the browser');
+
+    const audio = first('audio') as { pcm?: string; format?: string } | undefined;
+    t.ok(!!audio && !!audio.pcm, 'audio frame delivered');
+    t.eq(audio?.format, AUDIO_FORMAT, 'audio frame tags its PCM format');
+    t.ok(Buffer.from(audio?.pcm || '', 'base64').length > 0, 'audio carries real PCM bytes (playable in the page)');
+
+    const done = first('turn-done') as { bytes?: number } | undefined;
+    t.ok(!!done && (done.bytes ?? 0) > 0, 'turn-done reports the produced audio bytes');
+
+    t.ok(statuses.includes('thinking'), 'status reaches "thinking" during the turn', statuses.join(','));
+    t.ok(statuses.includes('speaking'), 'status reaches "speaking" while audio is produced', statuses.join(','));
+    t.eq(statuses[statuses.length - 1], 'awaiting-confirmation', 'ends "awaiting-confirmation" (reply asked a question)');
+  } finally {
+    await app.close();
     await mock.close();
   }
 });

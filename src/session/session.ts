@@ -44,6 +44,17 @@ export function capturePane(target: string = TARGET): string {
   }
 }
 
+// Like capturePane but preserves colour/attribute escape sequences (`-e`) so the
+// web UI's xterm.js renders the pane with the same ANSI styling the captain would
+// see in tmux. Plain capturePane (above) stays text-only for the idle-latch read.
+export function capturePaneAnsi(target: string = TARGET): string {
+  try {
+    return sh('tmux', ['capture-pane', '-e', '-p', '-t', target]);
+  } catch {
+    return '';
+  }
+}
+
 export interface SessionCtx {
   cwd: string;
   session: string;

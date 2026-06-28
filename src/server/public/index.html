@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>ceo-chat — voice bridge to firstmate</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/vendor/xterm.css" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <span class="dot" id="conn-dot" title="connection"></span>
+      <strong>ceo-chat</strong>
+      <span class="muted">voice bridge to firstmate</span>
+    </div>
+    <div class="modes">
+      <span class="pill" id="status-pill" data-state="idle">Idle</span>
+      <span class="pill ghost" id="tts-pill">TTS —</span>
+      <span class="pill ghost" id="speak-pill">speak —</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="panel term-panel">
+      <h2>Terminal view <span class="muted">— ceo-chat agent session</span></h2>
+      <div id="terminal" class="terminal"></div>
+    </section>
+
+    <section class="panel chat-panel">
+      <h2>Conversation</h2>
+      <div id="log" class="log" aria-live="polite"></div>
+
+      <div class="composer">
+        <button id="mic" class="mic" title="Push to talk (browser speech recognition)" aria-label="Push to talk">🎙</button>
+        <input id="input" type="text" autocomplete="off" placeholder="Type a message for firstmate…" />
+        <button id="send" class="send">Send</button>
+      </div>
+      <p class="hint" id="hint">
+        Mic uses the browser's built-in speech recognition (best-effort). Typing is the
+        always-reliable path.
+      </p>
+    </section>
+  </main>
+
+  <script src="/vendor/xterm.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
