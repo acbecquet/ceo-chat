@@ -112,7 +112,8 @@ streaming TTS. Decision-ready plan:
 - **WS contract** lives in `src/server/protocol.ts` (`WS_PATH=/ws`). Client→server:
   `send`/`listening`/`ping`. Server→client: `hello` (modes+sampleRate+audioFormat),
   `status`, `terminal` (full ANSI pane snapshot), `reply`, `narration`, `audio`
-  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `turn-done`, `error`.
+  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `turn-done`, `error`,
+  `pong`.
 - **Status indicators** are derived from the pipeline `onStage` hook added to
   `pipeline.ts`/`Broker.send` (inject/reply/speak → thinking; synth → speaking; after the
   turn → awaiting-confirmation iff the narration contains `?`, else idle). Don't scrape

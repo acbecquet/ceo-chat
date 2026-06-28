@@ -188,7 +188,8 @@ src/
   server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
   server/app.ts            HTTP + WS transport (static UI, status, terminal stream)
   server/serve.ts          the web server entrypoint (npm run serve)
-  server/public/           the single-page UI (index.html, app.js, styles.css, xterm.js)
+  server/public/           the single-page UI (index.html, app.js, styles.css)
+                           xterm.js is vendored from node_modules, served at /vendor
 test/
   validate.ts              the validation harness (npm run validate)
   harness/                 reporter + transcript/turn fixtures
