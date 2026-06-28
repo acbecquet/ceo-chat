@@ -112,9 +112,12 @@ streaming TTS. Decision-ready plan:
   `runPipeline` with mock deps — so the HTTP serving + WS contract are asserted with NO
   creds and NO agent session. Keep this seam: never make `app.ts` import tmux/claude.
 - **WS contract** lives in `src/server/protocol.ts` (`WS_PATH=/ws`). Client→server:
-  `send`/`listening`/`ping`. Server→client: `hello` (modes+sampleRate+audioFormat),
+  `send`/`listening`/`ping` plus the Phase-4 server-STT frames `stt-audio`
+  (base64 s16le mono chunk)/`stt-end`/`stt-cancel`. Server→client: `hello`
+  (`ttsMode`+`ttsVoice`+`speakBackend`+`sampleRate`+`audioFormat`+`serverStt`+`sttLabel`),
   `status`, `terminal` (full ANSI pane snapshot), `reply`, `narration`, `audio`
-  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `turn-done`, `error`,
+  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `transcript`
+  (server-STT result handed BACK to the client, never auto-run), `turn-done`, `error`,
   `pong`.
 - **Status indicators** are derived from the pipeline `onStage` hook added to
   `pipeline.ts`/`Broker.send` (inject/reply/speak → thinking; synth → speaking; after the

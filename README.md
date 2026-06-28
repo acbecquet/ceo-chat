@@ -216,9 +216,10 @@ npm run dev -- "your message"     # one-shot: drive a single line and exit
 npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + speak)
 ```
 
-- **TTS mode is automatic.** No `MINIMAX_API_KEY` → the broker stands up the mock
-  MiniMax server so you still get a real WAV. Key present → live MiniMax. `--mock`
-  (or `CEOCHAT_MOCK=1`) forces the offline path even when creds exist — handy for
+- **TTS backend is automatic.** Precedence: `MINIMAX_API_KEY` present → premium
+  MiniMax; else the local piper voice if installed (`npm run voice`) → real offline
+  speech, no key; else the mock synthetic tone (still a real, playable WAV). `--mock`
+  (or `CEOCHAT_MOCK=1`) forces the mock tone even when creds/voice exist — handy for
   exercising the firstmate/transcript legs without depending on live MiniMax.
 - **Speakability backend is automatic.** `ANTHROPIC_API_KEY` present → Anthropic
   Messages API; otherwise the locally-authenticated `claude -p` pure-rewriter
