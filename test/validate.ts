@@ -458,6 +458,34 @@ await reporter.leg('attach — prompt-anchored transcript (ignores concurrent se
   t.eq(says.join(' '), 'You are connected to first mate. Ready to merge?', 'says AFTER the anchor are this turn (not the backlog)');
   t.notIncludes(says.join(' '), 'old answer', 'pre-anchor backlog never included');
 
+  // Repeated/short confirmation prompts: the inject timestamp disambiguates an IDENTICAL
+  // earlier turn from OUR new one, so the old reply is never re-spoken at turn start.
+  const repeated = [
+    { kind: 'human', role: 'user', ts: '2026-06-27T00:00:00.000Z', text: 'go ahead and merge it now' },
+    { kind: 'say', role: 'assistant', ts: '2026-06-27T00:00:01.000Z', text: 'Merged the first one.' },
+    { kind: 'human', role: 'user', ts: '2026-06-27T00:00:10.000Z', text: 'go ahead and merge it now' },
+    { kind: 'say', role: 'assistant', ts: '2026-06-27T00:00:11.000Z', text: 'Merging the second one now.' },
+  ] as TranscriptEvent[];
+  t.eq(findPromptAnchor(repeated, 'go ahead and merge it now'), 2, 'no baseline -> legacy last-match (index 2)');
+  const aNew = findPromptAnchor(repeated, 'go ahead and merge it now', { afterTs: '2026-06-27T00:00:05.000Z' });
+  t.eq(aNew, 2, 'inject-timestamp anchor selects OUR post-inject turn, not the identical earlier one');
+  const newSays = saysAfterAnchor(repeated, aNew).map((e) => e.text).join(' ');
+  t.notIncludes(newSays, 'Merged the first one', 'the earlier identical turn reply is NEVER re-spoken');
+  t.includes(newSays, 'Merging the second one', 'only the NEW reply is read for this turn');
+  t.eq(findPromptAnchor(repeated, 'go ahead and merge it now', { afterTs: '2026-06-27T00:00:20.000Z' }), -1,
+    'before claude writes our user line, anchor is -1 (never the stale earlier turn)');
+
+  // Tightened loose fallback: a short prompt cannot match a longer line that merely
+  // CONTAINS the word; a substantial prompt still matches when the agent wraps it.
+  const looseEvs = [
+    { kind: 'human', role: 'user', ts: '2026-06-27T00:00:00.000Z', text: 'yes please go ahead with everything you proposed' },
+  ] as TranscriptEvent[];
+  t.eq(findPromptAnchor(looseEvs, 'yes'), -1, 'a short prompt does NOT loose-match a longer line containing the word');
+  const wrapEvs = [
+    { kind: 'human', role: 'user', ts: '2026-06-27T00:00:00.000Z', text: 'please summarize the memoirs data files' },
+  ] as TranscriptEvent[];
+  t.ok(findPromptAnchor(wrapEvs, 'summarize the memoirs data files') >= 0, 'a substantial prompt still loose-matches a lightly-wrapped line');
+
   // latestTranscriptWithPrompt: among concurrent sessions, pick the file with OUR prompt
   // even when a DIFFERENT (unrelated) session is newer by mtime.
   const dir = mkdtempSync(join(tmpdir(), 'ceochat-anchor-'));
@@ -472,6 +500,10 @@ await reporter.leg('attach — prompt-anchored transcript (ignores concurrent se
     t.eq(latestTranscriptIn(dir), noise, 'baseline: newest-by-mtime is the WRONG (unrelated) file');
     t.eq(latestTranscriptWithPrompt(dir, 'pull up my memoirs data'), ours, 'anchored resolver picks OUR file despite the newer noise file');
     t.eq(latestTranscriptWithPrompt(dir, 'something never said'), null, 'no file has the prompt yet -> null');
+    t.eq(latestTranscriptWithPrompt(dir, 'pull up my memoirs data', { afterTs: '2026-06-26T00:00:00.000Z' }), ours,
+      'afterTs before the prompt ts still resolves OUR file');
+    t.eq(latestTranscriptWithPrompt(dir, 'pull up my memoirs data', { afterTs: '2026-06-28T00:00:00.000Z' }), null,
+      'afterTs after the prompt ts -> not yet ours (window-safe, no stale match)');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

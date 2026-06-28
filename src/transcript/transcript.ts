@@ -133,10 +133,9 @@ export function normalizeLine(obj: RawLine, opts: NormalizeOpts = {}): Transcrip
   return events;
 }
 
-// Parse a whole transcript file into a flat, ordered event list.
-export function parseTranscript(path: string, opts?: NormalizeOpts): TranscriptEvent[] {
+function parseLines(text: string, opts?: NormalizeOpts): TranscriptEvent[] {
   const events: TranscriptEvent[] = [];
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
+  for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let obj: RawLine;
     try {
@@ -149,6 +148,45 @@ export function parseTranscript(path: string, opts?: NormalizeOpts): TranscriptE
   return events;
 }
 
+// Small mtime+size keyed cache for parseTranscript. The broker polls the SAME (often
+// multi-MB) transcript every ~1s while streaming a reply, and latestTranscriptWithPrompt
+// re-parses several recent files per poll — without a cache that re-parses unchanged
+// files ~9x/poll for the whole turn. Keyed by path; invalidated when mtime/size moves
+// (an append always bumps size). Bounded + LRU so rotated-away transcripts don't pile up.
+interface ParseCacheEntry { mtimeMs: number; size: number; events: TranscriptEvent[]; }
+const parseCache = new Map<string, ParseCacheEntry>();
+const PARSE_CACHE_MAX = 16;
+
+// Parse a whole transcript file into a flat, ordered event list. The returned array is
+// shared with the cache (callers MUST treat it as read-only — findPromptAnchor /
+// saysAfterAnchor only read).
+export function parseTranscript(path: string, opts?: NormalizeOpts): TranscriptEvent[] {
+  // A custom resultMax changes normalization, so only the default (the hot broker poll)
+  // path is cached.
+  const cacheable = !opts || opts.resultMax === undefined;
+  if (cacheable) {
+    let st: { mtimeMs: number; size: number } | null = null;
+    try { st = statSync(path); } catch { st = null; }
+    if (st) {
+      const hit = parseCache.get(path);
+      if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+        parseCache.delete(path); // re-insert to mark most-recently-used (LRU)
+        parseCache.set(path, hit);
+        return hit.events;
+      }
+      const events = parseLines(readFileSync(path, 'utf8'), opts);
+      parseCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, events });
+      while (parseCache.size > PARSE_CACHE_MAX) {
+        const oldest = parseCache.keys().next().value;
+        if (oldest === undefined) break;
+        parseCache.delete(oldest);
+      }
+      return events;
+    }
+  }
+  return parseLines(readFileSync(path, 'utf8'), opts);
+}
+
 // Normalize a line for robust matching of an injected prompt against a transcript
 // human event (collapse whitespace, trim). fm-send types the line verbatim, but the
 // composer/harness can reflow whitespace, so we compare on the collapsed form.
@@ -156,23 +194,60 @@ export function normalizeForMatch(s: string): string {
   return (s || '').replace(/\s+/g, ' ').trim();
 }
 
-// Find the index of the LAST `human` event whose text matches the injected prompt.
-// This is the per-turn ANCHOR: the captain's first mate shares a project dir with
-// OTHER concurrent claude sessions (the supervisor, crewmates), so "newest transcript
-// by mtime" flip-flops between unrelated files. The file that recorded OUR injected
-// line is unambiguously the right one — we anchor to it by content, not mtime. Returns
-// -1 if the prompt is not present yet (claude writes the user turn lazily).
-export function findPromptAnchor(events: TranscriptEvent[], injectedText: string): number {
+export interface AnchorOpts {
+  /**
+   * ISO timestamp captured just before fm-send submitted OUR prompt. When given, only
+   * human events at/after it are eligible and the FIRST such match is the anchor — so a
+   * repeated/short confirmation prompt ("yes", "go ahead") can't anchor to an IDENTICAL
+   * earlier turn's user line (which would re-speak the old reply). Omitted -> the legacy
+   * "last matching human event" behavior (used by the pure unit tests).
+   */
+  afterTs?: string;
+}
+
+// A loose (substring) match is only safe for a target long enough to be unambiguous AND
+// that makes up the bulk of the candidate line — otherwise a prior line that merely
+// CONTAINS a short confirmation word ("yes please, go ahead and merge") would match the
+// prompt "yes". Whitespace reflow is already handled by the exact (normalized) compare,
+// so loose is a narrow fallback for the agent wrapping our line with a little extra text.
+function looseMatches(got: string, target: string): boolean {
+  return target.length >= 16 && got.includes(target) && target.length * 2 >= got.length;
+}
+
+// Find the index of the `human` event that recorded OUR injected prompt. This is the
+// per-turn ANCHOR: the captain's first mate shares a project dir with OTHER concurrent
+// claude sessions (the supervisor, crewmates), so "newest transcript by mtime" flip-flops
+// between unrelated files. The file that recorded OUR injected line is unambiguously the
+// right one — we anchor to it by content (+ the inject timestamp when given), not mtime.
+// Returns -1 if the prompt is not present yet (claude writes the user turn lazily).
+export function findPromptAnchor(
+  events: TranscriptEvent[],
+  injectedText: string,
+  opts: AnchorOpts = {},
+): number {
   const target = normalizeForMatch(injectedText);
   if (!target) return -1;
+  const afterMs = opts.afterTs ? Date.parse(opts.afterTs) : NaN;
+  const timed = !Number.isNaN(afterMs);
   let exact = -1;
   let loose = -1;
   for (let i = 0; i < events.length; i++) {
     const e = events[i]!;
     if (e.kind !== 'human') continue;
+    if (timed) {
+      // Anchor by time: only OUR turn's user line (written at/after the inject) is
+      // eligible; an event without a parseable ts can't be proven ours, so skip it.
+      const ets = e.ts ? Date.parse(e.ts) : NaN;
+      if (Number.isNaN(ets) || ets < afterMs) continue;
+    }
     const got = normalizeForMatch(e.text);
-    if (got === target) exact = i;
-    else if (got.includes(target)) loose = i;
+    if (got === target) {
+      if (timed) return i; // first exact at/after the baseline IS our turn
+      exact = i;           // legacy: the last exact match wins
+    } else if (looseMatches(got, target)) {
+      if (timed) { if (loose < 0) loose = i; } // first loose at/after the baseline
+      else loose = i;                          // legacy: the last loose match
+    }
   }
   return exact >= 0 ? exact : loose;
 }
@@ -203,7 +278,7 @@ export function saysAfterAnchor(
 export function latestTranscriptWithPrompt(
   projectDir: string,
   injectedText: string,
-  { limit = 8 }: { limit?: number } = {},
+  { limit = 8, afterTs }: { limit?: number; afterTs?: string } = {},
 ): string | null {
   if (!existsSync(projectDir)) return null;
   const files = readdirSync(projectDir)
@@ -214,7 +289,7 @@ export function latestTranscriptWithPrompt(
     .slice(0, limit);
   for (const { p } of files) {
     try {
-      if (findPromptAnchor(parseTranscript(p), injectedText) >= 0) return p;
+      if (findPromptAnchor(parseTranscript(p), injectedText, { afterTs }) >= 0) return p;
     } catch { /* unreadable/partial — skip */ }
   }
   return null;

@@ -318,11 +318,20 @@ streaming TTS. Decision-ready plan:
   serve.log oscillated `1f87…↔3b77…`, and our injected prompt was in the OLDER file. Fix:
   `transcript.ts#latestTranscriptWithPrompt` + `findPromptAnchor` + `saysAfterAnchor` pick
   the file that recorded OUR injected line as a `human` event, and read only the says AFTER
-  that anchor (the anchor REPLACES the per-turn say-count baseline). Re-resolved every poll,
-  so a mid-turn `/clear`/compaction that re-records the prompt in a fresh UUID is FOLLOWED
-  forward; `streamReply` dedups units (normalized) so any re-read never double-speaks.
-  claude does NOT hold the .jsonl fd open (open→append→close), so /proc-fd pinning is out —
-  content-anchoring is the robust path.
+  that anchor. The anchor is GATED by an inject timestamp (`AnchorOpts.afterTs`, captured in
+  `Broker.send` just before `fmSend`): only a `human` event AT/AFTER that instant is
+  eligible and the FIRST such match is the anchor — so a short/repeated confirmation prompt
+  ("yes", "go ahead and merge") can NEVER anchor to an IDENTICAL earlier turn's user line
+  (which would re-speak the old reply). The loose substring fallback is tightened
+  (`looseMatches`: target ≥16 chars AND ≥half the candidate line) so a prior line that
+  merely contains the word can't match. Without `afterTs` (the pure unit tests) it keeps the
+  legacy last-match behavior. Re-resolved every poll, so a mid-turn `/clear`/compaction that
+  re-records the prompt in a fresh UUID is FOLLOWED forward; `streamReply` dedups units
+  (normalized) so any re-read never double-speaks. To keep that per-poll re-resolution cheap,
+  `parseTranscript` is mtime+size cached (LRU) and `streamReplyFor` only runs the multi-file
+  newest-first scan when the active transcript has NOT advanced (a growing file means we're
+  still on the right one). claude does NOT hold the .jsonl fd open (open→append→close), so
+  /proc-fd pinning is out — content+timestamp anchoring is the robust path.
 - **Auto-dismiss benign modals BEFORE every inject** (`session.ts#detectBenignModal` /
   `dismissBenignModals`, wired in `Broker.send`'s inject). Conservative — ONLY the
   "How is Claude doing this session?" rating prompt (→ **Escape**, no rating) and the

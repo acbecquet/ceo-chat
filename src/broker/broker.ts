@@ -15,7 +15,7 @@
 // full end-to-end run even before the live key is added. Drop the key into
 // secrets.env and the SAME broker flips to live with no code change.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../config/secrets.ts';
@@ -167,6 +167,10 @@ export class Broker {
     if (!this.ctx) throw new Error('broker not started');
     const target = this.ctx.target;
 
+    // Captured just before fm-send submits, so the reply tap can anchor to the user
+    // line claude writes at/after this instant — never an IDENTICAL earlier turn's line
+    // (the repeated-confirmation-prompt hazard). Set in inject (which runs first).
+    let baselineTs = '';
     const result = await runStreamingPipeline(typed, {
       inject: async (text) => {
         // Auto-dismiss a benign Claude modal (feedback rating / trust dialog) that
@@ -177,11 +181,12 @@ export class Broker {
           log: this.log,
         });
         if (dismissed) opts.onNotice?.(`Auto-dismissed ${dismissed.detail} before sending.`);
+        baselineTs = new Date().toISOString();
         await fmSend(text, { target, log: this.log });
       },
       // Anchor the reply to the transcript that recorded OUR prompt (multi-session safe)
       // and stream its says as speakable units.
-      streamReply: (onUnit) => this.streamReplyFor(target, typed, onUnit, opts.signal),
+      streamReply: (onUnit) => this.streamReplyFor(target, typed, () => baselineTs, onUnit, opts.signal),
       speakify: (text) => speakify(text, {
         apiKey: has(this.secrets, 'ANTHROPIC_API_KEY') ? this.secrets.ANTHROPIC_API_KEY : null,
         backend: this.streamSpeakBackend(),
@@ -254,31 +259,43 @@ export class Broker {
   private async streamReplyFor(
     target: string,
     injectedText: string,
+    getBaselineTs: () => string,
     onUnit: (unitText: string) => void,
     signal?: { readonly aborted: boolean },
   ): Promise<string> {
+    const afterTs = (): string | undefined => getBaselineTs() || undefined;
     // The user turn is written lazily — wait for OUR prompt to appear in some transcript.
     let anchored: string | null = null;
     for (let i = 0; i < 120 && !anchored; i++) {
       if (signal?.aborted) return '';
-      anchored = latestTranscriptWithPrompt(this.projectDir, injectedText);
+      anchored = latestTranscriptWithPrompt(this.projectDir, injectedText, { afterTs: afterTs() });
       if (!anchored) await sleep(500);
     }
     if (!anchored) {
       throw new Error('our injected prompt never appeared in any transcript under ' + this.projectDir);
     }
     let activePath = anchored;
+    let lastSig = ''; // mtime:size of activePath at the previous poll
 
     return streamReply({
       readSays: () => {
-        // Follow the prompt across a mid-turn rotation; fall back to the last good path.
-        const latest = latestTranscriptWithPrompt(this.projectDir, injectedText);
-        if (latest && latest !== activePath) {
-          this.log(`transcript rotated mid-turn (prompt re-anchored) -> ${latest}`);
-          activePath = latest;
+        let sig = '';
+        try { const st = statSync(activePath); sig = st.mtimeMs + ':' + st.size; } catch { sig = ''; }
+        // Only rescan the dir for a rotation when the active transcript has NOT advanced:
+        // a growing file means we are still on the right one (the common path), so we skip
+        // re-parsing several multi-MB siblings every poll. A stalled file may mean a
+        // mid-turn /clear/compaction re-anchored our prompt to a fresh UUID — then rescan.
+        if (sig === '' || sig === lastSig) {
+          const latest = latestTranscriptWithPrompt(this.projectDir, injectedText, { afterTs: afterTs() });
+          if (latest && latest !== activePath) {
+            this.log(`transcript rotated mid-turn (prompt re-anchored) -> ${latest}`);
+            activePath = latest;
+            try { const st = statSync(activePath); sig = st.mtimeMs + ':' + st.size; } catch { sig = ''; }
+          }
         }
+        lastSig = sig;
         const events = parseTranscript(activePath);
-        const says = saysAfterAnchor(events, findPromptAnchor(events, injectedText));
+        const says = saysAfterAnchor(events, findPromptAnchor(events, injectedText, { afterTs: afterTs() }));
         return { count: says.length, text: says.map((e) => e.text).join('\n') };
       },
       isIdle: () => !/esc to interrupt/i.test(capturePane(target)),
