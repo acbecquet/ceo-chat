@@ -144,8 +144,8 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     if (audio.speaking) return 'speaking';
     if (awaitingConfirmation) return 'awaiting-confirmation';
     if (serverState === 'thinking') return 'thinking';
-    if (inCall && (micState === 'listening')) return 'listening';
-    return inCall ? 'listening' : 'idle';
+    if (inCall && micState === 'listening') return 'listening';
+    return 'idle';
   }
   function refreshStatus() {
     var s = displayedStatus();

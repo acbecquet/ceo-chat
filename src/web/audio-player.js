@@ -117,8 +117,15 @@ export class AudioPlayer {
       this._active.delete(src);
       if (this._active.size === 0) this._setSpeaking(false);
     };
-    try { src.start(startAt); } catch (e) { this._log('start failed: ' + (e && e.message)); }
-    this._playHead = startAt + dur;
+    try {
+      src.start(startAt);
+      this._playHead = startAt + dur;
+    } catch (e) {
+      this._log('start failed: ' + (e && e.message));
+      this._active.delete(src);
+      src.onended = null;
+      if (this._active.size === 0) this._setSpeaking(false);
+    }
   }
 
   // Hard-stop everything scheduled (barge-in / cancel). Leaves the context unlocked.

@@ -683,6 +683,25 @@ await reporter.leg('mobile — audio auto-speak (unlock, queue, barge-in)', asyn
   player.enqueue(pcm, 22050);
   player.stop();
   t.ok(!player.speaking, 'stop() ends speaking immediately (barge-in)');
+
+  // Regression: a throwing src.start() must NOT wedge speaking=true forever
+  // (half-duplex would stay muted and never re-arm the mic).
+  const throwCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'running', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { return Promise.resolve(); },
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, connect() {}, start() { throw new Error('start blocked'); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const tp = new AudioPlayer({ createContext: throwCtx });
+  await tp.unlock();
+  tp.enqueue(pcm, 22050);
+  t.ok(!tp.speaking, 'a failed src.start() does not leave speaking stuck (mic re-arms)');
 });
 
 // M5 — SpeechController: iOS-shaped robustness (restart-on-end keep-alive, permanent

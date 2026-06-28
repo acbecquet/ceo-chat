@@ -123,6 +123,12 @@ export function synthLocal(
       });
     });
 
+    p.stdin.on('error', (e) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      try { p.kill('SIGKILL'); } catch { /* ignore */ }
+      reject(new Error('piper stdin write failed: ' + e.message));
+    });
     p.stdin.write(text + '\n');
     p.stdin.end();
   });

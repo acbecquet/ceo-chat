@@ -132,7 +132,8 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   const wss = new WebSocketServer({ noServer: true });
   const clients = new Set<WebSocket>();
   // Per-connection server-side STT capture buffers (mic PCM streamed before stt-end).
-  const sttBuffers = new Map<WebSocket, { chunks: Buffer[]; sampleRate: number }>();
+  const sttBuffers = new Map<WebSocket, { chunks: Buffer[]; sampleRate: number; bytes: number }>();
+  const STT_MAX_BYTES = 10 * 1024 * 1024;
   let turn = 0;
   let busy = false;
   let lastTerminal = '';
@@ -221,8 +222,17 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
       } else if (msg.type === 'stt-audio') {
         if (!transcribe) return;
         let buf = sttBuffers.get(ws);
-        if (!buf) { buf = { chunks: [], sampleRate: STT_SAMPLE_RATE }; sttBuffers.set(ws, buf); }
-        try { buf.chunks.push(Buffer.from(msg.pcm || '', 'base64')); } catch { /* skip bad chunk */ }
+        if (!buf) { buf = { chunks: [], sampleRate: STT_SAMPLE_RATE, bytes: 0 }; sttBuffers.set(ws, buf); }
+        try {
+          const chunk = Buffer.from(msg.pcm || '', 'base64');
+          if (buf.bytes + chunk.length > STT_MAX_BYTES) {
+            sttBuffers.delete(ws);
+            ship(ws, { type: 'error', message: 'capture too long — dropped; send stt-end to transcribe' });
+          } else {
+            buf.chunks.push(chunk);
+            buf.bytes += chunk.length;
+          }
+        } catch { /* skip bad chunk */ }
         if (typeof msg.sampleRate === 'number' && msg.sampleRate > 0) buf.sampleRate = msg.sampleRate;
       } else if (msg.type === 'stt-cancel') {
         sttBuffers.delete(ws);
