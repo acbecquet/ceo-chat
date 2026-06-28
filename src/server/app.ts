@@ -213,7 +213,17 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
     terminalPollMs > 0 ? setInterval(() => pushTerminal(), terminalPollMs) : null;
   if (terminalTimer) terminalTimer.unref?.();
 
-  await new Promise<void>((resolve) => httpServer.listen(port, host, () => resolve()));
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error): void => {
+      if (terminalTimer) clearInterval(terminalTimer);
+      reject(err);
+    };
+    httpServer.once('error', onError);
+    httpServer.listen(port, host, () => {
+      httpServer.removeListener('error', onError);
+      resolve();
+    });
+  });
   const addr = httpServer.address();
   const boundPort = typeof addr === 'object' && addr ? addr.port : port;
   const url = `http://${host}:${boundPort}/`;

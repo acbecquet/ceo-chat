@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { Broker } from '../broker/broker.ts';
 import { DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
 import { BrokerDriver } from './driver.ts';
-import { createWebApp } from './app.ts';
+import { createWebApp, type WebApp } from './app.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(HERE, '..', '..', 'out');
@@ -44,7 +44,15 @@ console.log(`TTS mode: ${broker.ttsMode.toUpperCase()}${broker.ttsMode === 'mock
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
 console.log('spawning dedicated ceo-chat session (this takes a few seconds)…');
 
-const app = await createWebApp({ driver, log });
+let app: WebApp;
+try {
+  app = await createWebApp({ driver, log });
+} catch (e) {
+  console.error('  ✗ startup failed:', (e as Error)?.message ?? e);
+  console.error('  tearing down the dedicated ceo-chat session…');
+  try { await driver.stop(); } catch { /* ignore */ }
+  process.exit(1);
+}
 
 console.log('');
 console.log(`  ▸ open ${app.url}`);
