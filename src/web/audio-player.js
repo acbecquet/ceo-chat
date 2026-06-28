@@ -51,6 +51,7 @@ export class AudioPlayer {
 
     this._el = null;                // persistent <audio> for the fallback path
     this._elArmed = false;
+    this._primeUrl = null;          // muted-prime object URL, revoked once it settles
     this._elQueue = [];             // {bytes, rate} waiting to play through the element
     this._elPlaying = false;
     this._lastState = null;         // for ctx-state-transition diagnostics
@@ -164,9 +165,17 @@ export class AudioPlayer {
       el.preload = 'auto';
       try {
         const silent = wavBytesFromPcm(new Uint8Array(2), this._defaultRate);
-        el.src = this._makeUrl(silent);
+        const primeUrl = this._makeUrl(silent);
+        el.src = primeUrl;
+        this._primeUrl = primeUrl;
+        const revokePrime = () => {
+          if (this._primeUrl !== primeUrl) return;
+          this._primeUrl = null;
+          try { this._revokeUrl(primeUrl); } catch (e) { void e; }
+        };
         const p = el.play();
-        if (p && typeof p.catch === 'function') p.catch((e) => this._log('element prime play: ' + (e && e.message)));
+        if (p && typeof p.then === 'function') p.then(revokePrime, (e) => { this._log('element prime play: ' + (e && e.message)); revokePrime(); });
+        else revokePrime();
       } catch (e) { this._log('element prime failed: ' + (e && e.message)); }
       this._el = el;
       this._elArmed = true;
@@ -288,21 +297,31 @@ export class AudioPlayer {
     this._elPlaying = true;
     this._recomputeSpeaking();
     let url = null;
+    // Advance the queue exactly once for this reply: onended, onerror, and the play()
+    // rejection can all fire for the same item (a media error trips both onerror and the
+    // promise). Null the handlers and latch so a single reply never double-advances.
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
+      if (this._el) { this._el.onended = null; this._el.onerror = null; }
+      this._elAfter(url);
+    };
     try {
       const wav = wavBytesFromPcm(item.bytes, item.sampleRate || this._defaultRate);
       url = this._makeUrl(wav);
       this._el.src = url;
       this._el.muted = false;
-      this._el.onended = () => this._elAfter(url);
-      this._el.onerror = () => { this._report({ t: 'playerr', via: 'element', error: 'media error' }); this._elAfter(url); };
+      this._el.onended = () => advance();
+      this._el.onerror = () => { this._report({ t: 'playerr', via: 'element', error: 'media error' }); advance(); };
       const p = this._el.play();
       if (p && typeof p.catch === 'function') {
-        p.catch((e) => { this._log('element play failed: ' + (e && e.message)); this._report({ t: 'playerr', via: 'element', error: (e && e.message) || 'play() rejected' }); this._elAfter(url); });
+        p.catch((e) => { this._log('element play failed: ' + (e && e.message)); this._report({ t: 'playerr', via: 'element', error: (e && e.message) || 'play() rejected' }); advance(); });
       }
     } catch (e) {
       this._log('element play threw: ' + (e && e.message));
       this._report({ t: 'playerr', via: 'element', error: (e && e.message) || 'threw' });
-      this._elAfter(url);
+      advance();
     }
   }
 
