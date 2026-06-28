@@ -344,20 +344,50 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
 
   // server STT capture: getUserMedia -> AudioWorklet (or ScriptProcessor fallback)
   // -> downsample 16k -> stream. Hardened for iOS: the capture AudioContext is resumed
-  // INSIDE the mic tap and kept running; if AudioWorklet is unavailable/silent we fall
-  // back to a ScriptProcessorNode so iOS still streams PCM.
+  // INSIDE the mic tap and kept running; if AudioWorklet is unavailable (throws) OR
+  // silent (a 1.5s watchdog sees 0 frames) we fall back to a ScriptProcessorNode so
+  // iOS still streams PCM.
   var capturing = false, capCtx = null, capStream = null, capNode = null, capSource = null, capProc = null;
-  var capBytesSent = 0, capMethod = '';
+  var capBytesSent = 0, capMethod = '', capFramesRecv = 0, capWatchdog = null;
   function onCapFrame(f32) {
+    capFramesRecv++;                                      // counts even when half-duplex suppresses sending
     if (audio.speaking) return;                           // half-duplex: skip first mate's reply
     var down = downsampleFloat32(f32, capCtx.sampleRate, STT_SAMPLE_RATE);
     var pcm = float32ToPcmS16le(down);
     capBytesSent += pcm.length;
     sendJson({ type: 'stt-audio', pcm: bytesToBase64(pcm), sampleRate: STT_SAMPLE_RATE });
   }
+  function startScriptProcessor() {
+    // ScriptProcessor fallback (deprecated but works on older iOS Safari / silent worklet).
+    var spn = capCtx.createScriptProcessor ? capCtx.createScriptProcessor(4096, 1, 1) : capCtx.createJavaScriptNode(4096, 1, 1);
+    capProc = spn;
+    spn.onaudioprocess = function (ev) { onCapFrame(ev.inputBuffer.getChannelData(0)); };
+    capSource.connect(spn); spn.connect(capCtx.destination);
+    capMethod = 'ScriptProcessor';
+  }
+  // iOS Safari sometimes loads + constructs an AudioWorklet whose port never fires
+  // (a "silent worklet"). If no frames arrive shortly after start, swap to ScriptProcessor.
+  function armWorkletWatchdog() {
+    if (capWatchdog) clearTimeout(capWatchdog);
+    capWatchdog = setTimeout(function () {
+      capWatchdog = null;
+      if (!capturing || capMethod !== 'AudioWorklet' || capFramesRecv > 0) return;
+      diag.error('AudioWorklet silent (0 frames in 1.5s) — switching to ScriptProcessor');
+      try { if (capNode) { capNode.port.onmessage = null; capNode.disconnect(); } } catch (e) {}
+      capNode = null;
+      try {
+        startScriptProcessor();
+        diag.add('mic capture restarted via ' + capMethod);
+        setDiagStat(els.diagMic, 'mic', 'capturing (' + capMethod + ')', 'good');
+      } catch (e) {
+        diag.error('ScriptProcessor fallback failed: ' + (e && e.message));
+        setDiagStat(els.diagMic, 'mic', 'failed', 'bad');
+      }
+    }, 1500);
+  }
   async function startServerCapture() {
     if (capturing || !serverStt) return;
-    capBytesSent = 0; capMethod = '';
+    capBytesSent = 0; capMethod = ''; capFramesRecv = 0;
     setDiagStat(els.diagMic, 'mic', 'requesting…', '');
     try {
       capStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -385,17 +415,11 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
           capMethod = 'AudioWorklet';
         } catch (e) { diag.add('AudioWorklet failed (' + (e && e.message) + ') — using ScriptProcessor'); useWorklet = false; }
       }
-      if (!useWorklet) {
-        // ScriptProcessor fallback (deprecated but works on older iOS Safari).
-        var spn = capCtx.createScriptProcessor ? capCtx.createScriptProcessor(4096, 1, 1) : capCtx.createJavaScriptNode(4096, 1, 1);
-        capProc = spn;
-        spn.onaudioprocess = function (ev) { onCapFrame(ev.inputBuffer.getChannelData(0)); };
-        capSource.connect(spn); spn.connect(capCtx.destination);
-        capMethod = 'ScriptProcessor';
-      }
+      if (!useWorklet) startScriptProcessor();
       diag.add('mic capture started via ' + capMethod);
       setDiagStat(els.diagMic, 'mic', 'capturing (' + capMethod + ')', 'good');
       capturing = true; refreshMicUi();
+      if (capMethod === 'AudioWorklet') armWorkletWatchdog();
       localSay('Listening.');
     } catch (e) {
       diag.error('mic capture setup failed: ' + (e && e.message));
@@ -411,7 +435,8 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
       sendJson({ type: transcribe ? 'stt-end' : 'stt-cancel' });
     }
     capturing = false;
-    try { if (capNode) capNode.disconnect(); } catch (e) {}
+    if (capWatchdog) { clearTimeout(capWatchdog); capWatchdog = null; }
+    try { if (capNode) { capNode.port.onmessage = null; capNode.disconnect(); } } catch (e) {}
     try { if (capProc) { capProc.onaudioprocess = null; capProc.disconnect(); } } catch (e) {}
     try { if (capSource) capSource.disconnect(); } catch (e) {}
     try { if (capStream) capStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
