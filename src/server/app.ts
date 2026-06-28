@@ -240,12 +240,32 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         const buf = sttBuffers.get(ws);
         sttBuffers.delete(ws);
         if (!transcribe) { ship(ws, { type: 'error', message: 'server-side STT not configured — use Web Speech or type' }); return; }
-        if (!buf || buf.chunks.length === 0) { ship(ws, { type: 'transcript', text: '', final: true }); return; }
+        if (!buf || buf.chunks.length === 0) {
+          log('stt: stt-end with 0 captured bytes (no mic frames streamed)');
+          ship(ws, { type: 'transcript', text: '', final: true, empty: true, bytes: 0, reason: 'no audio captured (mic streamed 0 bytes)' });
+          return;
+        }
         const pcm = Buffer.concat(buf.chunks);
         const rate = buf.sampleRate;
+        log(`stt: transcribing ${pcm.length} bytes @ ${rate}Hz`);
         void transcribe(pcm, rate)
-          .then((text) => ship(ws, { type: 'transcript', text: (text || '').trim(), final: true }))
-          .catch((e) => ship(ws, { type: 'error', message: 'transcription failed: ' + (e as Error).message }));
+          .then((text) => {
+            const t = (text || '').trim();
+            // ALWAYS return a transcript frame — even empty — so the client can SHOW
+            // "heard nothing" rather than the mic silently swallowing the utterance.
+            if (!t) {
+              log(`stt: whisper returned empty for ${pcm.length} bytes`);
+              ship(ws, { type: 'transcript', text: '', final: true, empty: true, bytes: pcm.length, reason: 'transcriber returned no words' });
+            } else {
+              log(`stt: whisper -> "${t}" (${pcm.length} bytes)`);
+              ship(ws, { type: 'transcript', text: t, final: true, bytes: pcm.length });
+            }
+          })
+          .catch((e) => {
+            const m = (e as Error).message;
+            log('stt: transcription FAILED: ' + m);
+            ship(ws, { type: 'transcript', text: '', final: true, empty: true, bytes: pcm.length, reason: 'transcription failed: ' + m });
+          });
       } else if (msg.type === 'ping') {
         ship(ws, { type: 'pong' });
       }

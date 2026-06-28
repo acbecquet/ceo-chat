@@ -17,6 +17,7 @@ import { AudioPlayer } from '/lib/audio-player.js';
 import { SpeechController } from '/lib/speech.js';
 import { guardUtterance } from '/lib/confirm.js';
 import { bytesToBase64, float32ToPcmS16le, downsampleFloat32 } from '/lib/pcm.js';
+import { Diagnostics } from '/lib/diagnostics.js';
 import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
 
 (function () {
@@ -39,8 +40,50 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     log: byId('log'), input: byId('input'), send: byId('send'), mic: byId('mic'), hint: byId('hint'),
     termDetails: byId('term-details'),
     overlay: byId('callmode-overlay'), cmStatus: byId('cm-status'), cmExit: byId('cm-exit'),
+    diagDetails: byId('diag-details'), diagLog: byId('diag-log'), diagCtx: byId('diag-ctx'),
+    diagKeepAlive: byId('diag-keepalive'), diagMic: byId('diag-mic'),
+    diagCopy: byId('diag-copy'), diagClear: byId('diag-clear'),
   };
   function byId(id) { return document.getElementById(id); }
+
+  // ---- diagnostics panel (sighted device testing) ----
+  var diag = new Diagnostics({
+    onAdd: function (rec) { renderDiagLine(rec); },
+    onError: function () { try { if (els.diagDetails) els.diagDetails.open = true; } catch (e) {} },
+  });
+  function renderDiagLine(rec) {
+    if (!els.diagLog) return;
+    var line = document.createElement('div');
+    line.className = 'd-line' + (rec.level === 'error' ? ' d-err' : '');
+    var ts = document.createElement('span'); ts.className = 'd-ts';
+    ts.textContent = '[+' + (rec.ts / 1000).toFixed(2) + 's] ';
+    line.appendChild(ts);
+    line.appendChild(document.createTextNode(rec.msg));
+    els.diagLog.appendChild(line);
+    while (els.diagLog.childElementCount > diag.max) els.diagLog.removeChild(els.diagLog.firstChild);
+    els.diagLog.scrollTop = els.diagLog.scrollHeight;
+  }
+  function setDiagStat(el, label, val, cls) {
+    if (!el) return;
+    el.textContent = label + ': ' + val;
+    el.className = 'diag-stat' + (cls ? ' ' + cls : '');
+  }
+  if (els.diagCopy) els.diagCopy.addEventListener('click', function () {
+    var text = diag.text();
+    var done = function () { toast('diagnostics copied to clipboard'); };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(done, fallbackCopy); }
+      else fallbackCopy();
+    } catch (e) { fallbackCopy(); }
+    function fallbackCopy() {
+      try {
+        var ta = document.createElement('textarea'); ta.value = text;
+        ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta);
+        ta.focus(); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done();
+      } catch (e2) { toast('copy failed — select the log manually'); }
+    }
+  });
+  if (els.diagClear) els.diagClear.addEventListener('click', function () { diag.clear(); if (els.diagLog) els.diagLog.textContent = ''; });
 
   // ---- terminal (xterm.js) ----
   var term = new window.Terminal({
@@ -63,18 +106,49 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   var wakeLock = null;
 
   // ---- audio: auto-speak ----
+  var lastCtxState = '';
   var audio = new AudioPlayer({
     createContext: function () {
       var AC = window.AudioContext || window.webkitAudioContext;
       return new AC();
     },
+    // HTMLAudioElement fallback: persistent <audio> fed a WAV Blob per reply when the
+    // AudioContext won't stay 'running' (the iOS idle-suspend bug).
+    createAudioElement: function () { return new Audio(); },
+    makeObjectUrl: function (bytes) { return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' })); },
+    revokeObjectUrl: function (url) { try { URL.revokeObjectURL(url); } catch (e) {} },
     onSpeakingChange: function (speaking) {
       if (speaking) { speech.pause(); }            // half-duplex: mute mic while talking
       else if (inCall && micWanted) { speech.resume(); }
       refreshStatus();
     },
+    onDiag: function (rec) {
+      if (rec.t === 'ctx') {
+        diag.add('AudioContext → ' + rec.state + (rec.reason ? ' (' + rec.reason + ')' : '') + (rec.keepAlive ? ' [keep-alive on]' : ''));
+        refreshAudioStats();
+      } else if (rec.t === 'keepalive') {
+        diag.add('keep-alive ' + (rec.active ? 'STARTED' : 'stopped')); refreshAudioStats();
+      } else if (rec.t === 'element') {
+        diag.add('HTMLAudio element armed (fallback ready)');
+      } else if (rec.t === 'play') {
+        diag.add('reply audio: ' + rec.bytes + ' bytes → ' + (rec.via === 'webaudio' ? 'Web Audio' : rec.via === 'element' ? 'HTMLAudio fallback' : 'BUFFERED (ctx ' + (rec.ctxState || '?') + ')'));
+      } else if (rec.t === 'playerr') {
+        diag.error('play error (' + rec.via + '): ' + (rec.error || 'unknown'));
+      }
+    },
     log: function (m) { console.debug('[audio]', m); },
   });
+  // Poll the AudioContext state while in a call so iOS auto-suspends (which fire no
+  // event) still show up live in the panel.
+  setInterval(function () {
+    var s = audio.ctxState;
+    if (s !== lastCtxState) { lastCtxState = s; refreshAudioStats(); if (inCall && s === 'suspended') diag.add('AudioContext idle-suspended (poll) — keep-alive ' + (audio.keepAliveActive ? 'on' : 'OFF')); }
+  }, 1000);
+  function refreshAudioStats() {
+    var s = audio.ctxState;
+    setDiagStat(els.diagCtx, 'ctx', s, s === 'running' ? 'good' : s === 'suspended' || s === 'interrupted' ? 'bad' : '');
+    setDiagStat(els.diagKeepAlive, 'keep-alive', audio.keepAliveActive ? 'on' : 'off', audio.keepAliveActive ? 'good' : '');
+  }
 
   // ---- speech (Web Speech STT) ----
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -84,10 +158,11 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
       if (!SR) throw new Error('no SpeechRecognition');
       return new SR();
     },
-    onState: function (s) { micState = s; refreshStatus(); refreshMicUi(); },
-    onResult: function (text, meta) { onSpoken(text, meta.isFinal); },
+    onState: function (s) { micState = s; if (webSpeechOk) setDiagStat(els.diagMic, 'mic', 'WebSpeech ' + s, s === 'listening' ? 'good' : ''); refreshStatus(); refreshMicUi(); },
+    onResult: function (text, meta) { if (webSpeechOk && meta.isFinal) diag.add('WebSpeech → "' + text + '"'); onSpoken(text, meta.isFinal); },
     onError: function (err) {
       console.debug('[speech]', err);
+      diag.error('WebSpeech error: ' + err.kind);
       if (err.kind === 'permission' || err.kind === 'unsupported') {
         // Web Speech unavailable — fall back to server-side STT (tap-to-talk) if we have it.
         webSpeechOk = false;
@@ -131,7 +206,19 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
         lastTurn = { pcm: msg.pcm, sampleRate: msg.sampleRate || sampleRate };
         audio.enqueue(msg.pcm, msg.sampleRate || sampleRate); // AUTO-SPEAK
         break;
-      case 'transcript': onSpoken(msg.text || '', true); break; // server STT result -> same guard path
+      case 'transcript':
+        // Server STT result. Make empty/failed results VISIBLE rather than silent.
+        if (msg.empty || !(msg.text || '').trim()) {
+          var why = msg.reason || 'no words recognized';
+          diag.error('server STT empty: ' + why + (msg.bytes != null ? ' (' + msg.bytes + ' bytes)' : ''));
+          setDiagStat(els.diagMic, 'mic', 'heard nothing', 'bad');
+          toast('Heard nothing — ' + why);
+          break;
+        }
+        diag.add('server STT → "' + msg.text + '"' + (msg.bytes != null ? ' (' + msg.bytes + ' bytes)' : ''));
+        setDiagStat(els.diagMic, 'mic', 'transcribed', 'good');
+        onSpoken(msg.text || '', true); // -> same confirmation guard path
+        break;
       case 'turn-done':
         addTurn('', { who: 'turn ' + msg.turn, meta: msg.bytes + ' audio bytes · ttfa ' + (msg.ttfbMs == null ? 'n/a' : msg.ttfbMs + 'ms') });
         break;
@@ -205,7 +292,10 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   // ---- call lifecycle ----
   async function startCall() {
     inCall = true;
-    await audio.unlock();              // THE unlock — must be in this tap handler
+    diag.add('Start call tapped — unlocking audio');
+    var running = await audio.unlock();              // THE unlock — must be in this tap handler
+    diag.add('after unlock: ctx ' + audio.ctxState + ', keep-alive ' + (audio.keepAliveActive ? 'on' : 'off') + (running ? ' (Web Audio running)' : ' (will use fallback if needed)'));
+    refreshAudioStats();
     await acquireWakeLock();
     micWanted = true;
     startListening();
@@ -253,36 +343,109 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     if (!webSpeechOk && serverStt) els.hint.innerHTML = 'Web Speech is unavailable here — tap <b>🎙</b> to talk; audio is transcribed on the server (' + (sttLabel || 'whisper') + ').';
   }
 
-  // server STT capture: getUserMedia -> AudioWorklet -> downsample 16k -> stream.
-  var capturing = false, capCtx = null, capStream = null, capNode = null, capSource = null;
+  // server STT capture: getUserMedia -> AudioWorklet (or ScriptProcessor fallback)
+  // -> downsample 16k -> stream. Hardened for iOS: the capture AudioContext is resumed
+  // INSIDE the mic tap and kept running; if AudioWorklet is unavailable (throws) OR
+  // silent (a 1.5s watchdog sees 0 frames) we fall back to a ScriptProcessorNode so
+  // iOS still streams PCM.
+  var capturing = false, capCtx = null, capStream = null, capNode = null, capSource = null, capProc = null;
+  var capBytesSent = 0, capMethod = '', capFramesRecv = 0, capWatchdog = null;
+  function onCapFrame(f32) {
+    capFramesRecv++;                                      // counts even when half-duplex suppresses sending
+    if (audio.speaking) return;                           // half-duplex: skip first mate's reply
+    var down = downsampleFloat32(f32, capCtx.sampleRate, STT_SAMPLE_RATE);
+    var pcm = float32ToPcmS16le(down);
+    capBytesSent += pcm.length;
+    sendJson({ type: 'stt-audio', pcm: bytesToBase64(pcm), sampleRate: STT_SAMPLE_RATE });
+  }
+  function startScriptProcessor() {
+    // ScriptProcessor fallback (deprecated but works on older iOS Safari / silent worklet).
+    var spn = capCtx.createScriptProcessor ? capCtx.createScriptProcessor(4096, 1, 1) : capCtx.createJavaScriptNode(4096, 1, 1);
+    capProc = spn;
+    spn.onaudioprocess = function (ev) { onCapFrame(ev.inputBuffer.getChannelData(0)); };
+    capSource.connect(spn); spn.connect(capCtx.destination);
+    capMethod = 'ScriptProcessor';
+  }
+  // iOS Safari sometimes loads + constructs an AudioWorklet whose port never fires
+  // (a "silent worklet"). If no frames arrive shortly after start, swap to ScriptProcessor.
+  function armWorkletWatchdog() {
+    if (capWatchdog) clearTimeout(capWatchdog);
+    capWatchdog = setTimeout(function () {
+      capWatchdog = null;
+      if (!capturing || capMethod !== 'AudioWorklet' || capFramesRecv > 0) return;
+      diag.error('AudioWorklet silent (0 frames in 1.5s) — switching to ScriptProcessor');
+      try { if (capNode) { capNode.port.onmessage = null; capNode.disconnect(); } } catch (e) {}
+      capNode = null;
+      try {
+        startScriptProcessor();
+        diag.add('mic capture restarted via ' + capMethod);
+        setDiagStat(els.diagMic, 'mic', 'capturing (' + capMethod + ')', 'good');
+      } catch (e) {
+        diag.error('ScriptProcessor fallback failed: ' + (e && e.message));
+        setDiagStat(els.diagMic, 'mic', 'failed', 'bad');
+      }
+    }, 1500);
+  }
   async function startServerCapture() {
     if (capturing || !serverStt) return;
+    capBytesSent = 0; capMethod = ''; capFramesRecv = 0;
+    setDiagStat(els.diagMic, 'mic', 'requesting…', '');
     try {
       capStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      diag.add('getUserMedia: OK (mic granted)');
+    } catch (e) {
+      diag.error('getUserMedia DENIED/failed: ' + (e && e.message));
+      setDiagStat(els.diagMic, 'mic', 'denied', 'bad');
+      toast('mic permission failed: ' + (e && e.message));
+      return;
+    }
+    try {
       var AC = window.AudioContext || window.webkitAudioContext;
       capCtx = new AC();
-      await capCtx.audioWorklet.addModule('/lib/capture-worklet.js');
+      // iOS starts capture contexts suspended too — resume in this tap gesture.
+      try { if (capCtx.state !== 'running' && capCtx.resume) await capCtx.resume(); } catch (e) {}
+      diag.add('capture ctx: ' + capCtx.state + ' @ ' + capCtx.sampleRate + 'Hz');
       capSource = capCtx.createMediaStreamSource(capStream);
-      capNode = new AudioWorkletNode(capCtx, 'ceo-capture');
-      capNode.port.onmessage = function (e) {
-        if (audio.speaking) return;                         // half-duplex: don't record first mate's reply
-        var f32 = e.data;                                   // Float32 at capCtx.sampleRate
-        var down = downsampleFloat32(f32, capCtx.sampleRate, STT_SAMPLE_RATE);
-        sendJson({ type: 'stt-audio', pcm: bytesToBase64(float32ToPcmS16le(down)), sampleRate: STT_SAMPLE_RATE });
-      };
-      capSource.connect(capNode); capNode.connect(capCtx.destination);
+      var useWorklet = !!(capCtx.audioWorklet && capCtx.audioWorklet.addModule && typeof AudioWorkletNode !== 'undefined');
+      if (useWorklet) {
+        try {
+          await capCtx.audioWorklet.addModule('/lib/capture-worklet.js');
+          capNode = new AudioWorkletNode(capCtx, 'ceo-capture');
+          capNode.port.onmessage = function (e) { onCapFrame(e.data); };
+          capSource.connect(capNode); capNode.connect(capCtx.destination);
+          capMethod = 'AudioWorklet';
+        } catch (e) { diag.add('AudioWorklet failed (' + (e && e.message) + ') — using ScriptProcessor'); useWorklet = false; }
+      }
+      if (!useWorklet) startScriptProcessor();
+      diag.add('mic capture started via ' + capMethod);
+      setDiagStat(els.diagMic, 'mic', 'capturing (' + capMethod + ')', 'good');
       capturing = true; refreshMicUi();
+      if (capMethod === 'AudioWorklet') armWorkletWatchdog();
       localSay('Listening.');
-    } catch (e) { toast('mic capture failed: ' + e.message); }
+    } catch (e) {
+      diag.error('mic capture setup failed: ' + (e && e.message));
+      setDiagStat(els.diagMic, 'mic', 'failed', 'bad');
+      toast('mic capture failed: ' + (e && e.message));
+      stopServerCapture(false);
+    }
   }
   function stopServerCapture(transcribe) {
-    if (capturing) sendJson({ type: transcribe ? 'stt-end' : 'stt-cancel' });
+    if (capturing) {
+      diag.add('mic ' + (transcribe ? 'stop → transcribe' : 'cancel') + ' (' + capBytesSent + ' PCM bytes streamed via ' + (capMethod || '?') + ', ' + capFramesRecv + ' frames captured)');
+      if (transcribe && capBytesSent === 0) {
+        if (capFramesRecv > 0) { diag.add('mic captured ' + capFramesRecv + ' frames but all were suppressed by half-duplex (first mate was speaking) — no failure'); }
+        else { diag.error('mic streamed 0 bytes — no audio reached the server'); setDiagStat(els.diagMic, 'mic', 'no audio', 'bad'); }
+      }
+      sendJson({ type: transcribe ? 'stt-end' : 'stt-cancel' });
+    }
     capturing = false;
-    try { if (capNode) capNode.disconnect(); } catch (e) {}
+    if (capWatchdog) { clearTimeout(capWatchdog); capWatchdog = null; }
+    try { if (capNode) { capNode.port.onmessage = null; capNode.disconnect(); } } catch (e) {}
+    try { if (capProc) { capProc.onaudioprocess = null; capProc.disconnect(); } } catch (e) {}
     try { if (capSource) capSource.disconnect(); } catch (e) {}
     try { if (capStream) capStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
     try { if (capCtx) capCtx.close(); } catch (e) {}
-    capNode = capSource = capStream = capCtx = null;
+    capNode = capProc = capSource = capStream = capCtx = null;
     refreshMicUi();
   }
 

@@ -62,7 +62,9 @@ export type ServerMessage =
     }
   // Result of a SERVER-SIDE STT transcription — handed BACK to the client (not
   // auto-run) so the confirmation guard (§3.5) applies before it reaches firstmate.
-  | { type: 'transcript'; text: string; final: boolean }
+  // `empty` (no speech recognized) / `reason` (why nothing came back) make a silent
+  // failure VISIBLE on the device instead of "mic on, no words" — the captain's bug.
+  | { type: 'transcript'; text: string; final: boolean; empty?: boolean; bytes?: number; reason?: string }
   // Status indicator transition.
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.

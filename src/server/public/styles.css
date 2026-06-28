@@ -172,3 +172,33 @@ body {
   .status-sub { font-size: 14px; }
   .terminal { height: 50vh; }
 }
+
+/* ---- diagnostics panel (sighted device testing: audio/mic/STT live log) ---- */
+.diag-panel { padding: 0; overflow: hidden; }
+.diag-panel > summary {
+  list-style: none; cursor: pointer; padding: 14px; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); font-weight: 700;
+}
+.diag-panel > summary::-webkit-details-marker { display: none; }
+.diag-panel > summary::before { content: "▸ "; }
+.diag-panel[open] > summary::before { content: "▾ "; }
+.diag-toolbar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  padding: 8px 12px; border-top: 1px solid var(--line); background: #0b0e13;
+}
+.diag-stat {
+  font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted);
+  background: #11151c; border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
+}
+.diag-stat.bad { color: #ffb4b4; border-color: #5a2a2a; }
+.diag-stat.good { color: #8fe3a0; border-color: #2a5a33; }
+.diag-spacer { flex: 1 1 auto; }
+.btn.small { font-size: 12px; padding: 5px 9px; }
+.diag-log {
+  max-height: 38vh; overflow: auto; -webkit-overflow-scrolling: touch;
+  padding: 8px 12px; font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  color: #c7cfda; background: #000; white-space: pre-wrap; word-break: break-word;
+}
+.diag-log .d-line { padding: 1px 0; }
+.diag-log .d-err { color: #ff9b9b; }
+.diag-log .d-ts { color: #5a6473; }

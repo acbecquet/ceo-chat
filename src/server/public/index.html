@@ -62,6 +62,24 @@
       </div>
     </section>
 
+    <!-- Diagnostics — off by default; auto-opens on the first audio/mic error so the
+         captain's device test is SIGHTED. "Copy diagnostics" copies the log to paste back. -->
+    <details class="panel diag-panel" id="diag-details">
+      <summary>
+        <span class="sum-title">Diagnostics</span>
+        <span class="muted">— audio / mic on this device</span>
+      </summary>
+      <div class="diag-toolbar">
+        <span class="diag-stat" id="diag-ctx">ctx: —</span>
+        <span class="diag-stat" id="diag-keepalive">keep-alive: —</span>
+        <span class="diag-stat" id="diag-mic">mic: —</span>
+        <span class="diag-spacer"></span>
+        <button id="diag-copy" class="btn small">⧉ Copy diagnostics</button>
+        <button id="diag-clear" class="btn small ghostline">Clear</button>
+      </div>
+      <div id="diag-log" class="diag-log" aria-live="polite"></div>
+    </details>
+
     <!-- The terminal — secondary; a glance when stopped. Collapsible + touch-scrolls. -->
     <details class="panel term-panel" id="term-details">
       <summary><span class="sum-title">Terminal view</span> <span class="muted">— glance when stopped</span></summary>

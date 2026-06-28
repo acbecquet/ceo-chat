@@ -126,9 +126,23 @@ The web app is built to feel like a **phone call** from the car:
 - **Audio unlocks on the first tap.** Mobile browsers suspend audio until a user
   gesture — the **Start call** button resumes the AudioContext (and holds a **Wake
   Lock**), after which replies auto-play with no further taps. Replies that arrive
-  before the tap are buffered, not lost.
+  before the tap are buffered, not lost. iOS Safari also auto-*re*-suspends the context
+  when idle, so a reply arriving seconds later would otherwise be silent: a near-silent
+  **keep-alive** source holds the context running, and a primed **HTMLAudioElement
+  fallback** plays the reply as a WAV blob whenever the context isn't genuinely running.
 - **Half-duplex:** the mic mutes while first mate is speaking, so the read-aloud isn't
   transcribed back.
+- **Mic failures are visible, not silent.** Tap-to-talk resumes the capture context in
+  the gesture and falls back to a `ScriptProcessorNode` when `AudioWorklet` is missing,
+  so older iOS still streams PCM; the server always returns a transcript frame — even an
+  empty one carrying the reason and bytes-received — so "mic on, no words" shows up on
+  screen ("Heard nothing — …") instead of being dropped.
+- **On-screen Diagnostics panel:** collapsible, off by default, **auto-opens on the
+  first audio/mic error**. Shows live AudioContext state / keep-alive / mic chips, each
+  reply's play path (Web Audio vs HTMLAudio fallback vs buffered) and play errors, and
+  mic getUserMedia / worklet-vs-scriptprocessor / bytes-streamed / server transcript —
+  with a one-tap **Copy diagnostics** button, so a device test can be sighted by pasting
+  the log back.
 - **Voice-safe confirmations (plan §3.5):** when first mate asks to confirm a
   consequential action (merge/push/deploy/delete…), a *spoken* reply must be a clear
   "confirm" or "cancel" — a misheard "yeah" is held and re-prompted, never
@@ -183,7 +197,7 @@ It covers:
 | **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
-| **Mobile** | pcm codec (browser↔node) · audio auto-speak (unlock/queue/barge-in) · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
+| **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -276,7 +290,7 @@ src/
   server/serve.ts          the web server entrypoint (npm run serve)
   server/public/           the single-page UI (index.html, app.js [ESM], styles.css)
   web/                     PURE browser modules served at /lib + asserted by validate:
-                           pcm · audio-player · speech · confirm · capture-worklet
+                           pcm · audio-player · speech · confirm · capture-worklet · diagnostics
 test/
   validate.ts              the validation harness (npm run validate)
   harness/                 reporter + transcript/turn fixtures

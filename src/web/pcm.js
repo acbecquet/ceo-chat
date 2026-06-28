@@ -81,6 +81,31 @@ export function float32ToPcmS16le(float32) {
 }
 
 /**
+ * Wrap raw s16le mono PCM bytes in a 44-byte WAV (RIFF) header so the bytes can be
+ * fed to an HTMLAudioElement as an `audio/wav` Blob — the iOS-safe playback FALLBACK
+ * when the Web Audio AudioContext won't stay 'running'. Pure (no Buffer/Blob) so the
+ * SAME header the phone plays is byte-asserted by `npm run validate`.
+ */
+export function wavBytesFromPcm(pcmBytes, sampleRate = 22050, channels = 1, bitsPerSample = 16) {
+  const b = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
+  const dataLen = b.length;
+  const blockAlign = channels * (bitsPerSample >> 3);
+  const byteRate = sampleRate * blockAlign;
+  const out = new Uint8Array(44 + dataLen);
+  const dv = new DataView(out.buffer);
+  let o = 0;
+  const w4 = (s) => { for (let i = 0; i < 4; i++) out[o++] = s.charCodeAt(i); };
+  w4('RIFF'); dv.setUint32(o, 36 + dataLen, true); o += 4; w4('WAVE');
+  w4('fmt '); dv.setUint32(o, 16, true); o += 4; dv.setUint16(o, 1, true); o += 2; // PCM
+  dv.setUint16(o, channels, true); o += 2; dv.setUint32(o, sampleRate, true); o += 4;
+  dv.setUint32(o, byteRate, true); o += 4; dv.setUint16(o, blockAlign, true); o += 2;
+  dv.setUint16(o, bitsPerSample, true); o += 2;
+  w4('data'); dv.setUint32(o, dataLen, true); o += 4;
+  out.set(b, 44);
+  return out;
+}
+
+/**
  * Linear-resample Float32 audio from srcRate to dstRate (default 16 kHz). Good
  * enough for ASR; the mic typically delivers 44.1/48 kHz and Whisper-class models
  * want 16 kHz mono. Returns the source unchanged when rates already match.
