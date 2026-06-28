@@ -30,11 +30,13 @@ import {
 } from '../transcript/transcript.ts';
 import { waitForReply } from '../transcript/reply.ts';
 import { speakify } from '../speakability/speakability.ts';
-import { synthStreaming, toWav, INTL_WS } from '../tts/minimax.ts';
+import { synthStreaming, toWav, INTL_WS, DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
+import { findPiper, synthLocal, type LocalVoice } from '../tts/local-tts.ts';
 import { runPipeline, type PipelineResult, type PipelineStage } from './pipeline.ts';
 import { startMockMinimax, type MockMinimax } from '../tts/mock-server.ts';
+import type { TtsMode } from '../server/protocol.ts';
 
-export type TtsMode = 'live' | 'mock';
+export type { TtsMode };
 
 export interface BrokerOptions {
   outDir: string;
@@ -56,6 +58,7 @@ export class Broker {
   private projectDir = '';
   private transcriptPath: string | null = null;
   private mock: MockMinimax | null = null;
+  private voice: LocalVoice | null = null;
   private readonly forceMock: boolean;
   private readonly targetSpec: TargetSpec | null;
   readonly ttsMode: TtsMode;
@@ -65,7 +68,17 @@ export class Broker {
     this.outDir = opts.outDir;
     this.log = opts.log ?? (() => {});
     this.forceMock = !!opts.mock;
-    this.ttsMode = !this.forceMock && hasMinimaxCreds(this.secrets) ? 'live' : 'mock';
+    // TTS backend precedence: MiniMax (premium, creds present) -> local piper neural
+    // voice (DEFAULT offline — real words, no key) -> mock synthetic tone (unit
+    // tests / no voice installed). --mock / CEOCHAT_MOCK forces the tone.
+    if (this.forceMock) {
+      this.ttsMode = 'mock';
+    } else if (hasMinimaxCreds(this.secrets)) {
+      this.ttsMode = 'minimax';
+    } else {
+      this.voice = findPiper();
+      this.ttsMode = this.voice ? 'local' : 'mock';
+    }
     // CEOCHAT_TARGET (/_SESSION/_WINDOW) -> attach to a real first mate; else spawn.
     this.targetSpec = resolveTargetFromEnv();
   }
@@ -73,6 +86,18 @@ export class Broker {
   speakBackendHint(): string {
     if (this.forceMock) return 'mock';
     return has(this.secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'claude-cli';
+  }
+
+  /** Human label of the TTS voice/backend in use (for logs + the UI). */
+  ttsVoiceLabel(): string {
+    if (this.ttsMode === 'local') return this.voice ? this.voice.name : 'local';
+    if (this.ttsMode === 'minimax') return 'minimax';
+    return 'mock tone';
+  }
+
+  /** Native sample rate of the active TTS backend (audio frames carry their own). */
+  ttsSampleRate(): number {
+    return this.ttsMode === 'local' && this.voice ? this.voice.sampleRate : DEFAULT_SAMPLE_RATE;
   }
 
   /** Is the broker attaching to a captain-launched first mate (vs spawning one)? */
@@ -104,9 +129,11 @@ export class Broker {
     }
     if (this.ttsMode === 'mock') {
       this.mock = await startMockMinimax();
-      this.log('TTS: mock MiniMax (no creds) — real WAV from synthetic PCM');
+      this.log('TTS: mock MiniMax (no creds, no voice installed) — synthetic tone for unit tests');
+    } else if (this.ttsMode === 'local') {
+      this.log(`TTS: LOCAL piper voice (${this.voice!.name}) — real offline speech, no key`);
     } else {
-      this.log('TTS: LIVE MiniMax (creds present)');
+      this.log('TTS: LIVE MiniMax (creds present) — premium cloud voice');
     }
   }
 
@@ -170,7 +197,7 @@ export class Broker {
   // ---- internals ----
 
   private async synth(chunks: string[]) {
-    if (this.ttsMode === 'live') {
+    if (this.ttsMode === 'minimax') {
       return synthStreaming({
         apiKey: this.secrets.MINIMAX_API_KEY!,
         groupId: this.secrets.MINIMAX_GROUP_ID || '',
@@ -178,6 +205,9 @@ export class Broker {
         endpoint: INTL_WS,
         log: this.log,
       });
+    }
+    if (this.ttsMode === 'local') {
+      return synthLocal(this.voice!, chunks, { log: this.log });
     }
     return synthStreaming({
       apiKey: 'mock', groupId: 'mock', textChunks: chunks,

@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="theme-color" content="#0e1116" />
   <title>ceo-chat — voice bridge to firstmate</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/vendor/xterm.css" />
@@ -13,38 +17,70 @@
     <div class="brand">
       <span class="dot" id="conn-dot" title="connection"></span>
       <strong>ceo-chat</strong>
-      <span class="muted">voice bridge to firstmate</span>
     </div>
     <div class="modes">
       <span class="pill" id="status-pill" data-state="idle">Idle</span>
-      <span class="pill ghost" id="tts-pill">TTS —</span>
-      <span class="pill ghost" id="speak-pill">speak —</span>
+      <span class="pill ghost" id="tts-pill">voice —</span>
     </div>
   </header>
 
-  <main class="grid">
-    <section class="panel term-panel">
-      <h2>Terminal view <span class="muted">— ceo-chat agent session</span></h2>
-      <div id="terminal" class="terminal"></div>
+  <main class="stack">
+    <!-- The hands-free call surface — primary on a phone. -->
+    <section class="panel call-panel">
+      <div class="status-hero">
+        <div class="status-ring" id="status-ring" data-state="idle">
+          <span class="status-icon" id="status-icon">●</span>
+        </div>
+        <div class="status-words" id="status-words">Tap “Start call” to begin</div>
+        <div class="status-sub" id="status-sub">Audio plays after the first tap (mobile requires it).</div>
+      </div>
+
+      <div class="call-controls">
+        <button id="start" class="btn primary big">▶ Start call</button>
+        <button id="hangup" class="btn danger big hidden">■ End call</button>
+      </div>
+      <div class="call-toggles hidden" id="call-toggles">
+        <button id="mic-toggle" class="btn" aria-pressed="true">🎙 Mic on</button>
+        <button id="callmode-toggle" class="btn" aria-pressed="false">📞 Call mode</button>
+        <button id="replay" class="btn" title="Read the last reply again">↻ Replay</button>
+      </div>
+      <p class="hint" id="hint">
+        Hands-free: tap <b>Start call</b> once — first mate’s replies are then read aloud
+        automatically and the mic listens between turns.
+      </p>
     </section>
 
+    <!-- The conversation / narration log. -->
     <section class="panel chat-panel">
       <h2>Conversation</h2>
       <div id="log" class="log" aria-live="polite"></div>
-
       <div class="composer">
-        <button id="mic" class="mic" title="Push to talk (browser speech recognition)" aria-label="Push to talk">🎙</button>
-        <input id="input" type="text" autocomplete="off" placeholder="Type a message for firstmate…" />
+        <button id="mic" class="mic" title="Push to talk" aria-label="Push to talk">🎙</button>
+        <input id="input" type="text" autocomplete="off" enterkeyhint="send"
+               placeholder="Type a message for firstmate…" />
         <button id="send" class="send">Send</button>
       </div>
-      <p class="hint" id="hint">
-        Mic uses the browser's built-in speech recognition (best-effort). Typing is the
-        always-reliable path.
-      </p>
     </section>
+
+    <!-- The terminal — secondary; a glance when stopped. Collapsible + touch-scrolls. -->
+    <details class="panel term-panel" id="term-details">
+      <summary><span class="sum-title">Terminal view</span> <span class="muted">— glance when stopped</span></summary>
+      <div id="terminal" class="terminal"></div>
+    </details>
   </main>
 
+  <!-- Call-mode overlay: full-screen black, ignores touches (cheek-proof). Audio
+       (listening + read-aloud) keeps running underneath. Web can't power the iOS
+       backlight off — a native wrapper would; this is the closest web approximation. -->
+  <div id="callmode-overlay" class="callmode-overlay hidden" aria-hidden="true">
+    <div class="cm-inner">
+      <div class="cm-status" id="cm-status">On call</div>
+      <button id="cm-exit" class="btn ghostline">Tap to wake screen</button>
+      <div class="cm-note">Screen dimmed for a call feel · backlight stays on (web limit)</div>
+    </div>
+  </div>
+
   <script src="/vendor/xterm.js"></script>
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

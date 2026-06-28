@@ -19,8 +19,16 @@ export type UiStatus =
   | 'speaking'
   | 'awaiting-confirmation';
 
-// PCM audio is always this shape (matches the pipeline / mock MiniMax output).
+// PCM audio is always this shape (matches the pipeline / piper / mock output).
 export const AUDIO_FORMAT = 'pcm-s16le-mono';
+
+// TTS backend the broker is speaking through (plan §6 + local-voice addendum):
+//   minimax = premium cloud voice (creds present); local = offline piper neural
+//   voice (DEFAULT — real words, no key); mock = synthetic tone (unit tests).
+export type TtsMode = 'minimax' | 'local' | 'mock';
+
+// Sample rate the SERVER-SIDE STT path expects the browser to send mic PCM at.
+export const STT_SAMPLE_RATE = 16000;
 
 // ---- client -> server ----
 export type ClientMessage =
@@ -28,6 +36,12 @@ export type ClientMessage =
   | { type: 'send'; text: string }
   // The mic button toggled — purely a status hint so other viewers see it.
   | { type: 'listening'; on: boolean }
+  // SERVER-SIDE STT fallback: a chunk of captured mic PCM (base64 s16le mono).
+  | { type: 'stt-audio'; pcm: string; sampleRate: number }
+  // End of the spoken utterance — transcribe the buffered audio and return text.
+  | { type: 'stt-end' }
+  // Discard any buffered STT audio without transcribing (barge-in / mic released).
+  | { type: 'stt-cancel' }
   // Liveness.
   | { type: 'ping' };
 
@@ -36,11 +50,19 @@ export type ServerMessage =
   // Sent once on connect: current modes + audio params for the player.
   | {
       type: 'hello';
-      ttsMode: 'live' | 'mock';
+      ttsMode: TtsMode;
+      ttsVoice: string;
       speakBackend: string;
       sampleRate: number;
       audioFormat: typeof AUDIO_FORMAT;
+      // Server-side STT availability (local whisper). The browser still prefers its
+      // own Web Speech; this is the fallback when that's unavailable/flaky.
+      serverStt: boolean;
+      sttLabel: string;
     }
+  // Result of a SERVER-SIDE STT transcription — handed BACK to the client (not
+  // auto-run) so the confirmation guard (§3.5) applies before it reaches firstmate.
+  | { type: 'transcript'; text: string; final: boolean }
   // Status indicator transition.
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.

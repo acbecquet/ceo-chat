@@ -6,12 +6,17 @@ view to glance at when stopped. firstmate is tmux-based; ceo-chat brokers voice 
 terminal view over one connection, reusing firstmate's own text injection for
 voice-in and a clean transcript tap for voice-out.
 
-This repo ships the **end-to-end core** plus a **browser web app**: a runnable
-broker that wires the whole pipeline, a single-page UI you open in a browser to
-exercise the full loop (terminal view + type/speak → firstmate → narration → audio),
-and a comprehensive validation harness that proves every leg — green with **no
-credentials**, and degrading cleanly to **live** when MiniMax/LLM keys are present.
-(Cloud/local STT and the phone PWA / WebRTC polish are later phases.)
+This repo ships the **end-to-end core** plus a **mobile-first browser web app**: a
+runnable broker that wires the whole pipeline, a single-page phone-call UI (auto-spoken
+replies, hands-free mic, a glanceable terminal), and a comprehensive validation harness
+that proves every leg — green with **no credentials**, including a **REAL generated-audio
+round-trip** (offline neural TTS → STT).
+
+**It speaks real words with no cloud key.** A local, offline neural voice
+([piper](https://github.com/rhasspy/piper)) is the default TTS, and a local transcriber
+([whisper.cpp](https://github.com/ggerganov/whisper.cpp)) powers STT — both installed
+sudo-free by `npm run voice`. MiniMax is an optional premium voice when its creds are
+present.
 
 ## The pipeline
 
@@ -40,10 +45,17 @@ validation harness exercise the **same** orchestration code.
 
 ```bash
 npm install                 # ws + xterm.js + TypeScript toolchain (Node >= 22 runs .ts directly)
-npm run validate            # the harness — fully green, no creds, no network
-npm run serve               # the WEB APP — open the printed http://127.0.0.1:8420/
+npm run voice               # one-time: download/build the LOCAL offline voice (piper TTS + whisper STT)
+npm run validate            # the harness — fully green; runs the REAL-audio round-trip when voice is installed
+npm run serve               # the WEB APP — open the printed http://127.0.0.1:8420/ (speaks with the local voice)
 npm run dev -- --mock "tell me the tests passed and ask if I should merge"   # CLI driver
 ```
+
+`npm run voice` lands everything **outside the repo** in `$CEOCHAT_VOICE_DIR`
+(default `~/.local/share/ceo-chat`): the piper binary + an English voice, and a
+static whisper.cpp + `ggml-tiny.en`. It's sudo-free and idempotent. Without it the
+app still runs (mock synthetic tone for TTS, text input for STT) and `validate` stays
+green — the real-audio leg just reports PENDING.
 
 ## Talk to your REAL first mate — attach mode (`CEOCHAT_TARGET`)
 
@@ -98,14 +110,39 @@ Open the printed URL and you get:
 - a **text input** that sends your message to firstmate (via the same `fm-send`
   verified submit);
 - the **speakability narration** as it is produced, and the **raw agent reply**;
-- the **TTS audio played back in the page** (Web Audio decodes raw PCM — the mock
-  server returns playable synthetic audio so this works with **no MiniMax key**, and
-  live MiniMax streams the same way once paired);
+- **auto-spoken replies** — tap **Start call** once and every reply is read aloud
+  automatically (Web Audio decodes raw PCM). The local piper voice speaks real words
+  with no key; MiniMax streams the same way once paired; the mock tone is for tests;
 - **status indicators** — listening / thinking / speaking / awaiting-confirmation —
   driven off real pipeline stages;
-- a **push-to-talk mic** using the browser's built-in speech recognition
-  (`webkitSpeechRecognition`) as a quick STT path; where unsupported, the text input
-  is the always-reliable fallback. (Real cloud/local STT is a later phase.)
+- **hands-free voice input** — robust `webkitSpeechRecognition` (re-armed for iOS),
+  with a **server-side whisper STT fallback** when the browser path is unavailable;
+  the text input is always there too.
+
+### Mobile / hands-free (iOS Safari first)
+
+The web app is built to feel like a **phone call** from the car:
+
+- **Audio unlocks on the first tap.** Mobile browsers suspend audio until a user
+  gesture — the **Start call** button resumes the AudioContext (and holds a **Wake
+  Lock**), after which replies auto-play with no further taps. Replies that arrive
+  before the tap are buffered, not lost.
+- **Half-duplex:** the mic mutes while first mate is speaking, so the read-aloud isn't
+  transcribed back.
+- **Voice-safe confirmations (plan §3.5):** when first mate asks to confirm a
+  consequential action (merge/push/deploy/delete…), a *spoken* reply must be a clear
+  "confirm" or "cancel" — a misheard "yeah" is held and re-prompted, never
+  auto-approved. Typed input is always explicit.
+- **Call mode:** a toggle (and an iOS raise-to-ear heuristic via DeviceMotion) shows a
+  cheek-proof black overlay while audio keeps running. **Web limitation:** Safari
+  can't power the backlight off or read the proximity sensor — the backlight stays on;
+  true screen-off needs a native wrapper (the code leaves a clean seam for one).
+- **Terminal** is a collapsible, touch-scrollable glance — secondary to the voice loop.
+
+> **Real-device note:** the dev box has no mic and isn't an iPhone, so Web Speech
+> reliability, the raise-to-ear thresholds, and audible read-aloud through the tunnel
+> need the captain's **iPhone 14 / Safari** retest. The headless gate proves the logic
+> and the real offline audio; the device proves the sensors/permissions.
 
 ```bash
 npm run serve                                   # bind 127.0.0.1:8420 (mock TTS unless creds present)
@@ -146,6 +183,7 @@ It covers:
 | **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
+| **Mobile** | pcm codec (browser↔node) · audio auto-speak (unlock/queue/barge-in) · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -217,28 +255,35 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
 ```
 bin/
   launch-firstmate.sh      launch a first mate in tmux to attach to (npm run firstmate)
+  setup-local-voice.sh     download/build the offline voice stack (npm run voice)
 src/
   config/secrets.ts        secrets loader (outside-repo, gitignored)
   session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror
   transcript/transcript.ts JSONL tap (normalize/parse/tail)
   transcript/reply.ts      reply-wait latch (injectable, regression-guarded)
   speakability/            rewrite-for-the-ear (anthropic-api | claude-cli | mock)
-  tts/minimax.ts           MiniMax streaming TTS client
+  tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec)
+  tts/local-tts.ts         LOCAL piper neural voice — the default offline TTS
   tts/mock-server.ts       in-process MiniMax mock (real protocol, synthetic PCM)
   broker/pipeline.ts       the one injected end-to-end orchestration (+ onStage hook)
-  broker/broker.ts         the runnable broker (owns session + tts mode)
+  broker/broker.ts         the runnable broker (owns session + TTS backend: minimax|local|mock)
   cli/dev.ts               the CLI driver entrypoint
   server/protocol.ts       the browser <-> broker WS message contract
   server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
-  server/app.ts            HTTP + WS transport (static UI, status, terminal stream)
+  server/app.ts            HTTP + WS transport (static UI, status, terminal, STT seam)
+  server/stt.ts            LOCAL whisper.cpp transcriber (server STT + the e2e gate)
   server/serve.ts          the web server entrypoint (npm run serve)
-  server/public/           the single-page UI (index.html, app.js, styles.css)
-                           xterm.js is vendored from node_modules, served at /vendor
+  server/public/           the single-page UI (index.html, app.js [ESM], styles.css)
+  web/                     PURE browser modules served at /lib + asserted by validate:
+                           pcm · audio-player · speech · confirm · capture-worklet
 test/
   validate.ts              the validation harness (npm run validate)
   harness/                 reporter + transcript/turn fixtures
 phase0/                    the original de-risking spikes (preserved)
 ```
+
+> The offline voice binaries live OUTSIDE the repo in `$CEOCHAT_VOICE_DIR`
+> (default `~/.local/share/ceo-chat`) — installed by `npm run voice`, never committed.
 
 ## Scripts
 
@@ -246,6 +291,7 @@ phase0/                    the original de-risking spikes (preserved)
 |---|---|
 | `npm run validate` | end-to-end harness, mock mode (the gate — must be green) |
 | `npm run validate:live` | same harness against real services where creds exist |
+| `npm run voice` | install the LOCAL offline voice (piper TTS + whisper STT) outside the repo |
 | `npm run firstmate` | launch a first mate in tmux to attach to (prints `CEOCHAT_TARGET`) |
 | `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker) |
 | `npm run dev` | run the CLI driver (interactive or one-shot) |

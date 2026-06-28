@@ -17,7 +17,7 @@ import { dirname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { WS_PATH, AUDIO_FORMAT, type ServerMessage, type ClientMessage, type UiStatus } from './protocol.ts';
+import { WS_PATH, AUDIO_FORMAT, STT_SAMPLE_RATE, type ServerMessage, type ClientMessage, type UiStatus } from './protocol.ts';
 import type { Driver } from './driver.ts';
 import type { PipelineStage } from '../broker/pipeline.ts';
 
@@ -25,6 +25,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(HERE, 'public');
 const REPO_ROOT = join(HERE, '..', '..');
 const XTERM_DIR = join(REPO_ROOT, 'node_modules', '@xterm', 'xterm');
+// Shared browser modules (pcm/audio/speech/confirm/worklet) live in src/web so the
+// SAME files the page loads at /lib/… are unit-asserted by `npm run validate`.
+const WEB_LIB_DIR = join(REPO_ROOT, 'src', 'web');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -41,6 +44,15 @@ export interface WebAppOptions {
   port?: number;
   /** Terminal poll interval (ms). 0 disables the periodic loop (tests). */
   terminalPollMs?: number;
+  /**
+   * Optional SERVER-SIDE STT: transcribe captured mic PCM (s16le mono) to text.
+   * When provided, the browser may stream mic audio over the WS as a fallback to
+   * its own Web Speech; the text is handed BACK to the client (not auto-run) so the
+   * confirmation guard applies before it reaches firstmate. Undefined -> disabled.
+   */
+  transcribe?: (pcm: Buffer, sampleRate: number) => Promise<string>;
+  /** Human label for the STT backend (advertised in `hello`). */
+  sttLabel?: string;
   log?: (msg: string) => void;
 }
 
@@ -79,6 +91,10 @@ function serveStatic(req: IncomingMessage, res: ServerResponse): void {
     filePath = join(XTERM_DIR, 'lib', 'xterm.js.map');
   } else if (urlPath === '/vendor/xterm.css') {
     filePath = join(XTERM_DIR, 'css', 'xterm.css');
+  } else if (urlPath.startsWith('/lib/') && /^\/lib\/[\w.-]+\.js$/.test(urlPath)) {
+    // Shared browser modules served straight from src/web (no build step).
+    filePath = join(WEB_LIB_DIR, urlPath.slice('/lib/'.length));
+    if (!filePath.startsWith(WEB_LIB_DIR) || !existsSync(filePath)) { res.writeHead(404).end('not found'); return; }
   } else {
     // Confine everything else to PUBLIC_DIR (no path traversal).
     const rel = normalize(urlPath).replace(/^(\.\.[/\\])+/, '').replace(/^[/\\]+/, '');
@@ -103,6 +119,8 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   const terminalPollMs = opts.terminalPollMs ?? 600;
   const log = opts.log ?? (() => {});
   const driver = opts.driver;
+  const transcribe = opts.transcribe;
+  const sttLabel = opts.sttLabel ?? '';
 
   await driver.start();
 
@@ -113,6 +131,8 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
 
   const wss = new WebSocketServer({ noServer: true });
   const clients = new Set<WebSocket>();
+  // Per-connection server-side STT capture buffers (mic PCM streamed before stt-end).
+  const sttBuffers = new Map<WebSocket, { chunks: Buffer[]; sampleRate: number }>();
   let turn = 0;
   let busy = false;
   let lastTerminal = '';
@@ -179,9 +199,12 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
     ship(ws, {
       type: 'hello',
       ttsMode: meta.ttsMode,
+      ttsVoice: meta.ttsVoice,
       speakBackend: meta.speakBackend,
       sampleRate: meta.sampleRate,
       audioFormat: AUDIO_FORMAT,
+      serverStt: !!transcribe,
+      sttLabel,
     });
     ship(ws, { type: 'status', state: busy ? 'thinking' : 'idle' });
     if (lastTerminal) ship(ws, { type: 'terminal', data: lastTerminal });
@@ -195,12 +218,30 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         if (text) void runTurn(ws, text);
       } else if (msg.type === 'listening') {
         broadcastStatus(msg.on ? 'listening' : (busy ? 'thinking' : 'idle'));
+      } else if (msg.type === 'stt-audio') {
+        if (!transcribe) return;
+        let buf = sttBuffers.get(ws);
+        if (!buf) { buf = { chunks: [], sampleRate: STT_SAMPLE_RATE }; sttBuffers.set(ws, buf); }
+        try { buf.chunks.push(Buffer.from(msg.pcm || '', 'base64')); } catch { /* skip bad chunk */ }
+        if (typeof msg.sampleRate === 'number' && msg.sampleRate > 0) buf.sampleRate = msg.sampleRate;
+      } else if (msg.type === 'stt-cancel') {
+        sttBuffers.delete(ws);
+      } else if (msg.type === 'stt-end') {
+        const buf = sttBuffers.get(ws);
+        sttBuffers.delete(ws);
+        if (!transcribe) { ship(ws, { type: 'error', message: 'server-side STT not configured — use Web Speech or type' }); return; }
+        if (!buf || buf.chunks.length === 0) { ship(ws, { type: 'transcript', text: '', final: true }); return; }
+        const pcm = Buffer.concat(buf.chunks);
+        const rate = buf.sampleRate;
+        void transcribe(pcm, rate)
+          .then((text) => ship(ws, { type: 'transcript', text: (text || '').trim(), final: true }))
+          .catch((e) => ship(ws, { type: 'error', message: 'transcription failed: ' + (e as Error).message }));
       } else if (msg.type === 'ping') {
         ship(ws, { type: 'pong' });
       }
     });
-    ws.on('close', () => { clients.delete(ws); });
-    ws.on('error', () => { clients.delete(ws); });
+    ws.on('close', () => { clients.delete(ws); sttBuffers.delete(ws); });
+    ws.on('error', () => { clients.delete(ws); sttBuffers.delete(ws); });
   });
 
   httpServer.on('upgrade', (req, socket, head) => {
