@@ -13,20 +13,24 @@
 // and measures true time-to-first-audio; an unpaired-credential 1004/1008 is
 // reported as PENDING (expected), never a crash.
 
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, realpathSync, utimesSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../src/config/secrets.ts';
 import {
-  parseTranscript, tailTranscript, type TranscriptEvent,
+  parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
 } from '../src/transcript/transcript.ts';
 import { waitForReply } from '../src/transcript/reply.ts';
 import { speakify, mockSpeakify } from '../src/speakability/speakability.ts';
 import {
   synthStreaming, toWav, wavHeader, INTL_WS, type SynthResult,
 } from '../src/tts/minimax.ts';
-import { verifiedSubmit, paneHoldsText } from '../src/session/session.ts';
+import {
+  verifiedSubmit, paneHoldsText, resolveTargetFromEnv, attachTarget, paneCurrentPath,
+  sessionExists, capturePane, capturePaneAnsi, resolveSessionWindow,
+} from '../src/session/session.ts';
 import { runPipeline } from '../src/broker/pipeline.ts';
 import { Reporter } from './harness/report.ts';
 import { startMockMinimax } from '../src/tts/mock-server.ts';
@@ -254,6 +258,149 @@ await reporter.leg('web server — serves the page + brokers the WS pipeline', a
     await app.close();
     await mock.close();
   }
+});
+
+// ─────────────────── leg 7: attach to an existing tmux first mate ───────────
+// The retarget feature: instead of spawning a throwaway agent, the broker ATTACHES
+// to a first mate the captain already runs in tmux. This leg asserts the attach
+// wiring the broker composes — target resolution from env, existence/cwd validation,
+// the colour pane mirror, and NON-ownership (detach must never kill it). It stands up
+// its OWN uniquely-named throwaway target (a trivial shell, NOT the captain's real
+// firstmate/bridge sessions or any fm-<id> window) and tears it down. If tmux is
+// unavailable (some CI), the env-parse assertions still run and the live half is
+// reported PENDING — never a red gate.
+await reporter.leg('attach — broker targets an existing tmux session (mirror + non-ownership)', async (t) => {
+  // Target resolution from env (pure — always runs).
+  t.eq(resolveTargetFromEnv({ CEOCHAT_TARGET: 'foo:bar' })?.target, 'foo:bar', 'CEOCHAT_TARGET="session:window" parsed');
+  t.eq(resolveTargetFromEnv({ CEOCHAT_TARGET: 'solo' })?.target, 'solo', 'bare CEOCHAT_TARGET=session parsed');
+  t.eq(resolveTargetFromEnv({ CEOCHAT_TARGET_SESSION: 'foo', CEOCHAT_TARGET_WINDOW: 'bar' })?.target, 'foo:bar', 'SESSION+WINDOW composed');
+  t.eq(resolveTargetFromEnv({ CEOCHAT_TARGET_SESSION: 'foo' })?.target, 'foo', 'SESSION alone -> bare target');
+  t.eq(resolveTargetFromEnv({}), null, 'no env -> null (broker falls back to spawn mode)');
+
+  // Transcript rotation (pure — always runs). An attached first mate rotates its JSONL
+  // on /clear, compaction, or a new session UUID. The broker re-resolves the NEWEST
+  // transcript each turn (captureBaseline -> latestTranscriptIn), so the readSays path
+  // must FOLLOW the new file instead of staying pinned to the now-stale old one.
+  const projDir = mkdtempSync(join(tmpdir(), 'ceochat-rotate-'));
+  try {
+    const fileA = join(projDir, 'aaaa-session.jsonl');
+    writeFileSync(fileA, assistantSay('first session reply') + '\n');
+    utimesSync(fileA, new Date(1000), new Date(1000));
+    t.eq(latestTranscriptIn(projDir), fileA, 'newest transcript is the only file (pre-rotation)');
+
+    // /clear -> a brand-new session UUID file, written AFTER (newer mtime).
+    const fileB = join(projDir, 'bbbb-session.jsonl');
+    writeFileSync(fileB, assistantSay('post-clear reply one') + '\n' + assistantSay('post-clear reply two') + '\n');
+    utimesSync(fileB, new Date(2000), new Date(2000));
+    t.eq(latestTranscriptIn(projDir), fileB, 'after rotation latestTranscriptIn follows the NEW file (not the stale path)');
+    const says = parseTranscript(latestTranscriptIn(projDir)!).filter((e) => e.kind === 'say');
+    t.eq(says.length, 2, 'readSays reads the rotated file (would have silently timed out on the stale one)');
+  } finally {
+    rmSync(projDir, { recursive: true, force: true });
+  }
+
+  // Mid-turn rotation (pure — always runs). The rotation can also land DURING the
+  // up-to-150s wait: the captain types /clear as the turn injects, or compaction / a
+  // new session UUID starts a fresh JSONL while the agent is replying. The reply then
+  // lands in the NEW file. This mirrors the broker's readReply readSays closure: it
+  // re-resolves latestTranscriptIn each poll, adopts a newer file (baseline 0 — the
+  // fresh file starts from zero), and reports count relative to sayBefore so the latch
+  // still fires. It must return B's text, not time out on the stale A.
+  const midDir = mkdtempSync(join(tmpdir(), 'ceochat-midrotate-'));
+  try {
+    const fileA = join(midDir, 'aaaa-session.jsonl');
+    writeFileSync(fileA, assistantSay('old backlog one') + '\n' + assistantSay('old backlog two') + '\n');
+    utimesSync(fileA, new Date(1000), new Date(1000));
+    const baseline = parseTranscript(latestTranscriptIn(midDir)!).filter((e) => e.kind === 'say').length;
+    t.eq(baseline, 2, 'baseline captured on file A (pre-rotation backlog)');
+
+    let activePath = latestTranscriptIn(midDir)!;
+    let activeBaseline = baseline;
+    let poll = 0;
+    let clock = 0;
+    const ROTATE_AT = 3;
+    const REPLY = 'post-clear fresh reply';
+    const got = await waitForReply({
+      readSays: () => {
+        if (poll === ROTATE_AT) {
+          const fileB = join(midDir, 'bbbb-session.jsonl');
+          writeFileSync(fileB, assistantSay(REPLY) + '\n');
+          utimesSync(fileB, new Date(2000), new Date(2000));
+        }
+        poll++;
+        const latest = latestTranscriptIn(midDir);
+        if (latest && latest !== activePath) { activePath = latest; activeBaseline = 0; }
+        const fresh = parseTranscript(activePath).filter((e) => e.kind === 'say').slice(activeBaseline);
+        return { count: baseline + fresh.length, text: fresh.map((e) => (e as Extract<TranscriptEvent, { kind: 'say' }>).text).join('\n') };
+      },
+      isIdle: () => true,
+      sleep: (ms) => { clock += ms; return Promise.resolve(); },
+      now: () => clock,
+    }, { sayBefore: baseline });
+    t.eq(got, REPLY, 'mid-turn rotation followed: reply read from the NEW file (no 150s timeout)');
+    t.notIncludes(got, 'old backlog', 'stale file A backlog is never spoken after a mid-turn rotation');
+  } finally {
+    rmSync(midDir, { recursive: true, force: true });
+  }
+
+  let tmuxOk = true;
+  try { execFileSync('tmux', ['-V'], { stdio: 'pipe' }); } catch { tmuxOk = false; }
+  if (!tmuxOk) {
+    t.pending('tmux not available here — attach wiring asserted by env-parse only');
+    return;
+  }
+
+  // attach refuses a non-existent target (no throwaway needed).
+  let refused = false;
+  try { attachTarget(resolveTargetFromEnv({ CEOCHAT_TARGET: 'ceochat-nope-' + process.pid + ':x' })!, {}); }
+  catch { refused = true; }
+  t.ok(refused, 'attach refuses a target session that does not exist');
+
+  // Stand up our OWN throwaway target (trivial shell as the "agent" pane). The name
+  // is unique and is NOT the captain's firstmate/bridge or any fm-<id> window.
+  const session = 'ceochat-attach-test-' + process.pid;
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'ceochat-attach-')));
+  const spec = resolveTargetFromEnv({ CEOCHAT_TARGET: `${session}:main` })!;
+  execFileSync('tmux', ['new-session', '-d', '-s', session, '-n', 'main', '-c', cwd, "printf 'READY\\n'; sleep 600"]);
+  try {
+    // tmux's #{pane_current_path} lags the spawn briefly — settle before attaching so
+    // the cwd-derivation assertions are deterministic (not racing the new pane).
+    for (let i = 0; i < 50 && realpathSync(paneCurrentPath(spec.target) || '/') !== cwd; i++) {
+      await realSleep(100);
+    }
+    const ctx = attachTarget(spec, {});
+    t.eq(ctx.owned, false, 'attached session is NOT owned (detach must not kill it)');
+    t.eq(realpathSync(ctx.cwd), cwd, 'cwd derived from pane_current_path (locates the transcript)');
+    t.eq(realpathSync(paneCurrentPath(spec.target)), cwd, 'paneCurrentPath resolves the pane cwd');
+
+    // The pane mirror (xterm.js source): wait for the shell to paint, then capture.
+    let mirrored = '';
+    for (let i = 0; i < 50; i++) {
+      mirrored = capturePane(spec.target);
+      if (mirrored.includes('READY')) break;
+      await realSleep(100);
+    }
+    t.includes(mirrored, 'READY', 'pane mirrored via capture-pane (the terminal view)');
+    t.includes(capturePaneAnsi(spec.target), 'READY', 'colour-preserving capture mirrors the same pane');
+
+    // Non-ownership in practice: the broker only tears down OWNED sessions, so an
+    // attached target survives a detach. Assert it is still alive here.
+    t.ok(sessionExists(session), 'target session stays alive while attached (broker would only detach)');
+
+    // Bare session (no :window): attach must PIN a concrete window so inject/mirror/cwd
+    // never drift to whatever window the captain later makes active in that session.
+    const win = resolveSessionWindow(session);
+    t.ok(win !== '', 'resolveSessionWindow resolves a concrete window for the bare session');
+    const bareSpec = resolveTargetFromEnv({ CEOCHAT_TARGET: session })!;
+    t.eq(bareSpec.window, '', 'bare CEOCHAT_TARGET=session resolves with no window (unpinned)');
+    const bareCtx = attachTarget(bareSpec, {});
+    t.eq(bareCtx.target, `${session}:${win}`, 'attach pins bare session to a concrete session:window');
+    t.eq(realpathSync(bareCtx.cwd), cwd, 'pinned bare-session attach still derives the pane cwd');
+  } finally {
+    try { execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'pipe' }); } catch { /* ignore */ }
+    rmSync(cwd, { recursive: true, force: true });
+  }
+  t.ok(!sessionExists(session), 'our throwaway target torn down — captain sessions untouched');
 });
 
 // ═══════════════════════ REGRESSION GUARDS (the 3 fixed bugs) ════════════════

@@ -13,8 +13,10 @@ streaming TTS. Decision-ready plan:
 - **Voice-out = transcript tap, not the scraped TUI.** Read Claude Code's session JSONL
   (clean assistant text + tool events), run a Haiku-class speakability rewrite, stream into
   MiniMax. The scraped pane is only for the *visual* terminal.
-- **Dedicated `ceo-chat` firstmate session** the broker owns (isolated from the captain's
-  desktop session). Cloud-STT / half-duplex / Cloudflare exposure are Phase 1+.
+- **Pane the broker drives:** ATTACH to the captain's REAL first mate in tmux when
+  `CEOCHAT_TARGET` is set (Phase 3 — same workspace/context), else own a dedicated throwaway
+  `ceo-chat` session (the self-contained default). Cloud-STT / half-duplex / Cloudflare
+  exposure are Phase 1+.
 
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
@@ -136,6 +138,54 @@ streaming TTS. Decision-ready plan:
   and forwards to the bound port. firstmate wires `cloudflared` separately; don't set it up
   here. CONFIRMED end-to-end in a real browser (chrome-devtools): typed line → live claude
   reply → narration → playable audio + live xterm terminal mirror, clean SIGINT teardown.
+
+## Phase 3 — attach to a REAL first mate (`CEOCHAT_TARGET`)
+- **Two pane-ownership modes in `src/session/session.ts`.** ATTACH (any of
+  `CEOCHAT_TARGET="session:window"` / bare `CEOCHAT_TARGET=session` /
+  `CEOCHAT_TARGET_SESSION`+`CEOCHAT_TARGET_WINDOW`) → the broker attaches to a
+  first mate the captain already runs in tmux. SPAWN (no target env) → the original
+  throwaway `ceo-chat` session. `resolveTargetFromEnv()` picks the mode; the Broker
+  exposes `isAttached()`/`targetLabel()`.
+- **Ownership flag drives teardown.** `SessionCtx.owned`: `spawnCeoChat` → `true`
+  (teardown kills it), `attachTarget` → `false` (Broker.stop only DETACHES — Ctrl-C
+  never kills the captain's first mate). Never teardown a non-owned ctx.
+- **Attach derives cwd from the pane, not a guess.** `paneCurrentPath(target)`
+  (`tmux display-message -p -F '#{pane_current_path}'`) → mangled → the transcript
+  project dir. So the narration taps THAT session's JSONL. (Assumes claude's cwd is
+  the launch dir; true unless the agent `cd`s elsewhere.)
+- **Per-turn say baseline, not a running counter.** `Broker` snapshots the current
+  `say`-count BEFORE each inject (`captureBaseline`) and `readReply` returns only
+  says past it. Essential for attach: the live transcript already holds a long
+  backlog (and whatever the captain types directly in the pane) — baselining per
+  turn means the first turn speaks only its NEW reply, never the history.
+- **Follow transcript rotation, never cache the path for the broker's life.** Both
+  `captureBaseline` and `readReply` re-resolve the NEWEST transcript (by mtime) each
+  turn AND on every poll — an attached first mate rotates its JSONL on `/clear`,
+  auto-compaction, or a new session UUID. On a mid-turn rotation `readReply` adopts
+  the new (fresh) file with an effective baseline of 0, so the latch's "a new say
+  arrived" check still holds; resolution only ever moves FORWARD, never back to an
+  older file. Without this a stale cached path would silently time out (~150s) every
+  later turn.
+- **Attach skips `waitForComposer`/trust** — the first mate is already up. Inject is
+  the same `fm-send.sh <session:window>` escape-hatch path (unmarked), and the
+  terminal mirror is the same `capturePaneAnsi(target)`.
+- **Launch helper:** `bin/launch-firstmate.sh` (`npm run firstmate`) starts
+  `claude --dangerously-skip-permissions` in the firstmate home (default
+  `/home/acbecquet/firstmate`, so it loads firstmate's AGENTS.md and IS a first
+  mate), names it `ceo-firstmate:main` (overridable via `CEOCHAT_FM_SESSION`/
+  `_WINDOW`/`FM_HOME`/`CEOCHAT_FM_CMD`), refuses to clobber an existing session, and
+  prints `CEOCHAT_TARGET`. **Session lock:** one first mate per home — this tmux one
+  is meant to be the captain's MAIN first mate.
+- **Validation:** `npm run validate` leg 7 ("attach — …") asserts env resolution and
+  transcript-rotation following (both pure, always run); and, when tmux is present,
+  stands up its OWN uniquely-named throwaway target (a trivial shell, torn down in
+  `finally`) and checks attach existence/cwd-derivation, the pane mirror,
+  non-ownership, and bare-session window pinning. tmux-absent CI → PENDING, never red.
+  NEVER targets the captain's `firstmate`/`bridge` or any `fm-<id>` window.
+- **CONFIRMED end-to-end** against a real claude in tmux: attach → fm-send inject →
+  transcript-narrate → mock TTS audio + pane mirror, two sequential turns each
+  speaking only their new reply (baseline proven), clean detach leaving the session
+  alive.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

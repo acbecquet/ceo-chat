@@ -1,12 +1,19 @@
-// session.ts — own a DEDICATED, throwaway `ceo-chat` firstmate-style tmux session,
-// drive firstmate's own bin/fm-send.sh to inject text into it, and tear it down.
-// This is the voice INPUT path (plan §2): STT text -> one verified fm-send.sh call
-// -> the agent composer.
+// session.ts — drive a tmux first-mate pane: inject text via firstmate's own
+// bin/fm-send.sh, mirror the pane, and read its transcript. This is the voice INPUT
+// path (plan §2): STT text -> one verified fm-send.sh call -> the agent composer.
 //
-// SAFETY (task rules): we create our OWN session named `ceo-chat` in a temp cwd,
-// never touch the captain's real sessions or any fm-<id> windows, address it via
-// the explicit `session:window` escape hatch (which fm-send leaves unmarked), and
-// always kill it on teardown. We refuse to start if a `ceo-chat` session exists.
+// Two pane-ownership modes:
+//   - ATTACH (CEOCHAT_TARGET set): the broker attaches to an ALREADY-RUNNING first
+//     mate the captain launched in tmux (same workspace/context as their real first
+//     mate). We never kill it on teardown — we only detach.
+//   - SPAWN (no target env): the broker owns a DEDICATED, throwaway `ceo-chat`
+//     session in a temp cwd (the original self-contained demo path).
+//
+// SAFETY (task rules): the throwaway spawn is named `ceo-chat`, lives in a temp cwd,
+// and is always killed on teardown; we refuse to spawn if a `ceo-chat` session
+// exists. Either way we address panes via the explicit `session:window` escape hatch
+// (which fm-send leaves unmarked) and never touch the captain's real sessions or any
+// fm-<id> windows.
 
 import { execFileSync, execFile } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -59,6 +66,97 @@ export interface SessionCtx {
   cwd: string;
   session: string;
   target: string;
+  /** true = we spawned it (teardown kills it); false = attached (leave it running). */
+  owned: boolean;
+}
+
+export interface TargetSpec {
+  session: string;
+  window: string;
+  /** The `session:window` (or bare `session`) string passed to tmux / fm-send. */
+  target: string;
+}
+
+// Resolve the ATTACH target from env. Prefer a single `CEOCHAT_TARGET="session:window"`
+// (or bare `session`); else compose `CEOCHAT_TARGET_SESSION` [+ `CEOCHAT_TARGET_WINDOW`].
+// Returns null when nothing is set -> the broker falls back to SPAWN mode.
+export function resolveTargetFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): TargetSpec | null {
+  const full = (env.CEOCHAT_TARGET || '').trim();
+  if (full) {
+    const i = full.indexOf(':');
+    const session = i >= 0 ? full.slice(0, i) : full;
+    const window = i >= 0 ? full.slice(i + 1) : '';
+    return { session, window, target: window ? `${session}:${window}` : session };
+  }
+  const session = (env.CEOCHAT_TARGET_SESSION || '').trim();
+  if (session) {
+    const window = (env.CEOCHAT_TARGET_WINDOW || '').trim();
+    return { session, window, target: window ? `${session}:${window}` : session };
+  }
+  return null;
+}
+
+// Resolve a CONCRETE window for a bare-session attach target (no window given). tmux
+// would otherwise follow the session's ACTIVE window, so if the captain switches
+// windows our inject/mirror/cwd would mis-target. We pin once at attach time: prefer
+// the active window now, else the first window. Returns '' if the list can't be read.
+export function resolveSessionWindow(session: string): string {
+  let out: string;
+  try {
+    out = sh('tmux', ['list-windows', '-t', session, '-F', '#{window_index} #{window_active}']);
+  } catch {
+    return '';
+  }
+  const rows = out.split('\n').map((r) => r.trim()).filter(Boolean);
+  if (!rows.length) return '';
+  const active = rows.find((r) => /\s1$/.test(r));
+  const chosen = active ?? rows[0]!;
+  return chosen.split(/\s+/)[0] ?? '';
+}
+
+// The working directory a pane's foreground process runs in — used to locate the
+// transcript project dir of an attached first mate (claude writes its JSONL under a
+// dir mangled from this cwd). Empty string if the target can't be resolved.
+export function paneCurrentPath(target: string): string {
+  try {
+    return sh('tmux', ['display-message', '-p', '-t', target, '-F', '#{pane_current_path}']).trim();
+  } catch {
+    return '';
+  }
+}
+
+// Attach to an ALREADY-RUNNING first mate the captain launched in tmux. Validates the
+// session/pane exists and derives its cwd (for the transcript tap). Does NOT spawn,
+// does NOT accept any trust dialog, and is NEVER killed on teardown (owned: false).
+export function attachTarget(spec: TargetSpec, { log = noop }: { log?: Log } = {}): SessionCtx {
+  if (!sessionExists(spec.session)) {
+    throw new Error(
+      `target tmux session '${spec.session}' does not exist. Launch a first mate in tmux ` +
+      `(npm run firstmate) and export CEOCHAT_TARGET=${spec.target}, or point CEOCHAT_TARGET ` +
+      `at your already-running first mate's session:window.`,
+    );
+  }
+  // Bare session (no window): pin a concrete window NOW so inject/mirror/cwd never
+  // drift to whatever window the captain later makes active in that session.
+  let target = spec.target;
+  if (!spec.window) {
+    const window = resolveSessionWindow(spec.session);
+    if (window) {
+      target = `${spec.session}:${window}`;
+      log(`bare session '${spec.session}' -> pinned to window ${target}`);
+    }
+  }
+  const cwd = paneCurrentPath(target);
+  if (!cwd) {
+    throw new Error(
+      `could not resolve pane for target '${target}' — check the window name ` +
+      `(tmux list-windows -t ${spec.session}).`,
+    );
+  }
+  log(`attaching to existing first mate at ${target} (cwd ${cwd})`);
+  return { cwd, session: spec.session, target, owned: false };
 }
 
 // Launch a real claude harness in the throwaway session, mirroring how firstmate
@@ -77,7 +175,7 @@ export function spawnCeoChat({ log = noop }: { log?: Log } = {}): SessionCtx {
     'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions';
   log(`tmux new-session ${SESSION} (cwd ${cwd})`);
   sh('tmux', ['new-session', '-d', '-s', SESSION, '-n', WINDOW, '-c', cwd, launch]);
-  return { cwd, session: SESSION, target: TARGET };
+  return { cwd, session: SESSION, target: TARGET, owned: true };
 }
 
 export function teardown({ cwd, log = noop }: { cwd?: string; log?: Log } = {}): void {

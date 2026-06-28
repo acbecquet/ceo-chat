@@ -38,7 +38,9 @@ let stopping = false;
 async function shutdown(code: number): Promise<never> {
   if (!stopping) {
     stopping = true;
-    console.log('\nTearing down dedicated ceo-chat session…');
+    console.log(broker.isAttached()
+      ? '\nDetaching (your first mate keeps running)…'
+      : '\nTearing down dedicated ceo-chat session…');
     await broker.stop();
   }
   process.exit(code);
@@ -72,6 +74,7 @@ async function drive(line: string): Promise<void> {
 console.log('ceo-chat — voice interface to firstmate (CLI driver)');
 console.log(`TTS mode: ${broker.ttsMode.toUpperCase()}${broker.ttsMode === 'mock' ? '  (add MiniMax creds to go live)' : ''}`);
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
+console.log(`target: ${broker.targetLabel()}`);
 
 await broker.start();
 

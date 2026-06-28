@@ -19,7 +19,8 @@ credentials**, and degrading cleanly to **live** when MiniMax/LLM keys are prese
 typed/spoken text
    │  fm-send.sh  (verified submit)            ← voice-IN: reuse firstmate
    ▼
-dedicated throwaway `ceo-chat` firstmate session
+your REAL first mate in tmux (CEOCHAT_TARGET)    ← attach mode; or a dedicated
+                                                   throwaway `ceo-chat` session
    │  transcript JSONL tap  (idle latch)       ← clean source, not the scraped TUI
    ▼
 agent reply (clean assistant text)
@@ -44,16 +45,56 @@ npm run serve               # the WEB APP — open the printed http://127.0.0.1:
 npm run dev -- --mock "tell me the tests passed and ask if I should merge"   # CLI driver
 ```
 
-`npm run serve` (and `npm run dev`) spawn their **own** dedicated `ceo-chat` tmux
-session (never the captain's sessions or `fm-<id>` windows) and tear it down on exit.
+## Talk to your REAL first mate — attach mode (`CEOCHAT_TARGET`)
+
+By default `npm run serve`/`npm run dev` spawn their own throwaway `ceo-chat` agent.
+To instead open the web app and talk to **your actual first mate** — same workspace,
+same context, same terminal pane you'd otherwise drive in tmux — point ceo-chat at
+that tmux session with **`CEOCHAT_TARGET`**:
+
+```bash
+# 1. Launch a first mate in tmux (loads firstmate's AGENTS.md from its home — it IS
+#    your first mate). Prints the CEOCHAT_TARGET to export.
+npm run firstmate                       # session "ceo-firstmate", window "main"
+
+# 2. Point ceo-chat at it and serve the web app.
+export CEOCHAT_TARGET=ceo-firstmate:main
+npm run serve                           # open http://127.0.0.1:8420/
+```
+
+Now the browser **mirrors that first mate's pane**, your typed/spoken lines are
+**injected into its composer** (`fm-send.sh`), and its replies are **narrated and
+spoken** — tapped from *that* session's Claude Code transcript.
+
+- **Already running a first mate in tmux?** You don't need `npm run firstmate` —
+  just `export CEOCHAT_TARGET=<session>:<window>` (find it with
+  `tmux list-windows -t <session>`) and `npm run serve`.
+- `CEOCHAT_TARGET="session:window"` (or a bare `session`), or the split form
+  `CEOCHAT_TARGET_SESSION=… CEOCHAT_TARGET_WINDOW=…`, both work.
+- **Session lock:** only ONE first mate may operate a home at a time. The tmux first
+  mate you launch is meant to be your **main** first mate for that home — don't run a
+  second agent against the same home.
+- Attach mode **never kills** the target on exit — Ctrl-C just **detaches**; your
+  first mate keeps running. (Spawn mode still tears down its own throwaway session.)
+
+Either way, ceo-chat only ever touches the session you point it at via the explicit
+`session:window` escape hatch — never the captain's other sessions or `fm-<id>`
+windows.
+
+### Default (spawn) mode
+
+With no `CEOCHAT_TARGET` set, `npm run serve` (and `npm run dev`) spawn their **own**
+dedicated `ceo-chat` tmux session (never the captain's sessions or `fm-<id>` windows)
+and tear it down on exit — the self-contained demo path.
 
 ## Web app — `npm run serve`
 
 A single-page browser front-end to the same pipeline ([`src/server/`](./src/server/)).
 Open the printed URL and you get:
 
-- a **live terminal view** of the dedicated `ceo-chat` agent session (xterm.js,
-  fed colour-preserving `capture-pane` snapshots over the WebSocket);
+- a **live terminal view** of the target agent pane — your real first mate in attach
+  mode, else the dedicated `ceo-chat` session (xterm.js, fed colour-preserving
+  `capture-pane` snapshots over the WebSocket);
 - a **text input** that sends your message to firstmate (via the same `fm-send`
   verified submit);
 - the **speakability narration** as it is produced, and the **raw agent reply**;
@@ -67,10 +108,11 @@ Open the printed URL and you get:
   is the always-reliable fallback. (Real cloud/local STT is a later phase.)
 
 ```bash
-npm run serve                          # bind 127.0.0.1:8420 (mock TTS unless creds present)
-CEOCHAT_PORT=9000 npm run serve        # choose the port
-CEOCHAT_HOST=0.0.0.0 npm run serve     # bind all interfaces (prefer the tunnel below)
-npm run serve -- --mock                # force the fully-offline path even with creds
+npm run serve                                   # bind 127.0.0.1:8420 (mock TTS unless creds present)
+CEOCHAT_TARGET=ceo-firstmate:main npm run serve # attach to your real first mate (see above)
+CEOCHAT_PORT=9000 npm run serve                 # choose the port
+CEOCHAT_HOST=0.0.0.0 npm run serve              # bind all interfaces (prefer the tunnel below)
+npm run serve -- --mock                         # force the fully-offline path even with creds
 ```
 
 The server serves plain HTTP on `127.0.0.1` and brokers everything over a
@@ -101,7 +143,7 @@ It covers:
 
 | Group | What it asserts |
 |---|---|
-| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** |
+| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 
@@ -173,9 +215,11 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
 ## Layout
 
 ```
+bin/
+  launch-firstmate.sh      launch a first mate in tmux to attach to (npm run firstmate)
 src/
   config/secrets.ts        secrets loader (outside-repo, gitignored)
-  session/session.ts       dedicated ceo-chat session + fm-send verified submit
+  session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror
   transcript/transcript.ts JSONL tap (normalize/parse/tail)
   transcript/reply.ts      reply-wait latch (injectable, regression-guarded)
   speakability/            rewrite-for-the-ear (anthropic-api | claude-cli | mock)
@@ -202,6 +246,7 @@ phase0/                    the original de-risking spikes (preserved)
 |---|---|
 | `npm run validate` | end-to-end harness, mock mode (the gate — must be green) |
 | `npm run validate:live` | same harness against real services where creds exist |
+| `npm run firstmate` | launch a first mate in tmux to attach to (prints `CEOCHAT_TARGET`) |
 | `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker) |
 | `npm run dev` | run the CLI driver (interactive or one-shot) |
 | `npm run typecheck` / `build` / `lint` | `tsc --noEmit` (we run `.ts` directly on Node ≥22) |
