@@ -39,17 +39,23 @@ const log = (m: string): void => console.log('  ·', m);
 const broker = new Broker({ outDir: OUT_DIR, log, mock: forceMock });
 const driver = new BrokerDriver(broker, DEFAULT_SAMPLE_RATE);
 
+const attached = broker.isAttached();
+
 console.log('ceo-chat — web interface to firstmate');
 console.log(`TTS mode: ${broker.ttsMode.toUpperCase()}${broker.ttsMode === 'mock' ? '  (add MiniMax creds to go live)' : ''}`);
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
-console.log('spawning dedicated ceo-chat session (this takes a few seconds)…');
+console.log(`target: ${broker.targetLabel()}`);
+console.log(attached
+  ? 'attaching to your running first mate…'
+  : 'spawning dedicated ceo-chat session (this takes a few seconds)…  '
+    + '[set CEOCHAT_TARGET=session:window to attach to a REAL first mate instead]');
 
 let app: WebApp;
 try {
   app = await createWebApp({ driver, log });
 } catch (e) {
   console.error('  ✗ startup failed:', (e as Error)?.message ?? e);
-  console.error('  tearing down the dedicated ceo-chat session…');
+  if (!attached) console.error('  tearing down the dedicated ceo-chat session…');
   try { await driver.stop(); } catch { /* ignore */ }
   process.exit(1);
 }
@@ -57,14 +63,18 @@ try {
 console.log('');
 console.log(`  ▸ open ${app.url}`);
 console.log(`  ▸ via Cloudflare named tunnel: https://ceo-chat.acb-apps.com`);
-console.log('  ▸ Ctrl-C to stop (tears down the ceo-chat session)');
+console.log(attached
+  ? '  ▸ Ctrl-C to stop (DETACHES — your first mate keeps running)'
+  : '  ▸ Ctrl-C to stop (tears down the dedicated ceo-chat session)');
 console.log('');
 
 let stopping = false;
 async function shutdown(code: number): Promise<never> {
   if (!stopping) {
     stopping = true;
-    console.log('\nShutting down — tearing down the dedicated ceo-chat session…');
+    console.log(attached
+      ? '\nShutting down — detaching (your first mate keeps running)…'
+      : '\nShutting down — tearing down the dedicated ceo-chat session…');
     try { await app.close(); } catch { /* ignore */ }
     try { await driver.stop(); } catch { /* ignore */ }
   }

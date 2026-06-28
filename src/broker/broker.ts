@@ -20,8 +20,9 @@ import { join } from 'node:path';
 
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../config/secrets.ts';
 import {
-  spawnCeoChat, teardown, waitForComposer, fmSend, capturePane, capturePaneAnsi, sleep,
-  type SessionCtx,
+  spawnCeoChat, attachTarget, resolveTargetFromEnv, teardown, waitForComposer, fmSend,
+  capturePane, capturePaneAnsi, sleep,
+  type SessionCtx, type TargetSpec,
 } from '../session/session.ts';
 import {
   PROJECTS_DIR, mangleCwd, latestTranscriptIn, parseTranscript,
@@ -54,9 +55,9 @@ export class Broker {
   private ctx: SessionCtx | null = null;
   private projectDir = '';
   private transcriptPath: string | null = null;
-  private sayBaseline = 0;
   private mock: MockMinimax | null = null;
   private readonly forceMock: boolean;
+  private readonly targetSpec: TargetSpec | null;
   readonly ttsMode: TtsMode;
 
   constructor(opts: BrokerOptions) {
@@ -65,6 +66,8 @@ export class Broker {
     this.log = opts.log ?? (() => {});
     this.forceMock = !!opts.mock;
     this.ttsMode = !this.forceMock && hasMinimaxCreds(this.secrets) ? 'live' : 'mock';
+    // CEOCHAT_TARGET (/_SESSION/_WINDOW) -> attach to a real first mate; else spawn.
+    this.targetSpec = resolveTargetFromEnv();
   }
 
   speakBackendHint(): string {
@@ -72,12 +75,33 @@ export class Broker {
     return has(this.secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'claude-cli';
   }
 
+  /** Is the broker attaching to a captain-launched first mate (vs spawning one)? */
+  isAttached(): boolean {
+    return this.targetSpec !== null;
+  }
+
+  /** Human-readable description of what this broker drives (for startup logs). */
+  targetLabel(): string {
+    return this.targetSpec
+      ? `attached to first mate ${this.targetSpec.target}`
+      : 'dedicated throwaway ceo-chat session';
+  }
+
   async start(): Promise<void> {
     mkdirSync(this.outDir, { recursive: true });
-    this.log('spawning dedicated ceo-chat session');
-    this.ctx = spawnCeoChat({ log: this.log });
-    this.projectDir = join(PROJECTS_DIR, mangleCwd(this.ctx.cwd));
-    await waitForComposer({ log: this.log });
+    if (this.targetSpec) {
+      this.log(`attaching to existing first mate ${this.targetSpec.target}`);
+      this.ctx = attachTarget(this.targetSpec, { log: this.log });
+      this.projectDir = join(PROJECTS_DIR, mangleCwd(this.ctx.cwd));
+      // The attached session's transcript already exists and may hold a long
+      // history — its discovery happens lazily (captureBaseline) and each turn
+      // baselines at the CURRENT say-count, so we only ever speak NEW replies.
+    } else {
+      this.log('spawning dedicated ceo-chat session');
+      this.ctx = spawnCeoChat({ log: this.log });
+      this.projectDir = join(PROJECTS_DIR, mangleCwd(this.ctx.cwd));
+      await waitForComposer({ log: this.log });
+    }
     if (this.ttsMode === 'mock') {
       this.mock = await startMockMinimax();
       this.log('TTS: mock MiniMax (no creds) — real WAV from synthetic PCM');
@@ -97,9 +121,14 @@ export class Broker {
     if (!this.ctx) throw new Error('broker not started');
     const target = this.ctx.target;
 
+    // Snapshot the say-count BEFORE injecting so readReply returns only THIS turn's
+    // new reply — essential when attached to a live first mate whose transcript
+    // already holds a backlog (and whatever the captain types directly in the pane).
+    const baseline = this.captureBaseline();
+
     const result = await runPipeline(typed, {
       inject: async (text) => { await fmSend(text, { target, log: this.log }); },
-      readReply: () => this.readReply(target),
+      readReply: () => this.readReply(target, baseline),
       speakify: (text) => speakify(text, {
         apiKey: has(this.secrets, 'ANTHROPIC_API_KEY') ? this.secrets.ANTHROPIC_API_KEY : null,
         backend: this.forceMock ? 'mock' : 'auto',
@@ -127,7 +156,15 @@ export class Broker {
 
   async stop(): Promise<void> {
     if (this.mock) { try { await this.mock.close(); } catch { /* ignore */ } this.mock = null; }
-    if (this.ctx) { teardown({ cwd: this.ctx.cwd, log: this.log }); this.ctx = null; }
+    if (this.ctx) {
+      if (this.ctx.owned) {
+        teardown({ cwd: this.ctx.cwd, log: this.log });
+      } else {
+        // Attached to the captain's first mate — leave it running, just detach.
+        this.log(`detaching from ${this.ctx.target} (left running)`);
+      }
+      this.ctx = null;
+    }
   }
 
   // ---- internals ----
@@ -148,9 +185,18 @@ export class Broker {
     });
   }
 
-  // Wait for the COMPLETE agent reply on the transcript tap (idle latch), tracking a
-  // per-turn say baseline so each turn returns only its own new reply.
-  private async readReply(target: string): Promise<string> {
+  // Current number of assistant `say` blocks in the transcript (0 before it appears).
+  // Used as the per-turn baseline so a turn returns only the reply it triggered.
+  private captureBaseline(): number {
+    if (!this.transcriptPath) this.transcriptPath = latestTranscriptIn(this.projectDir);
+    if (!this.transcriptPath) return 0;
+    return parseTranscript(this.transcriptPath).filter((e) => e.kind === 'say').length;
+  }
+
+  // Wait for the COMPLETE agent reply on the transcript tap (idle latch). `baseline`
+  // is the say-count captured just before this turn's inject, so we read only the
+  // new say blocks this turn produced.
+  private async readReply(target: string, baseline: number): Promise<string> {
     // The transcript is written lazily — discover it after the first inject.
     for (let i = 0; i < 120 && !this.transcriptPath; i++) {
       this.transcriptPath = latestTranscriptIn(this.projectDir);
@@ -158,9 +204,8 @@ export class Broker {
     }
     if (!this.transcriptPath) throw new Error('no transcript appeared under ' + this.projectDir);
     const path = this.transcriptPath;
-    const baseline = this.sayBaseline;
 
-    const reply = await waitForReply({
+    return waitForReply({
       readSays: () => {
         const says = parseTranscript(path).filter((e) => e.kind === 'say') as Extract<TranscriptEvent, { kind: 'say' }>[];
         return { count: says.length, text: says.slice(baseline).map((e) => e.text).join('\n') };
@@ -170,9 +215,5 @@ export class Broker {
       now: () => performance.now(),
       log: this.log,
     }, { sayBefore: baseline });
-
-    // advance baseline to the new total so the next turn starts clean
-    this.sayBaseline = parseTranscript(path).filter((e) => e.kind === 'say').length;
-    return reply;
   }
 }
