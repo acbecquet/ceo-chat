@@ -158,6 +158,14 @@ streaming TTS. Decision-ready plan:
   says past it. Essential for attach: the live transcript already holds a long
   backlog (and whatever the captain types directly in the pane) — baselining per
   turn means the first turn speaks only its NEW reply, never the history.
+- **Follow transcript rotation, never cache the path for the broker's life.** Both
+  `captureBaseline` and `readReply` re-resolve the NEWEST transcript (by mtime) each
+  turn AND on every poll — an attached first mate rotates its JSONL on `/clear`,
+  auto-compaction, or a new session UUID. On a mid-turn rotation `readReply` adopts
+  the new (fresh) file with an effective baseline of 0, so the latch's "a new say
+  arrived" check still holds; resolution only ever moves FORWARD, never back to an
+  older file. Without this a stale cached path would silently time out (~150s) every
+  later turn.
 - **Attach skips `waitForComposer`/trust** — the first mate is already up. Inject is
   the same `fm-send.sh <session:window>` escape-hatch path (unmarked), and the
   terminal mirror is the same `capturePaneAnsi(target)`.
@@ -168,11 +176,12 @@ streaming TTS. Decision-ready plan:
   `_WINDOW`/`FM_HOME`/`CEOCHAT_FM_CMD`), refuses to clobber an existing session, and
   prints `CEOCHAT_TARGET`. **Session lock:** one first mate per home — this tmux one
   is meant to be the captain's MAIN first mate.
-- **Validation:** `npm run validate` leg 7 ("attach — …") asserts env resolution +
-  (when tmux is present) stands up its OWN uniquely-named throwaway target (a trivial
-  shell, torn down in `finally`), and checks attach existence/cwd-derivation, the
-  pane mirror, and non-ownership. tmux-absent CI → PENDING, never red. NEVER targets
-  the captain's `firstmate`/`bridge` or any `fm-<id>` window.
+- **Validation:** `npm run validate` leg 7 ("attach — …") asserts env resolution and
+  transcript-rotation following (both pure, always run); and, when tmux is present,
+  stands up its OWN uniquely-named throwaway target (a trivial shell, torn down in
+  `finally`) and checks attach existence/cwd-derivation, the pane mirror,
+  non-ownership, and bare-session window pinning. tmux-absent CI → PENDING, never red.
+  NEVER targets the captain's `firstmate`/`bridge` or any `fm-<id>` window.
 - **CONFIRMED end-to-end** against a real claude in tmux: attach → fm-send inject →
   transcript-narrate → mock TTS audio + pane mirror, two sequential turns each
   speaking only their new reply (baseline proven), clean detach leaving the session
