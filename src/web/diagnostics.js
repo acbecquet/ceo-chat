@@ -19,6 +19,8 @@ export class Diagnostics {
 
   get count() { return this._lines.length; }
 
+  get max() { return this._max; }
+
   add(msg, level) {
     const ts = this._now() - this._t0;
     const rec = { ts, msg: String(msg), level: level === 'error' ? 'error' : 'info' };

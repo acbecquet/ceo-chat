@@ -60,6 +60,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     line.appendChild(ts);
     line.appendChild(document.createTextNode(rec.msg));
     els.diagLog.appendChild(line);
+    while (els.diagLog.childElementCount > diag.max) els.diagLog.removeChild(els.diagLog.firstChild);
     els.diagLog.scrollTop = els.diagLog.scrollHeight;
   }
   function setDiagStat(el, label, val, cls) {
@@ -430,8 +431,11 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   }
   function stopServerCapture(transcribe) {
     if (capturing) {
-      diag.add('mic ' + (transcribe ? 'stop → transcribe' : 'cancel') + ' (' + capBytesSent + ' PCM bytes streamed via ' + (capMethod || '?') + ')');
-      if (transcribe && capBytesSent === 0) { diag.error('mic streamed 0 bytes — no audio reached the server'); setDiagStat(els.diagMic, 'mic', 'no audio', 'bad'); }
+      diag.add('mic ' + (transcribe ? 'stop → transcribe' : 'cancel') + ' (' + capBytesSent + ' PCM bytes streamed via ' + (capMethod || '?') + ', ' + capFramesRecv + ' frames captured)');
+      if (transcribe && capBytesSent === 0) {
+        if (capFramesRecv > 0) { diag.add('mic captured ' + capFramesRecv + ' frames but all were suppressed by half-duplex (first mate was speaking) — no failure'); }
+        else { diag.error('mic streamed 0 bytes — no audio reached the server'); setDiagStat(els.diagMic, 'mic', 'no audio', 'bad'); }
+      }
       sendJson({ type: transcribe ? 'stt-end' : 'stt-cancel' });
     }
     capturing = false;
