@@ -204,7 +204,14 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
         break;
       case 'audio':
         lastTurn = { pcm: msg.pcm, sampleRate: msg.sampleRate || sampleRate };
-        audio.enqueue(msg.pcm, msg.sampleRate || sampleRate); // AUTO-SPEAK
+        // `replay` audio is last-turn state re-sent to a refreshed client — arm Replay
+        // but do NOT auto-play it (the captain didn't just ask). Live audio auto-speaks,
+        // queued gaplessly across the turn's progressive chunks.
+        if (!msg.replay) audio.enqueue(msg.pcm, msg.sampleRate || sampleRate);
+        break;
+      case 'notice':
+        diag.add('notice: ' + msg.message);
+        toast(msg.message);
         break;
       case 'transcript':
         // Server STT result. Make empty/failed results VISIBLE rather than silent.
@@ -304,6 +311,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     localSay('Call started.');
   }
   function hangup() {
+    sendJson({ type: 'stop' }); // cancel any in-flight turn server-side (stop synthesis)
     inCall = false; micWanted = false;
     speech.stop(); stopServerCapture(); audio.stop();
     releaseWakeLock(); exitCallMode(true);

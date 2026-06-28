@@ -17,8 +17,23 @@ export interface DriverMeta {
   sampleRate: number;
 }
 
+// One progressively-spoken chunk handed to the web layer as the turn streams.
+export interface DriverChunk {
+  index: number;
+  narration: string;
+  speakBackend: string;
+  pcm: Buffer;
+  sampleRate: number;
+}
+
 export interface TurnHooks {
   onStage: (stage: PipelineStage) => void;
+  /** Progressive: one chunk per speakable unit as the agent talks (before turn end). */
+  onChunk?: (chunk: DriverChunk) => void;
+  /** A benign Claude modal was auto-dismissed before inject (surface in diagnostics). */
+  onNotice?: (message: string) => void;
+  /** Barge-in / hangup: when aborted, stop pending speech + in-flight synthesis. */
+  signal?: { readonly aborted: boolean };
 }
 
 export interface DriverTurn {
@@ -26,6 +41,8 @@ export interface DriverTurn {
   narration: string;
   speakBackend: string;
   audio: { pcm: Buffer; sampleRate: number; ttfbMs: number | null; bytes: number };
+  /** How many progressive chunks were streamed this turn (0 = legacy aggregate path). */
+  chunks?: number;
 }
 
 export interface Driver {
@@ -65,7 +82,13 @@ export class BrokerDriver implements Driver {
   }
 
   async send(text: string, turnIndex: number, hooks: TurnHooks): Promise<DriverTurn> {
-    const r = await this.broker.send(text, turnIndex, { onStage: hooks.onStage });
+    let chunks = 0;
+    const r = await this.broker.send(text, turnIndex, {
+      onStage: hooks.onStage,
+      onChunk: (c) => { chunks++; hooks.onChunk?.(c); },
+      onNotice: hooks.onNotice,
+      signal: hooks.signal,
+    });
     return {
       reply: r.reply,
       narration: r.narration,
@@ -76,6 +99,7 @@ export class BrokerDriver implements Driver {
         ttfbMs: r.audio.ttfbMs,
         bytes: r.audio.bytes,
       },
+      chunks,
     };
   }
 

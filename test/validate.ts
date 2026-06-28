@@ -21,8 +21,11 @@ import { join } from 'node:path';
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../src/config/secrets.ts';
 import {
   parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
+  findPromptAnchor, saysAfterAnchor, latestTranscriptWithPrompt,
 } from '../src/transcript/transcript.ts';
-import { waitForReply } from '../src/transcript/reply.ts';
+import { waitForReply, streamReply, splitCompleteUnits } from '../src/transcript/reply.ts';
+import { runStreamingPipeline, type PipelineChunk as PipelineChunkT } from '../src/broker/pipeline.ts';
+import { detectBenignModal, dismissBenignModals } from '../src/session/session.ts';
 import { speakify, mockSpeakify } from '../src/speakability/speakability.ts';
 import {
   synthStreaming, toWav, wavHeader, INTL_WS, type SynthResult,
@@ -432,6 +435,254 @@ await reporter.leg('attach — broker targets an existing tmux session (mirror +
     rmSync(cwd, { recursive: true, force: true });
   }
   t.ok(!sessionExists(session), 'our throwaway target torn down — captain sessions untouched');
+});
+
+// ─────────── leg 8: prompt-anchored transcript (multi-session safe) ──────────
+// The captain's first mate shares ~/firstmate's project dir with OTHER concurrent
+// claude sessions (supervisor, crewmates), so latestTranscriptIn (newest-by-mtime)
+// flip-flops between unrelated files (proven in the real serve.log). We anchor each
+// turn to the file that recorded OUR injected prompt — robust against that noise.
+await reporter.leg('attach — prompt-anchored transcript (ignores concurrent sessions)', (t) => {
+  // findPromptAnchor: last human event matching the injected line (whitespace-tolerant).
+  const events = parseTranscript; void events;
+  const evs = [
+    { kind: 'human', role: 'user', ts: null, text: 'old question' },
+    { kind: 'say', role: 'assistant', ts: null, text: 'old answer.' },
+    { kind: 'human', role: 'user', ts: null, text: 'who am I connected to' },
+    { kind: 'say', role: 'assistant', ts: null, text: 'You are connected to first mate.' },
+    { kind: 'say', role: 'assistant', ts: null, text: 'Ready to merge?' },
+  ] as TranscriptEvent[];
+  t.eq(findPromptAnchor(evs, '  who am I   connected to '), 2, 'anchors the LAST matching human event (whitespace-tolerant)');
+  t.eq(findPromptAnchor(evs, 'never injected this'), -1, 'absent prompt -> -1 (not written yet)');
+  const says = saysAfterAnchor(evs, 2).map((e) => e.text);
+  t.eq(says.join(' '), 'You are connected to first mate. Ready to merge?', 'says AFTER the anchor are this turn (not the backlog)');
+  t.notIncludes(says.join(' '), 'old answer', 'pre-anchor backlog never included');
+
+  // latestTranscriptWithPrompt: among concurrent sessions, pick the file with OUR prompt
+  // even when a DIFFERENT (unrelated) session is newer by mtime.
+  const dir = mkdtempSync(join(tmpdir(), 'ceochat-anchor-'));
+  try {
+    const ours = join(dir, 'ours.jsonl');
+    writeFileSync(ours, userPrompt('pull up my memoirs data') + '\n' + assistantSay('Opening it now.') + '\n');
+    utimesSync(ours, new Date(1000), new Date(1000));
+    // a NEWER, unrelated session (the supervisor) without our prompt.
+    const noise = join(dir, 'noise.jsonl');
+    writeFileSync(noise, assistantSay('supervisor chatter') + '\n');
+    utimesSync(noise, new Date(5000), new Date(5000));
+    t.eq(latestTranscriptIn(dir), noise, 'baseline: newest-by-mtime is the WRONG (unrelated) file');
+    t.eq(latestTranscriptWithPrompt(dir, 'pull up my memoirs data'), ours, 'anchored resolver picks OUR file despite the newer noise file');
+    t.eq(latestTranscriptWithPrompt(dir, 'something never said'), null, 'no file has the prompt yet -> null');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─────────── leg 9: incremental speak — units emitted before turn end ────────
+// Bug A: today the broker latches until the WHOLE turn completes, then speaks — ~36s of
+// silence on a 36s turn. streamReply must emit complete speakable units AS they stream.
+await reporter.leg('streaming — incremental speakable units (audio starts mid-turn)', async (t) => {
+  // splitCompleteUnits: sentence/newline boundaries; hold the trailing partial.
+  const a = splitCompleteUnits('Hello there. Running the te');
+  t.eq(a.units.join('|'), 'Hello there.', 'first complete sentence is a unit');
+  t.eq(a.rest, ' Running the te', 'the partial trailing sentence is held (never spoken mid-word)');
+  const b = splitCompleteUnits('block one\nblock two\npartial');
+  t.eq(b.units.join('|'), 'block one|block two', 'newline (say-block) boundaries split units too');
+  t.eq(b.rest, 'partial', 'trailing non-terminated text held');
+
+  // streamReply: text grows over polls; idle only at the end. Units must arrive BEFORE
+  // the turn is idle, in order, with no dups, and the full reply returned at the end.
+  const FULL = 'Opening your memoirs data. Found three files. Want me to summarize them?';
+  const steps = [
+    'Opening your memoirs data. Foun',
+    'Opening your memoirs data. Found three files. ',
+    'Opening your memoirs data. Found three files. Want me to summarize them?',
+  ];
+  let poll = 0;
+  let clock = 0;
+  const IDLE_AT = steps.length - 1; // idle once the last step is present
+  const units: Array<{ text: string; idleWhenEmitted: boolean }> = [];
+  const got = await streamReply({
+    readSays: () => ({ count: 1, text: steps[Math.min(poll, steps.length - 1)]! }),
+    isIdle: () => poll >= IDLE_AT,
+    sleep: (ms) => { clock += ms; poll++; return Promise.resolve(); },
+    now: () => clock,
+    onUnit: (u) => units.push({ text: u, idleWhenEmitted: poll >= IDLE_AT }),
+  }, { sayBefore: 0, settleMs: 0, pollMs: 1, timeoutMs: 60000 });
+  t.eq(got, FULL, 'full reply returned at the end');
+  t.ok(units.length >= 2, 'multiple units emitted progressively', `${units.length} units`);
+  t.ok(units.some((u) => !u.idleWhenEmitted), 'at least one unit spoken BEFORE the turn went idle (latency win)');
+  t.eq(units[0]!.text, 'Opening your memoirs data.', 'the FIRST unit is spoken first (early audio)');
+  const joined = units.map((u) => u.text).join(' ');
+  t.eq(units.filter((u) => u.text === 'Opening your memoirs data.').length, 1, 'no unit is double-emitted');
+  t.includes(joined, 'Want me to summarize them?', 'the closing question is emitted too');
+});
+
+// ─────────── leg 10: streaming pipeline — progressive chunks ─────────────────
+await reporter.leg('streaming — runStreamingPipeline emits chunks before completion', async (t) => {
+  const mock = await startMockMinimax();
+  try {
+    const chunks: PipelineChunkT[] = [];
+    let resolveReply: (() => void) | null = null;
+    const replyGate = new Promise<void>((r) => { resolveReply = r; });
+    let injected = false;
+    const result = await runStreamingPipeline('summarize the memoirs', {
+      inject: async () => { injected = true; },
+      streamReply: async (onUnit) => {
+        onUnit('Opening your memoirs data.');
+        onUnit('Found three files.');
+        // let the first units flow through speakify+synth+onChunk before we finish.
+        await replyGate;
+        onUnit('Want me to summarize them?');
+        return 'Opening your memoirs data. Found three files. Want me to summarize them?';
+      },
+      speakify: (s) => speakify(s, { backend: 'mock' }),
+      synth: (cs) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: cs, endpoint: mock.endpoint, timeoutMs: 8000 }),
+      onChunk: (c) => { chunks.push(c); if (chunks.length === 2 && resolveReply) resolveReply(); },
+    });
+    t.ok(injected, 'inject ran');
+    t.ok(chunks.length >= 2, 'a chunk is emitted per speakable unit (progressive)', `${chunks.length} chunks`);
+    t.ok(chunks[0]!.pcm.length > 0, 'the first chunk carries real audio (plays before the turn ends)');
+    t.ok(chunks[0]!.index === 0 && chunks[1]!.index === 1, 'chunks are ordered by index');
+    t.eq(result.reply, 'Opening your memoirs data. Found three files. Want me to summarize them?', 'aggregate reply is the full turn');
+    t.ok(result.audio.bytes > 0, 'aggregate audio concatenates the chunk pcm', `${result.audio.bytes} bytes`);
+    t.ok(/summarize/i.test(result.narration), 'aggregate narration concatenates the unit narrations');
+    // cancellation: an aborted run stops emitting further chunks.
+    const aborted = { aborted: true };
+    const after: PipelineChunkT[] = [];
+    const r2 = await runStreamingPipeline('x', {
+      inject: async () => {},
+      streamReply: async (onUnit) => { onUnit('one.'); onUnit('two.'); return 'one. two.'; },
+      speakify: (s) => speakify(s, { backend: 'mock' }),
+      synth: (cs) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: cs, endpoint: mock.endpoint, timeoutMs: 8000 }),
+      onChunk: (c) => after.push(c),
+      signal: aborted,
+    });
+    t.eq(after.length, 0, 'an aborted turn (barge-in/hangup) emits no chunks');
+    void r2;
+  } finally {
+    await mock.close();
+  }
+});
+
+// ─────────── leg 11: benign modal auto-dismiss before inject ─────────────────
+// Bug B3: a wedged "How is Claude doing this session?" rating prompt swallowed the next
+// injected message (the captain's dead-end). Detect + dismiss known benign dialogs.
+await reporter.leg('attach — auto-dismiss benign Claude modals before inject', async (t) => {
+  const ratingPane = 'some output\n╭─ How is Claude doing this session? ─╮\n│ 0  1  2 … rate │\n╰─ Press Esc to dismiss ─╯';
+  const trustPane = 'Do you trust the files in this folder?\n❯ 1. Yes, I trust\n  2. No';
+  const normalPane = '╭─ firstmate ─╮\n❯ \n╰────────────╯';
+  const realQuestionPane = '❯ Should I delete the production database? (y/n)';
+
+  const rating = detectBenignModal(ratingPane);
+  t.ok(!!rating && rating.kind === 'feedback-rating', 'detects the feedback/rating prompt');
+  t.eq(rating!.key, 'Escape', 'feedback prompt is DISMISSED with Escape (no rating given)');
+  const trust = detectBenignModal(trustPane);
+  t.ok(!!trust && trust.kind === 'trust-folder', 'detects the trust-folder dialog');
+  t.eq(trust!.key, 'Enter', 'trust dialog is accepted with Enter');
+  t.eq(detectBenignModal(normalPane), null, 'an ordinary composer is NOT a modal (no action)');
+  t.eq(detectBenignModal(realQuestionPane), null, 'a genuine question to the captain is NEVER auto-answered');
+
+  // dismissBenignModals: sends the key, then re-checks; returns the dismissed descriptor.
+  const keys: string[] = [];
+  let pane = ratingPane;
+  const dismissed = await dismissBenignModals({
+    capture: () => pane,
+    sendKey: (k) => { keys.push(k); pane = normalPane; /* modal gone after dismiss */ },
+    sleep: () => Promise.resolve(),
+  });
+  t.ok(!!dismissed && dismissed.kind === 'feedback-rating', 'reports which benign modal it dismissed (for diagnostics)');
+  t.eq(keys.join(','), 'Escape', 'dismissed the rating prompt with Escape');
+
+  // a clean pane -> no key sent, returns null.
+  const keys2: string[] = [];
+  const none = await dismissBenignModals({ capture: () => normalPane, sendKey: (k) => keys2.push(k), sleep: () => Promise.resolve() });
+  t.eq(none, null, 'no modal -> nothing dismissed');
+  t.eq(keys2.length, 0, 'no keys sent when there is no benign modal');
+});
+
+// ─────────── leg 12: web transport — progressive chunks + reconnect replay ───
+// The full wiring (app.ts) over a STREAMING driver: multiple narration+audio frames
+// arrive progressively (one per unit, indexed), a benign-modal `notice` is surfaced,
+// and a client that connects AFTER the turn is REPLAYED the last state (Bug B2 — never
+// left blank on refresh) with replay:true so it doesn't auto-play.
+await reporter.leg('web — progressive chunks, notice, reconnect replay', async (t) => {
+  const mock = await startMockMinimax();
+  const streamingDriver: Driver = {
+    meta: () => ({ ttsMode: 'local', ttsVoice: 'en_US-lessac-medium', speakBackend: 'mock', sampleRate: 22050 }),
+    start: async () => {},
+    send: async (text, _i, hooks) => {
+      const r = await runStreamingPipeline(text, {
+        inject: async () => { hooks.onNotice?.('Auto-dismissed "How is Claude doing this session?" rating prompt before sending.'); },
+        streamReply: async (onUnit) => {
+          onUnit('Opening your memoirs data.');
+          onUnit('Found three files.');
+          onUnit('Want me to summarize them?');
+          return 'Opening your memoirs data. Found three files. Want me to summarize them?';
+        },
+        speakify: (s) => speakify(s, { backend: 'mock' }),
+        synth: (cs) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: cs, endpoint: mock.endpoint, timeoutMs: 8000 }),
+        onChunk: (c) => hooks.onChunk?.({ index: c.index, narration: c.narration, speakBackend: c.speakBackend, pcm: c.pcm, sampleRate: c.sampleRate }),
+        onStage: hooks.onStage,
+        signal: hooks.signal,
+      });
+      return { reply: r.reply, narration: r.narration, speakBackend: r.speakBackend, audio: { pcm: r.audio.pcm, sampleRate: r.audio.sampleRate, ttfbMs: r.audio.ttfbMs, bytes: r.audio.bytes } };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const app = await createWebApp({ driver: streamingDriver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // --- turn 1: drive a streaming turn, collect every frame ---
+    const msgs: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('streaming WS timed out')); }, 12000);
+      let sent = false;
+      client.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        msgs.push(m);
+        if (m.type === 'hello' && !sent) { sent = true; client.send(JSON.stringify({ type: 'send', text: 'pull up my memoirs' })); }
+        if (m.type === 'turn-done') { clearTimeout(timer); client.close(); resolve(); }
+      });
+      client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+    const audioFrames = msgs.filter((m) => m.type === 'audio');
+    const narrFrames = msgs.filter((m) => m.type === 'narration');
+    t.ok(audioFrames.length >= 3, 'one audio frame PER speakable unit (progressive, not one big blob)', `${audioFrames.length} frames`);
+    t.ok(narrFrames.length >= 3, 'one narration frame per unit', `${narrFrames.length} frames`);
+    t.eq(audioFrames[0]!.index, 0, 'first audio chunk is index 0 (ordered)');
+    t.eq(audioFrames[1]!.index, 1, 'second audio chunk is index 1');
+    t.ok(Buffer.from((audioFrames[0]!.pcm as string) || '', 'base64').length > 0, 'the first chunk carries playable PCM (plays before the turn ends)');
+    const notice = msgs.find((m) => m.type === 'notice') as { message?: string } | undefined;
+    t.ok(!!notice && /rating prompt/i.test(notice.message || ''), 'auto-dismissed benign modal surfaced as a notice');
+    const reply = msgs.find((m) => m.type === 'reply') as { text?: string } | undefined;
+    t.includes(reply?.text || '', 'memoirs', 'the full raw reply is delivered at the end');
+    // no DUPLICATE aggregate audio when chunks streamed (would double-speak).
+    t.ok(audioFrames.every((m) => typeof m.index === 'number'), 'every audio frame is a progressive chunk (no extra aggregate blob)');
+
+    // --- turn 2: a FRESH client (page refresh) is re-synced, not left blank ---
+    const replayMsgs: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const c2 = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { c2.close(); } catch { /* ignore */ } reject(new Error('replay WS timed out')); }, 8000);
+      c2.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        replayMsgs.push(m);
+        if (m.type === 'turn-done') { clearTimeout(timer); c2.close(); resolve(); }
+      });
+      c2.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+    const rReply = replayMsgs.find((m) => m.type === 'reply') as { replay?: boolean; text?: string } | undefined;
+    t.ok(!!rReply && rReply.replay === true, 'a refreshed client is REPLAYED the last reply (not left blank)');
+    t.includes(rReply?.text || '', 'memoirs', 'replayed reply carries the last turn text');
+    const rAudio = replayMsgs.find((m) => m.type === 'audio') as { replay?: boolean } | undefined;
+    t.ok(!!rAudio && rAudio.replay === true, 'replayed audio is flagged replay (client arms Replay, does NOT auto-play)');
+    const rDone = replayMsgs.find((m) => m.type === 'turn-done') as { replay?: boolean } | undefined;
+    t.ok(!!rDone && rDone.replay === true, 'replay ends with a turn-done so the client settles to idle');
+  } finally {
+    await app.close();
+    await mock.close();
+  }
 });
 
 // ═══════════════════════ REGRESSION GUARDS (the 3 fixed bugs) ════════════════

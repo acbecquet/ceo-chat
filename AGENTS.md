@@ -296,5 +296,56 @@ streaming TTS. Decision-ready plan:
   auto-opened the panel. Headless can't emit sound or grant a mic, so the suspended→fallback
   path and STT-empty path are proven by the deterministic validate legs.
 
+## Phase 5 — FAST + ROBUST hands-free (incremental speak, anchored tap, modal dismiss)
+- **Latency fix = INCREMENTAL speak, never latch the whole turn.** The old path waited
+  for the COMPLETE reply (idle latch, up to 150s) then ran one speakify+TTS — ~36s of
+  silence on a 36s turn (proven in the captain's serve.log: repeated "say seen but
+  harness still streaming — holding (latch)"). Now `src/transcript/reply.ts#streamReply`
+  emits complete **speakable units** (sentence/newline boundaries via `splitCompleteUnits`)
+  AS the reply streams; `src/broker/pipeline.ts#runStreamingPipeline` rewrites+synthesizes
+  +emits each unit (a `PipelineChunk`) progressively, serialized so audio stays ordered.
+  First audio lands within ~1-2s of the first say. CONFIRMED live against a real claude:
+  4 chunks, first audio BEFORE turn-end. `runPipeline` is kept (legacy/in-memory drivers).
+- **Streaming speakability MUST be fast — NEVER `claude -p` per unit.** `claude -p` cold
+  start alone is >2s; spawning it per sentence defeats the fix. `Broker#streamSpeakBackend`
+  picks **anthropic-api** if a key is paired, else the **deterministic `mock` rewriter**
+  (instant, still honors §7.3 — drops code/paths/URLs, keeps questions). On hub the offline
+  env's `ANTHROPIC_API_KEY` is EMPTY (`has()` → false), so streaming uses the rule-based
+  rewriter — by design. `speakBackendHint()` reports this backend.
+- **Transcript tap is PROMPT-ANCHORED, not newest-by-mtime.** An attached first mate shares
+  `~/firstmate`'s project dir with OTHER concurrent claude sessions (supervisor, crewmates),
+  so `latestTranscriptIn` (newest mtime) FLIP-FLOPS between unrelated files — the real
+  serve.log oscillated `1f87…↔3b77…`, and our injected prompt was in the OLDER file. Fix:
+  `transcript.ts#latestTranscriptWithPrompt` + `findPromptAnchor` + `saysAfterAnchor` pick
+  the file that recorded OUR injected line as a `human` event, and read only the says AFTER
+  that anchor (the anchor REPLACES the per-turn say-count baseline). Re-resolved every poll,
+  so a mid-turn `/clear`/compaction that re-records the prompt in a fresh UUID is FOLLOWED
+  forward; `streamReply` dedups units (normalized) so any re-read never double-speaks.
+  claude does NOT hold the .jsonl fd open (open→append→close), so /proc-fd pinning is out —
+  content-anchoring is the robust path.
+- **Auto-dismiss benign modals BEFORE every inject** (`session.ts#detectBenignModal` /
+  `dismissBenignModals`, wired in `Broker.send`'s inject). Conservative — ONLY the
+  "How is Claude doing this session?" rating prompt (→ **Escape**, no rating) and the
+  first-run trust dialog (→ **Enter**). A genuine question to the captain is NEVER
+  auto-answered. A wedged rating prompt swallowing the next message was the captain's
+  "nothing after refresh" dead-end. Surfaced to the client as a `notice` frame (→ toast +
+  diagnostics). The normal `⏵⏵ bypass permissions` FOOTER is not a modal — don't match it.
+- **Refresh/reconnect robustness (Bug B2).** `app.ts` keeps `lastTurnState`; a freshly
+  connected client (page refresh) is REPLAYED reply+narration+audio+turn-done with
+  `replay:true` (client SHOWS them + arms Replay but does NOT auto-play). A turn is NOT
+  cancelled when the initiating socket drops — a refresh mid-turn re-joins the broadcast and
+  receives the REMAINING chunks, so it never wedges. Cancel is EXPLICIT only: the `stop`
+  client frame (sent on hangup) sets the turn's abort signal → `streamReply`/pipeline stop
+  emitting + synthesizing. Turns stay serialized (one `busy` lock).
+- **WS protocol additions:** client→server `stop`; server→client `notice`; `narration`/
+  `audio` carry an `index` (progressive ordering) and `reply`/`narration`/`audio`/`turn-done`
+  an optional `replay`. When chunks streamed (`result.chunks>0`) app.ts SKIPS the aggregate
+  narration/audio broadcast (no double-speak); in-memory/legacy drivers with 0 chunks still
+  get the aggregate frames (keeps the older web legs valid).
+- **New validate legs (all green, mock):** prompt-anchored transcript (ignores concurrent
+  sessions), incremental speakable units (audio starts mid-turn), runStreamingPipeline emits
+  chunks before completion + abort, benign-modal auto-dismiss, and web progressive-chunks +
+  notice + reconnect replay. The real-audio e2e (piper→whisper) leg still passes.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

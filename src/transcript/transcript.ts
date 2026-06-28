@@ -149,6 +149,77 @@ export function parseTranscript(path: string, opts?: NormalizeOpts): TranscriptE
   return events;
 }
 
+// Normalize a line for robust matching of an injected prompt against a transcript
+// human event (collapse whitespace, trim). fm-send types the line verbatim, but the
+// composer/harness can reflow whitespace, so we compare on the collapsed form.
+export function normalizeForMatch(s: string): string {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+// Find the index of the LAST `human` event whose text matches the injected prompt.
+// This is the per-turn ANCHOR: the captain's first mate shares a project dir with
+// OTHER concurrent claude sessions (the supervisor, crewmates), so "newest transcript
+// by mtime" flip-flops between unrelated files. The file that recorded OUR injected
+// line is unambiguously the right one — we anchor to it by content, not mtime. Returns
+// -1 if the prompt is not present yet (claude writes the user turn lazily).
+export function findPromptAnchor(events: TranscriptEvent[], injectedText: string): number {
+  const target = normalizeForMatch(injectedText);
+  if (!target) return -1;
+  let exact = -1;
+  let loose = -1;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i]!;
+    if (e.kind !== 'human') continue;
+    const got = normalizeForMatch(e.text);
+    if (got === target) exact = i;
+    else if (got.includes(target)) loose = i;
+  }
+  return exact >= 0 ? exact : loose;
+}
+
+// The `say` events that belong to the turn anchored at `anchorIndex`: every assistant
+// say AFTER the anchor up to the next `human` event (or end of file). Returns [] when
+// anchorIndex < 0.
+export function saysAfterAnchor(
+  events: TranscriptEvent[],
+  anchorIndex: number,
+): Extract<TranscriptEvent, { kind: 'say' }>[] {
+  if (anchorIndex < 0) return [];
+  const out: Extract<TranscriptEvent, { kind: 'say' }>[] = [];
+  for (let i = anchorIndex + 1; i < events.length; i++) {
+    const e = events[i]!;
+    if (e.kind === 'human') break; // the next turn started — stop at our turn's boundary
+    if (e.kind === 'say') out.push(e);
+  }
+  return out;
+}
+
+// Newest transcript under `projectDir` that contains the injected prompt as a human
+// event — the robust replacement for latestTranscriptIn() when tapping an attached
+// first mate. Scans .jsonl files newest-first (so a mid-turn /clear or compaction that
+// re-records the prompt in a fresh UUID file is followed forward) and returns the first
+// whose content anchors the prompt, or null if none does yet. `limit` caps how many
+// recent files we parse per call (cheap, newest-first).
+export function latestTranscriptWithPrompt(
+  projectDir: string,
+  injectedText: string,
+  { limit = 8 }: { limit?: number } = {},
+): string | null {
+  if (!existsSync(projectDir)) return null;
+  const files = readdirSync(projectDir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .map((f) => join(projectDir, f))
+    .map((p) => ({ p, mtime: statSync(p).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit);
+  for (const { p } of files) {
+    try {
+      if (findPromptAnchor(parseTranscript(p), injectedText) >= 0) return p;
+    } catch { /* unreadable/partial — skip */ }
+  }
+  return null;
+}
+
 export interface TailOpts {
   startOffset?: number;
   opts?: NormalizeOpts;

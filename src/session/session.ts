@@ -227,6 +227,71 @@ export async function waitForComposer(
   return false;
 }
 
+// A benign Claude Code modal that would otherwise SWALLOW the next injected message
+// (the captain's "nothing after refresh" wedge): the periodic "How is Claude doing
+// this session?" feedback/rating prompt, and the first-run "trust this folder" dialog.
+// We only ever act on these KNOWN, benign dialogs — never auto-answer a real question.
+export interface BenignModal {
+  /** machine id for diagnostics (e.g. 'feedback-rating', 'trust-folder'). */
+  kind: string;
+  /** the tmux key to send to dismiss/accept it ('Escape' to dismiss, 'Enter' to accept). */
+  key: string;
+  /** human description for the diagnostics surface. */
+  detail: string;
+}
+
+// Pure detector: given a captured pane, return the benign modal to dismiss, or null.
+// Conservative — matches only the two specific dialogs above so an ordinary turn (or a
+// genuine question to the captain) is never auto-answered.
+export function detectBenignModal(pane: string): BenignModal | null {
+  const p = pane || '';
+  if (/how is claude doing this session/i.test(p) || /\brate (?:this|your) session\b/i.test(p)) {
+    return {
+      kind: 'feedback-rating', key: 'Escape',
+      detail: '"How is Claude doing this session?" rating prompt (dismissed, no rating)',
+    };
+  }
+  if (/do you trust the files in this folder|trust this folder|yes, i trust/i.test(p)) {
+    return {
+      kind: 'trust-folder', key: 'Enter',
+      detail: '"trust this folder" first-run dialog (accepted)',
+    };
+  }
+  return null;
+}
+
+// Detect + auto-dismiss a benign modal in the live pane BEFORE injecting, so the
+// message lands in the composer, not the popup. Returns the dismissed modal (for the
+// diagnostics surface) or null. Injectable (capture/sendKey/sleep) for the harness.
+export interface DismissDeps {
+  capture: () => string;
+  sendKey: (key: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  log?: Log;
+}
+export async function dismissBenignModals(deps: DismissDeps): Promise<BenignModal | null> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const log = deps.log ?? noop;
+  const modal = detectBenignModal(deps.capture());
+  if (!modal) return null;
+  log(`auto-dismissing benign modal: ${modal.detail} -> ${modal.key}`);
+  deps.sendKey(modal.key);
+  await sleep(400);
+  // Best-effort: if the SAME benign modal is still up, dismiss once more, then give up
+  // (never loop — we only ever touch the two known dialogs).
+  if (detectBenignModal(deps.capture())) {
+    deps.sendKey(modal.key);
+    await sleep(400);
+  }
+  return modal;
+}
+
+// Send one tmux key (e.g. 'Escape', 'Enter') to a pane. Best-effort; used to dismiss
+// the benign modals above before injecting.
+export function sendKey(target: string, key: string): void {
+  try { sh('tmux', ['send-keys', '-t', target, key]); } catch { /* best effort */ }
+}
+
 // Clear anything sitting in the composer (kill-line + Escape) — also our recovery
 // after a swallowed Enter, which leaves our text in the composer.
 export function clearComposer(target: string = TARGET): void {
