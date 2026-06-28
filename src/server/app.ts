@@ -137,6 +137,13 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   let turn = 0;
   let busy = false;
   let lastTerminal = '';
+  // Cancellation for the in-flight turn (explicit barge-in / hangup via `stop`).
+  let currentSignal: { aborted: boolean } | null = null;
+  // Last completed turn's state, so a client that refreshes mid/post-turn is re-synced
+  // instead of left blank (the captain's "nothing after refresh" dead-end).
+  let lastTurnState:
+    | { turn: number; reply: string; narration: string; backend: string; pcm: string; sampleRate: number; ttfbMs: number | null; bytes: number }
+    | null = null;
 
   const ship = (ws: WebSocket, msg: ServerMessage): void => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
@@ -164,6 +171,9 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
     }
     busy = true;
     const myTurn = ++turn;
+    const signal = { aborted: false };
+    currentSignal = signal;
+    let chunks = 0;
     try {
       const result = await driver.send(text, myTurn, {
         onStage: (stage) => {
@@ -171,19 +181,33 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
           if (st) broadcastStatus(st);
           if (stage === 'reply' || stage === 'synth') pushTerminal();
         },
+        // Progressive: broadcast each speakable unit's narration + audio AS it is ready,
+        // so the captain hears the first sentence ~1s in. The client queues audio frames
+        // gaplessly. Aborted turns emit nothing further.
+        onChunk: (c) => {
+          if (signal.aborted) return;
+          chunks++;
+          broadcast({ type: 'narration', turn: myTurn, text: c.narration, backend: c.speakBackend, index: c.index });
+          broadcast({ type: 'audio', turn: myTurn, pcm: c.pcm.toString('base64'), sampleRate: c.sampleRate, format: AUDIO_FORMAT, index: c.index });
+        },
+        onNotice: (message) => broadcast({ type: 'notice', message }),
+        signal,
       });
+      if (signal.aborted) { broadcastStatus('idle'); return; }
+      // The full raw reply (transcript column) lands at the end.
       broadcast({ type: 'reply', turn: myTurn, text: result.reply });
-      broadcast({ type: 'narration', turn: myTurn, text: result.narration, backend: result.speakBackend });
-      broadcast({
-        type: 'audio',
-        turn: myTurn,
-        pcm: result.audio.pcm.toString('base64'),
-        sampleRate: result.audio.sampleRate,
-        format: AUDIO_FORMAT,
-      });
+      // Legacy/in-memory drivers don't stream chunks — fall back to the aggregate frames
+      // so the page still gets one narration + audio (and tests stay valid).
+      if ((result.chunks ?? chunks) === 0) {
+        broadcast({ type: 'narration', turn: myTurn, text: result.narration, backend: result.speakBackend });
+        broadcast({ type: 'audio', turn: myTurn, pcm: result.audio.pcm.toString('base64'), sampleRate: result.audio.sampleRate, format: AUDIO_FORMAT });
+      }
       broadcast({ type: 'turn-done', turn: myTurn, ttfbMs: result.audio.ttfbMs, bytes: result.audio.bytes });
-      // Speaking happens client-side; once audio is delivered, reflect whether the
-      // captain now owes an answer (the narration asks a question) or we are idle.
+      lastTurnState = {
+        turn: myTurn, reply: result.reply, narration: result.narration, backend: result.speakBackend,
+        pcm: result.audio.pcm.toString('base64'), sampleRate: result.audio.sampleRate,
+        ttfbMs: result.audio.ttfbMs, bytes: result.audio.bytes,
+      };
       broadcastStatus(/\?/.test(result.narration) ? 'awaiting-confirmation' : 'idle');
       pushTerminal();
     } catch (e) {
@@ -191,6 +215,27 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
       broadcastStatus('idle');
     } finally {
       busy = false;
+      currentSignal = null;
+    }
+  }
+
+  // Re-sync a freshly-connected (refreshed) client with the last completed turn so it is
+  // never left blank. Replayed frames carry `replay: true` so the client SHOWS them and
+  // arms Replay without auto-playing audio or re-running anything.
+  function replayLastTurn(ws: WebSocket): void {
+    const s = lastTurnState;
+    if (!s) return;
+    ship(ws, { type: 'reply', turn: s.turn, text: s.reply, replay: true });
+    if (s.narration) ship(ws, { type: 'narration', turn: s.turn, text: s.narration, backend: s.backend, replay: true });
+    if (s.bytes > 0) ship(ws, { type: 'audio', turn: s.turn, pcm: s.pcm, sampleRate: s.sampleRate, format: AUDIO_FORMAT, replay: true });
+    ship(ws, { type: 'turn-done', turn: s.turn, ttfbMs: s.ttfbMs, bytes: s.bytes, replay: true });
+  }
+
+  function cancelCurrentTurn(reason: string): void {
+    if (currentSignal && !currentSignal.aborted) {
+      currentSignal.aborted = true;
+      log('turn cancelled: ' + reason);
+      broadcastStatus('idle');
     }
   }
 
@@ -207,9 +252,15 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
       serverStt: !!transcribe,
       sttLabel,
     });
-    ship(ws, { type: 'status', state: busy ? 'thinking' : 'idle' });
+    // Preserve awaiting-confirmation across a refresh so the §3.5 voice guard still
+    // applies (a misheard "yeah" can't approve a merge just because the page reloaded).
+    const idleState: UiStatus =
+      lastTurnState && /\?/.test(lastTurnState.narration) ? 'awaiting-confirmation' : 'idle';
+    ship(ws, { type: 'status', state: busy ? 'thinking' : idleState });
     if (lastTerminal) ship(ws, { type: 'terminal', data: lastTerminal });
     else pushTerminal(true);
+    // Re-sync a refreshed client with the last turn so it is never left blank.
+    replayLastTurn(ws);
 
     ws.on('message', (raw) => {
       let msg: ClientMessage;
@@ -234,6 +285,8 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
           }
         } catch { /* skip bad chunk */ }
         if (typeof msg.sampleRate === 'number' && msg.sampleRate > 0) buf.sampleRate = msg.sampleRate;
+      } else if (msg.type === 'stop') {
+        cancelCurrentTurn('client stop (barge-in/hangup)');
       } else if (msg.type === 'stt-cancel') {
         sttBuffers.delete(ws);
       } else if (msg.type === 'stt-end') {
@@ -270,8 +323,13 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         ship(ws, { type: 'pong' });
       }
     });
-    ws.on('close', () => { clients.delete(ws); sttBuffers.delete(ws); });
-    ws.on('error', () => { clients.delete(ws); sttBuffers.delete(ws); });
+    // NOTE: we deliberately do NOT cancel the in-flight turn when a client disconnects.
+    // A page refresh mid-turn drops this socket and immediately opens a new one; the new
+    // connection joins the broadcast and receives the REMAINING chunks (then a replay of
+    // the finished state), so the turn is never wedged. Cancel is explicit only (`stop`).
+    const onGone = (): void => { clients.delete(ws); sttBuffers.delete(ws); };
+    ws.on('close', onGone);
+    ws.on('error', onGone);
   });
 
   httpServer.on('upgrade', (req, socket, head) => {

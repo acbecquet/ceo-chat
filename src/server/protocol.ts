@@ -42,6 +42,8 @@ export type ClientMessage =
   | { type: 'stt-end' }
   // Discard any buffered STT audio without transcribing (barge-in / mic released).
   | { type: 'stt-cancel' }
+  // Barge-in / hangup: cancel the in-flight turn (stop pending speech + synthesis).
+  | { type: 'stop' }
   // Liveness.
   | { type: 'ping' };
 
@@ -69,14 +71,21 @@ export type ServerMessage =
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.
   | { type: 'terminal'; data: string }
-  // The raw agent reply text (shown in the transcript column).
-  | { type: 'reply'; turn: number; text: string }
-  // The speakability narration (the words actually spoken).
-  | { type: 'narration'; turn: number; text: string; backend: string }
-  // One turn's spoken audio, base64 PCM.
-  | { type: 'audio'; turn: number; pcm: string; sampleRate: number; format: typeof AUDIO_FORMAT }
+  // The raw agent reply text (shown in the transcript column). `replay` = state
+  // re-sent to a reconnecting client (page refresh) — show it, don't re-run anything.
+  | { type: 'reply'; turn: number; text: string; replay?: boolean }
+  // The speakability narration (the words actually spoken). Streamed PROGRESSIVELY —
+  // one frame per speakable unit as the agent talks (carries `index`), so the captain
+  // hears the first sentence ~1s in instead of after the whole turn.
+  | { type: 'narration'; turn: number; text: string; backend: string; index?: number; replay?: boolean }
+  // One unit's spoken audio, base64 PCM. Multiple per turn (progressive); the client
+  // queues them gaplessly. `replay` audio (reconnect) is NOT auto-played.
+  | { type: 'audio'; turn: number; pcm: string; sampleRate: number; format: typeof AUDIO_FORMAT; index?: number; replay?: boolean }
+  // A benign Claude Code modal was auto-dismissed before injecting (feedback/trust
+  // dialog) — surfaced for the diagnostics panel. Not an error.
+  | { type: 'notice'; message: string }
   // Turn finished cleanly (metrics for the UI).
-  | { type: 'turn-done'; turn: number; ttfbMs: number | null; bytes: number }
+  | { type: 'turn-done'; turn: number; ttfbMs: number | null; bytes: number; replay?: boolean }
   // Something failed mid-turn; the UI returns to idle.
   | { type: 'error'; message: string }
   // Liveness.

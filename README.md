@@ -26,7 +26,7 @@ typed/spoken text
    ▼
 your REAL first mate in tmux (CEOCHAT_TARGET)    ← attach mode; or a dedicated
                                                    throwaway `ceo-chat` session
-   │  transcript JSONL tap  (idle latch)       ← clean source, not the scraped TUI
+   │  transcript JSONL tap  (prompt-anchored)  ← clean source, not the scraped TUI
    ▼
 agent reply (clean assistant text)
    │  speakability rewrite  (Haiku-class LLM)   ← drop code/paths/URLs, keep questions
@@ -37,9 +37,14 @@ agent reply (clean assistant text)
 spoken audio  +  terminal view (capture-pane)
 ```
 
-Every leg is the real component, dependency-injected into one `runPipeline()`
+Every leg is the real component, dependency-injected into the pipeline
 ([`src/broker/pipeline.ts`](./src/broker/pipeline.ts)) so the product and the
-validation harness exercise the **same** orchestration code.
+validation harness exercise the **same** orchestration code. The live web app drives
+`runStreamingPipeline` — it speaks each **complete sentence as it streams** from the
+transcript (first audio ~1–2s in, instead of after the whole turn), while the CLI and
+in-memory test drivers use the aggregate `runPipeline`. The tap is **prompt-anchored**
+(it follows the transcript file that recorded *our* injected line), so an attached first
+mate sharing a project dir with other concurrent Claude sessions is read correctly.
 
 ## Quick start
 
@@ -111,8 +116,10 @@ Open the printed URL and you get:
   verified submit);
 - the **speakability narration** as it is produced, and the **raw agent reply**;
 - **auto-spoken replies** — tap **Start call** once and every reply is read aloud
-  automatically (Web Audio decodes raw PCM). The local piper voice speaks real words
-  with no key; MiniMax streams the same way once paired; the mock tone is for tests;
+  automatically, **sentence-by-sentence as it streams** (gapless, ordered; Web Audio
+  decodes raw PCM). The local piper voice speaks real words with no key; MiniMax streams
+  the same way once paired; the mock tone is for tests. **Replay** re-speaks the whole
+  last turn; **hang up** (or a barge-in) cancels the in-flight turn server-side;
 - **status indicators** — listening / thinking / speaking / awaiting-confirmation —
   driven off real pipeline stages;
 - **hands-free voice input** — robust `webkitSpeechRecognition` (re-armed for iOS),
@@ -123,6 +130,10 @@ Open the printed URL and you get:
 
 The web app is built to feel like a **phone call** from the car:
 
+- **Replies start speaking almost immediately.** Each complete sentence is spoken as
+  the agent streams it, so the first audio lands ~1–2s in rather than after the whole
+  turn. A page refresh mid-call **rejoins** the turn (it gets the remaining chunks) and
+  is replayed the last turn's text/audio (shown, not auto-played) instead of going blank.
 - **Audio unlocks on the first tap.** Mobile browsers suspend audio until a user
   gesture — the **Start call** button resumes the AudioContext (and holds a **Wake
   Lock**), after which replies auto-play with no further taps. Replies that arrive
@@ -143,6 +154,10 @@ The web app is built to feel like a **phone call** from the car:
   mic getUserMedia / worklet-vs-scriptprocessor / bytes-streamed / server transcript —
   with a one-tap **Copy diagnostics** button, so a device test can be sighted by pasting
   the log back.
+- **Benign Claude prompts don't wedge the call.** A stray "How is Claude doing this
+  session?" rating or the first-run trust dialog is auto-dismissed before each message
+  (surfaced as a toast + diagnostics note); a genuine question to you is never
+  auto-answered.
 - **Voice-safe confirmations (plan §3.5):** when first mate asks to confirm a
   consequential action (merge/push/deploy/delete…), a *spoken* reply must be a clear
   "confirm" or "cancel" — a misheard "yeah" is held and re-prompted, never
@@ -196,6 +211,7 @@ It covers:
 |---|---|
 | **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
+| **Streaming & robustness** | prompt-anchored transcript tap (ignores concurrent sessions in a shared project dir) · incremental speakable units (audio starts mid-turn) · `runStreamingPipeline` emits chunks before completion + aborts on barge-in · benign-modal auto-dismiss · web progressive chunks + `notice` + reconnect replay |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
 
@@ -273,14 +289,14 @@ bin/
   setup-local-voice.sh     download/build the offline voice stack (npm run voice)
 src/
   config/secrets.ts        secrets loader (outside-repo, gitignored)
-  session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror
-  transcript/transcript.ts JSONL tap (normalize/parse/tail)
-  transcript/reply.ts      reply-wait latch (injectable, regression-guarded)
+  session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror + benign-modal dismiss
+  transcript/transcript.ts JSONL tap (normalize/parse/tail; prompt-anchored resolution)
+  transcript/reply.ts      reply-wait latch + incremental streamReply (injectable, regression-guarded)
   speakability/            rewrite-for-the-ear (anthropic-api | claude-cli | mock)
   tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec)
   tts/local-tts.ts         LOCAL piper neural voice — the default offline TTS
   tts/mock-server.ts       in-process MiniMax mock (real protocol, synthetic PCM)
-  broker/pipeline.ts       the one injected end-to-end orchestration (+ onStage hook)
+  broker/pipeline.ts       the injected orchestration: aggregate runPipeline + streaming runStreamingPipeline (+ onStage hook)
   broker/broker.ts         the runnable broker (owns session + TTS backend: minimax|local|mock)
   cli/dev.ts               the CLI driver entrypoint
   server/protocol.ts       the browser <-> broker WS message contract

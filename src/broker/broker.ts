@@ -1,13 +1,13 @@
 // broker.ts — the runnable ceo-chat broker: it OWNS a dedicated throwaway firstmate
 // session and turns typed lines into spoken audio through the real pipeline.
 //
-// This is the "finished product" the captain manually tests. It wires the real
-// legs into runPipeline():
-//   inject     = fm-send.sh verified submit            (src/session)
-//   readReply  = transcript JSONL tap + idle latch     (src/transcript)
-//   speakify   = Anthropic API or `claude -p` fallback (src/speakability)
-//   synth      = MiniMax TTS — LIVE if creds present, else an in-process MOCK
-//                server speaking the same protocol so audio still comes out
+// This is the "finished product" the captain manually tests. It wires the real legs
+// into runStreamingPipeline() — speaking PROGRESSIVELY (a chunk per speakable unit) so
+// audio starts ~1-2s in instead of after the whole turn:
+//   inject     = auto-dismiss benign modals + fm-send.sh verified submit (src/session)
+//   streamReply= PROMPT-ANCHORED transcript tap streaming units          (src/transcript)
+//   speakify   = Anthropic API (fast) or deterministic rule rewriter     (src/speakability)
+//   synth      = piper / MiniMax / mock TTS, per unit                    (src/tts)
 //   terminal   = tmux capture-pane (the visual view)
 //
 // TTS mode is chosen automatically: MINIMAX_API_KEY present -> live; otherwise the
@@ -15,24 +15,26 @@
 // full end-to-end run even before the live key is added. Drop the key into
 // secrets.env and the SAME broker flips to live with no code change.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../config/secrets.ts';
 import {
   spawnCeoChat, attachTarget, resolveTargetFromEnv, teardown, waitForComposer, fmSend,
-  capturePane, capturePaneAnsi, sleep,
+  capturePane, capturePaneAnsi, sendKey, dismissBenignModals, sleep,
   type SessionCtx, type TargetSpec,
 } from '../session/session.ts';
 import {
-  PROJECTS_DIR, mangleCwd, latestTranscriptIn, parseTranscript,
-  type TranscriptEvent,
+  PROJECTS_DIR, mangleCwd, parseTranscript,
+  latestTranscriptWithPrompt, findPromptAnchor, saysAfterAnchor,
 } from '../transcript/transcript.ts';
-import { waitForReply } from '../transcript/reply.ts';
-import { speakify } from '../speakability/speakability.ts';
+import { streamReply } from '../transcript/reply.ts';
+import { speakify, type SpeakabilityBackend } from '../speakability/speakability.ts';
 import { synthStreaming, toWav, INTL_WS, DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
 import { findPiper, synthLocal, type LocalVoice } from '../tts/local-tts.ts';
-import { runPipeline, type PipelineResult, type PipelineStage } from './pipeline.ts';
+import {
+  runStreamingPipeline, type PipelineResult, type PipelineStage, type PipelineChunk,
+} from './pipeline.ts';
 import { startMockMinimax, type MockMinimax } from '../tts/mock-server.ts';
 import type { TtsMode } from '../server/protocol.ts';
 
@@ -56,7 +58,6 @@ export class Broker {
   private readonly log: (msg: string) => void;
   private ctx: SessionCtx | null = null;
   private projectDir = '';
-  private transcriptPath: string | null = null;
   private mock: MockMinimax | null = null;
   private voice: LocalVoice | null = null;
   private readonly forceMock: boolean;
@@ -83,9 +84,19 @@ export class Broker {
     this.targetSpec = resolveTargetFromEnv();
   }
 
-  speakBackendHint(): string {
+  // The speakability backend used for the PROGRESSIVE/streaming path. We deliberately
+  // avoid `claude -p` here: spawning it per speakable unit costs seconds each and would
+  // defeat the whole point of incremental speak. So: Anthropic API when a key is paired
+  // (fast, best rewrite), otherwise the deterministic rule-based rewriter (instant, and
+  // it still honors the §7.3 contract — drops code/paths/URLs, keeps questions). The
+  // mock tone path forces 'mock' too.
+  private streamSpeakBackend(): SpeakabilityBackend {
     if (this.forceMock) return 'mock';
-    return has(this.secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'claude-cli';
+    return has(this.secrets, 'ANTHROPIC_API_KEY') ? 'anthropic-api' : 'mock';
+  }
+
+  speakBackendHint(): string {
+    return this.streamSpeakBackend();
   }
 
   /** Human label of the TTS voice/backend in use (for logs + the UI). */
@@ -119,8 +130,9 @@ export class Broker {
       this.ctx = attachTarget(this.targetSpec, { log: this.log });
       this.projectDir = join(PROJECTS_DIR, mangleCwd(this.ctx.cwd));
       // The attached session's transcript already exists and may hold a long
-      // history — its discovery happens lazily (captureBaseline) and each turn
-      // baselines at the CURRENT say-count, so we only ever speak NEW replies.
+      // history — each turn anchors to the file that recorded ITS injected prompt and
+      // reads only the says after that anchor, so we only ever speak the NEW reply
+      // (never the backlog), even with other concurrent claude sessions in this dir.
     } else {
       this.log('spawning dedicated ceo-chat session');
       this.ctx = spawnCeoChat({ log: this.log });
@@ -138,32 +150,53 @@ export class Broker {
   }
 
   // Drive one full turn: typed text -> spoken audio + narration + terminal view.
-  // `onStage` (optional) lets the web UI drive its listening/thinking/speaking
-  // status indicators off real pipeline progress.
+  // Speaks PROGRESSIVELY — each speakable unit is rewritten + synthesized + emitted via
+  // `onChunk` as the agent talks, so audio starts within ~1-2s instead of after the
+  // whole (often 30s+) turn. `onStage` drives the web UI status; `onNotice` surfaces an
+  // auto-dismissed benign modal; `signal` cancels pending speech on barge-in/hangup.
   async send(
     typed: string,
     turnIndex: number,
-    opts: { onStage?: (stage: PipelineStage) => void } = {},
+    opts: {
+      onStage?: (stage: PipelineStage) => void;
+      onChunk?: (chunk: PipelineChunk) => void;
+      onNotice?: (message: string) => void;
+      signal?: { readonly aborted: boolean };
+    } = {},
   ): Promise<PipelineResult & { wavPath: string; narrationPath: string }> {
     if (!this.ctx) throw new Error('broker not started');
     const target = this.ctx.target;
 
-    // Snapshot the say-count BEFORE injecting so readReply returns only THIS turn's
-    // new reply — essential when attached to a live first mate whose transcript
-    // already holds a backlog (and whatever the captain types directly in the pane).
-    const baseline = this.captureBaseline();
-
-    const result = await runPipeline(typed, {
-      inject: async (text) => { await fmSend(text, { target, log: this.log }); },
-      readReply: () => this.readReply(target, baseline),
+    // Captured just before fm-send submits, so the reply tap can anchor to the user
+    // line claude writes at/after this instant — never an IDENTICAL earlier turn's line
+    // (the repeated-confirmation-prompt hazard). Set in inject (which runs first).
+    let baselineTs = '';
+    const result = await runStreamingPipeline(typed, {
+      inject: async (text) => {
+        // Auto-dismiss a benign Claude modal (feedback rating / trust dialog) that
+        // would otherwise swallow this message into the popup — the captain's wedge.
+        const dismissed = await dismissBenignModals({
+          capture: () => capturePane(target),
+          sendKey: (k) => sendKey(target, k),
+          log: this.log,
+        });
+        if (dismissed) opts.onNotice?.(`Auto-dismissed ${dismissed.detail} before sending.`);
+        baselineTs = new Date().toISOString();
+        await fmSend(text, { target, log: this.log });
+      },
+      // Anchor the reply to the transcript that recorded OUR prompt (multi-session safe)
+      // and stream its says as speakable units.
+      streamReply: (onUnit) => this.streamReplyFor(target, typed, () => baselineTs, onUnit, opts.signal),
       speakify: (text) => speakify(text, {
         apiKey: has(this.secrets, 'ANTHROPIC_API_KEY') ? this.secrets.ANTHROPIC_API_KEY : null,
-        backend: this.forceMock ? 'mock' : 'auto',
+        backend: this.streamSpeakBackend(),
         log: this.log,
       }),
       synth: (chunks) => this.synth(chunks),
       terminalView: () => capturePane(target),
       onStage: opts.onStage,
+      onChunk: (c) => opts.onChunk?.(c),
+      signal: opts.signal,
       log: this.log,
     });
 
@@ -215,60 +248,62 @@ export class Broker {
     });
   }
 
-  // Current number of assistant `say` blocks in the transcript (0 before it appears).
-  // Used as the per-turn baseline so a turn returns only the reply it triggered.
-  // Re-resolves the newest transcript EACH turn (never caches for the broker's life):
-  // an attached first mate rotates its JSONL on /clear, compaction, or a new session
-  // UUID, and a stale cached path would silently time out at 150s every later turn.
-  private captureBaseline(): number {
-    const latest = latestTranscriptIn(this.projectDir);
-    if (latest && latest !== this.transcriptPath) {
-      if (this.transcriptPath) this.log(`transcript rotated -> ${latest}`);
-      this.transcriptPath = latest;
+  // Stream THIS turn's reply as speakable units, anchored to the transcript that
+  // recorded our injected prompt. This is the robustness fix for an attached first mate:
+  // ~/firstmate's project dir is shared with OTHER concurrent claude sessions (the
+  // supervisor, crewmates), so "newest transcript by mtime" flip-flops between unrelated
+  // files (seen live in the captain's serve.log). The file holding OUR prompt is the
+  // unambiguous one. We RE-RESOLVE it every poll, so a mid-turn /clear or compaction
+  // that re-records the prompt in a fresh UUID file is followed forward seamlessly; the
+  // unit dedup in streamReply makes any re-read of already-spoken text a non-event.
+  private async streamReplyFor(
+    target: string,
+    injectedText: string,
+    getBaselineTs: () => string,
+    onUnit: (unitText: string) => void,
+    signal?: { readonly aborted: boolean },
+  ): Promise<string> {
+    const afterTs = (): string | undefined => getBaselineTs() || undefined;
+    // The user turn is written lazily — wait for OUR prompt to appear in some transcript.
+    let anchored: string | null = null;
+    for (let i = 0; i < 120 && !anchored; i++) {
+      if (signal?.aborted) return '';
+      anchored = latestTranscriptWithPrompt(this.projectDir, injectedText, { afterTs: afterTs() });
+      if (!anchored) await sleep(500);
     }
-    if (!this.transcriptPath) return 0;
-    return parseTranscript(this.transcriptPath).filter((e) => e.kind === 'say').length;
-  }
-
-  // Wait for the COMPLETE agent reply on the transcript tap (idle latch). `baseline`
-  // is the say-count captured just before this turn's inject, so we read only the
-  // new say blocks this turn produced.
-  //
-  // The transcript can ALSO rotate mid-turn: the captain types /clear as the turn
-  // injects, or auto-compaction / a new session UUID starts a fresh JSONL while the
-  // agent is replying. So readSays re-resolves the NEWEST transcript on every poll and
-  // adopts it if it changed — the reply lands in the new file, which starts fresh, so
-  // the effective say-baseline for the adopted file is 0. Count is reported relative to
-  // `baseline` (sayBefore) so the latch's `count > sayBefore` "a new say arrived" check
-  // holds across a rotation. We only ever move FORWARD: latestTranscriptIn returns the
-  // most-recent file by mtime, so adopting it never steps back to an older transcript.
-  private async readReply(target: string, baseline: number): Promise<string> {
-    // The transcript is written lazily — discover it after the first inject.
-    for (let i = 0; i < 120 && !this.transcriptPath; i++) {
-      this.transcriptPath = latestTranscriptIn(this.projectDir);
-      if (!this.transcriptPath) await sleep(500);
+    if (!anchored) {
+      throw new Error('our injected prompt never appeared in any transcript under ' + this.projectDir);
     }
-    if (!this.transcriptPath) throw new Error('no transcript appeared under ' + this.projectDir);
-    let activePath = this.transcriptPath;
-    let activeBaseline = baseline;
+    let activePath = anchored;
+    let lastSig = ''; // mtime:size of activePath at the previous poll
 
-    return waitForReply({
+    return streamReply({
       readSays: () => {
-        const latest = latestTranscriptIn(this.projectDir);
-        if (latest && latest !== activePath) {
-          this.log(`transcript rotated mid-turn -> ${latest}`);
-          activePath = latest;
-          activeBaseline = 0; // fresh file starts from zero says
-          this.transcriptPath = latest;
+        let sig = '';
+        try { const st = statSync(activePath); sig = st.mtimeMs + ':' + st.size; } catch { sig = ''; }
+        // Only rescan the dir for a rotation when the active transcript has NOT advanced:
+        // a growing file means we are still on the right one (the common path), so we skip
+        // re-parsing several multi-MB siblings every poll. A stalled file may mean a
+        // mid-turn /clear/compaction re-anchored our prompt to a fresh UUID — then rescan.
+        if (sig === '' || sig === lastSig) {
+          const latest = latestTranscriptWithPrompt(this.projectDir, injectedText, { afterTs: afterTs() });
+          if (latest && latest !== activePath) {
+            this.log(`transcript rotated mid-turn (prompt re-anchored) -> ${latest}`);
+            activePath = latest;
+            try { const st = statSync(activePath); sig = st.mtimeMs + ':' + st.size; } catch { sig = ''; }
+          }
         }
-        const says = parseTranscript(activePath).filter((e) => e.kind === 'say') as Extract<TranscriptEvent, { kind: 'say' }>[];
-        const fresh = says.slice(activeBaseline);
-        return { count: baseline + fresh.length, text: fresh.map((e) => e.text).join('\n') };
+        lastSig = sig;
+        const events = parseTranscript(activePath);
+        const says = saysAfterAnchor(events, findPromptAnchor(events, injectedText, { afterTs: afterTs() }));
+        return { count: says.length, text: says.map((e) => e.text).join('\n') };
       },
       isIdle: () => !/esc to interrupt/i.test(capturePane(target)),
       sleep,
       now: () => performance.now(),
+      onUnit,
+      signal,
       log: this.log,
-    }, { sayBefore: baseline });
+    }, { sayBefore: 0 });
   }
 }

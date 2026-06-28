@@ -99,7 +99,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   var inCall = false;
   var serverStt = false, sttLabel = '';
   var lastNarration = '';
-  var lastTurn = null;            // {pcm, sampleRate} for Replay
+  var lastTurn = null;            // {turn, chunks:[{pcm, sampleRate}]} — the WHOLE turn for Replay
   var awaitingConfirmation = false;
   var serverState = 'idle';       // last status from the broker
   var micState = 'idle';          // SpeechController state
@@ -203,8 +203,22 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
         addTurn('spoken', { who: 'spoken (' + msg.backend + ')', spoken: msg.text });
         break;
       case 'audio':
-        lastTurn = { pcm: msg.pcm, sampleRate: msg.sampleRate || sampleRate };
-        audio.enqueue(msg.pcm, msg.sampleRate || sampleRate); // AUTO-SPEAK
+        var sr = msg.sampleRate || sampleRate;
+        if (msg.replay) {
+          // Reconnect aggregate: the whole turn arrives in one frame. Arm Replay but do
+          // NOT auto-play it (the captain didn't just ask).
+          lastTurn = { turn: msg.turn, chunks: [{ pcm: msg.pcm, sampleRate: sr }] };
+        } else {
+          // Live progressive chunk: accumulate per turn so Replay covers the ENTIRE turn,
+          // not just the final sentence. Live audio auto-speaks, queued gaplessly.
+          if (!lastTurn || lastTurn.turn !== msg.turn) lastTurn = { turn: msg.turn, chunks: [] };
+          lastTurn.chunks.push({ pcm: msg.pcm, sampleRate: sr });
+          audio.enqueue(msg.pcm, sr);
+        }
+        break;
+      case 'notice':
+        diag.add('notice: ' + msg.message);
+        toast(msg.message);
         break;
       case 'transcript':
         // Server STT result. Make empty/failed results VISIBLE rather than silent.
@@ -304,6 +318,7 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
     localSay('Call started.');
   }
   function hangup() {
+    sendJson({ type: 'stop' }); // cancel any in-flight turn server-side (stop synthesis)
     inCall = false; micWanted = false;
     speech.stop(); stopServerCapture(); audio.stop();
     releaseWakeLock(); exitCallMode(true);
@@ -312,7 +327,10 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   }
   els.start.addEventListener('click', function () { void startCall(); });
   els.hangup.addEventListener('click', hangup);
-  els.replay.addEventListener('click', function () { if (lastTurn) audio.enqueue(lastTurn.pcm, lastTurn.sampleRate); });
+  els.replay.addEventListener('click', function () {
+    if (!lastTurn || !lastTurn.chunks.length) return;
+    lastTurn.chunks.forEach(function (c) { audio.enqueue(c.pcm, c.sampleRate); });
+  });
 
   function startListening() {
     if (webSpeechOk) { speech.start(); }
