@@ -187,8 +187,15 @@ export class Broker {
 
   // Current number of assistant `say` blocks in the transcript (0 before it appears).
   // Used as the per-turn baseline so a turn returns only the reply it triggered.
+  // Re-resolves the newest transcript EACH turn (never caches for the broker's life):
+  // an attached first mate rotates its JSONL on /clear, compaction, or a new session
+  // UUID, and a stale cached path would silently time out at 150s every later turn.
   private captureBaseline(): number {
-    if (!this.transcriptPath) this.transcriptPath = latestTranscriptIn(this.projectDir);
+    const latest = latestTranscriptIn(this.projectDir);
+    if (latest && latest !== this.transcriptPath) {
+      if (this.transcriptPath) this.log(`transcript rotated -> ${latest}`);
+      this.transcriptPath = latest;
+    }
     if (!this.transcriptPath) return 0;
     return parseTranscript(this.transcriptPath).filter((e) => e.kind === 'say').length;
   }

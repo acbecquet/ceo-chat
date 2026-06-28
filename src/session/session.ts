@@ -98,6 +98,24 @@ export function resolveTargetFromEnv(
   return null;
 }
 
+// Resolve a CONCRETE window for a bare-session attach target (no window given). tmux
+// would otherwise follow the session's ACTIVE window, so if the captain switches
+// windows our inject/mirror/cwd would mis-target. We pin once at attach time: prefer
+// the active window now, else the first window. Returns '' if the list can't be read.
+export function resolveSessionWindow(session: string): string {
+  let out: string;
+  try {
+    out = sh('tmux', ['list-windows', '-t', session, '-F', '#{window_index} #{window_active}']);
+  } catch {
+    return '';
+  }
+  const rows = out.split('\n').map((r) => r.trim()).filter(Boolean);
+  if (!rows.length) return '';
+  const active = rows.find((r) => /\s1$/.test(r));
+  const chosen = active ?? rows[0]!;
+  return chosen.split(/\s+/)[0] ?? '';
+}
+
 // The working directory a pane's foreground process runs in — used to locate the
 // transcript project dir of an attached first mate (claude writes its JSONL under a
 // dir mangled from this cwd). Empty string if the target can't be resolved.
@@ -120,15 +138,25 @@ export function attachTarget(spec: TargetSpec, { log = noop }: { log?: Log } = {
       `at your already-running first mate's session:window.`,
     );
   }
-  const cwd = paneCurrentPath(spec.target);
+  // Bare session (no window): pin a concrete window NOW so inject/mirror/cwd never
+  // drift to whatever window the captain later makes active in that session.
+  let target = spec.target;
+  if (!spec.window) {
+    const window = resolveSessionWindow(spec.session);
+    if (window) {
+      target = `${spec.session}:${window}`;
+      log(`bare session '${spec.session}' -> pinned to window ${target}`);
+    }
+  }
+  const cwd = paneCurrentPath(target);
   if (!cwd) {
     throw new Error(
-      `could not resolve pane for target '${spec.target}' — check the window name ` +
+      `could not resolve pane for target '${target}' — check the window name ` +
       `(tmux list-windows -t ${spec.session}).`,
     );
   }
-  log(`attaching to existing first mate at ${spec.target} (cwd ${cwd})`);
-  return { cwd, session: spec.session, target: spec.target, owned: false };
+  log(`attaching to existing first mate at ${target} (cwd ${cwd})`);
+  return { cwd, session: spec.session, target, owned: false };
 }
 
 // Launch a real claude harness in the throwaway session, mirroring how firstmate
