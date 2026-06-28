@@ -100,5 +100,41 @@ streaming TTS. Decision-ready plan:
   `~/.config/ceo-chat/secrets.env` has creds; the live MiniMax leg reports **PENDING**
   (not FAIL) on 1004/1008/transport errors until the captain pairs creds at home.
 
+## Phase 2 — browser web app (`src/server/`, `npm run serve`)
+- **Same broker, web front-end.** `src/server/serve.ts` wraps the existing `Broker` in a
+  `BrokerDriver` and serves a single-page UI + a same-origin WebSocket. It reuses the SAME
+  `runPipeline`/`Broker.send` — no parallel pipeline. `npm start` aliases `npm run serve`.
+- **Driver seam = testability.** `src/server/app.ts#createWebApp` talks to a `Driver`
+  interface (`src/server/driver.ts`), NOT tmux directly. The product passes `BrokerDriver`
+  (real session); `npm run validate`'s web leg passes an in-memory driver over the same
+  `runPipeline` with mock deps — so the HTTP serving + WS contract are asserted with NO
+  creds and NO agent session. Keep this seam: never make `app.ts` import tmux/claude.
+- **WS contract** lives in `src/server/protocol.ts` (`WS_PATH=/ws`). Client→server:
+  `send`/`listening`/`ping`. Server→client: `hello` (modes+sampleRate+audioFormat),
+  `status`, `terminal` (full ANSI pane snapshot), `reply`, `narration`, `audio`
+  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `turn-done`, `error`.
+- **Status indicators** are derived from the pipeline `onStage` hook added to
+  `pipeline.ts`/`Broker.send` (inject/reply/speak → thinking; synth → speaking; after the
+  turn → awaiting-confirmation iff the narration contains `?`, else idle). Don't scrape
+  log strings for status — use `onStage`.
+- **Terminal view** uses `Broker.terminalSnapshot()` → `capturePaneAnsi` (`tmux capture-pane
+  -e -p`, colour-preserving; plain `capturePane` stays for the idle latch). `app.ts` polls
+  it (`terminalPollMs`, default 600; pass 0 in tests) and broadcasts FULL snapshots; the
+  client clears+homes xterm.js each frame. Detached tmux pane is 80x24 → xterm is 80x24.
+- **xterm.js is VENDORED**, not CDN: `@xterm/xterm` is a dependency and `app.ts` serves
+  `node_modules/@xterm/xterm/lib/xterm.js` + `css/xterm.css` at `/vendor/…`. Self-contained
+  so it works through the tunnel with no external egress.
+- **Voice-in (browser STT)** is best-effort `webkitSpeechRecognition` in `public/app.js`;
+  unsupported → the text input is the reliable fallback. Real cloud/local STT is a later
+  phase — do NOT build it here.
+- **Turns are serialized** (one `busy` lock); a concurrent `send` gets an `error` frame.
+  All turn output is broadcast to every connected client so multiple tabs stay in sync.
+- **Tunnel-ready, host-agnostic.** Serve plain HTTP on `127.0.0.1` (env `CEOCHAT_HOST`/
+  `CEOCHAT_PORT`, default `127.0.0.1:8420`); the page upgrades to a RELATIVE same-origin
+  `ws(s)://…/ws`. Cloudflare named tunnel terminates TLS at `https://ceo-chat.acb-apps.com`
+  and forwards to the bound port. firstmate wires `cloudflared` separately; don't set it up
+  here. CONFIRMED end-to-end in a real browser (chrome-devtools): typed line → live claude
+  reply → narration → playable audio + live xterm terminal mirror, clean SIGINT teardown.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

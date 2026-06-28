@@ -20,7 +20,7 @@ import { join } from 'node:path';
 
 import { loadSecrets, has, hasMinimaxCreds, type Secrets } from '../config/secrets.ts';
 import {
-  spawnCeoChat, teardown, waitForComposer, fmSend, capturePane, sleep,
+  spawnCeoChat, teardown, waitForComposer, fmSend, capturePane, capturePaneAnsi, sleep,
   type SessionCtx,
 } from '../session/session.ts';
 import {
@@ -30,7 +30,7 @@ import {
 import { waitForReply } from '../transcript/reply.ts';
 import { speakify } from '../speakability/speakability.ts';
 import { synthStreaming, toWav, INTL_WS } from '../tts/minimax.ts';
-import { runPipeline, type PipelineResult } from './pipeline.ts';
+import { runPipeline, type PipelineResult, type PipelineStage } from './pipeline.ts';
 import { startMockMinimax, type MockMinimax } from '../tts/mock-server.ts';
 
 export type TtsMode = 'live' | 'mock';
@@ -87,7 +87,13 @@ export class Broker {
   }
 
   // Drive one full turn: typed text -> spoken audio + narration + terminal view.
-  async send(typed: string, turnIndex: number): Promise<PipelineResult & { wavPath: string; narrationPath: string }> {
+  // `onStage` (optional) lets the web UI drive its listening/thinking/speaking
+  // status indicators off real pipeline progress.
+  async send(
+    typed: string,
+    turnIndex: number,
+    opts: { onStage?: (stage: PipelineStage) => void } = {},
+  ): Promise<PipelineResult & { wavPath: string; narrationPath: string }> {
     if (!this.ctx) throw new Error('broker not started');
     const target = this.ctx.target;
 
@@ -101,6 +107,7 @@ export class Broker {
       }),
       synth: (chunks) => this.synth(chunks),
       terminalView: () => capturePane(target),
+      onStage: opts.onStage,
       log: this.log,
     });
 
@@ -109,6 +116,13 @@ export class Broker {
     writeFileSync(wavPath, toWav({ pcm: result.audio.pcm, sampleRate: result.audio.sampleRate }));
     writeFileSync(narrationPath, result.narration + '\n');
     return { ...result, wavPath, narrationPath };
+  }
+
+  // A colour-preserving snapshot of the live agent pane, for the web terminal view
+  // (xterm.js). Empty string before the session is up.
+  terminalSnapshot(): string {
+    if (!this.ctx) return '';
+    return capturePaneAnsi(this.ctx.target);
   }
 
   async stop(): Promise<void> {

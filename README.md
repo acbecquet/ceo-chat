@@ -6,10 +6,12 @@ view to glance at when stopped. firstmate is tmux-based; ceo-chat brokers voice 
 terminal view over one connection, reusing firstmate's own text injection for
 voice-in and a clean transcript tap for voice-out.
 
-This repo currently ships the **end-to-end core**: a runnable broker that wires the
-whole pipeline, and a comprehensive validation harness that proves every leg —
-green with **no credentials**, and degrading cleanly to **live** when MiniMax/LLM
-keys are present. (The phone PWA / WebRTC / cloud-STT are later phases.)
+This repo ships the **end-to-end core** plus a **browser web app**: a runnable
+broker that wires the whole pipeline, a single-page UI you open in a browser to
+exercise the full loop (terminal view + type/speak → firstmate → narration → audio),
+and a comprehensive validation harness that proves every leg — green with **no
+credentials**, and degrading cleanly to **live** when MiniMax/LLM keys are present.
+(Cloud/local STT and the phone PWA / WebRTC polish are later phases.)
 
 ## The pipeline
 
@@ -36,13 +38,53 @@ validation harness exercise the **same** orchestration code.
 ## Quick start
 
 ```bash
-npm install                 # ws + TypeScript toolchain (Node >= 22 runs .ts directly)
+npm install                 # ws + xterm.js + TypeScript toolchain (Node >= 22 runs .ts directly)
 npm run validate            # the harness — fully green, no creds, no network
-npm run dev -- --mock "tell me the tests passed and ask if I should merge"
+npm run serve               # the WEB APP — open the printed http://127.0.0.1:8420/
+npm run dev -- --mock "tell me the tests passed and ask if I should merge"   # CLI driver
 ```
 
-`npm run dev` spawns its **own** dedicated `ceo-chat` tmux session (never the
-captain's sessions or `fm-<id>` windows) and tears it down on exit.
+`npm run serve` (and `npm run dev`) spawn their **own** dedicated `ceo-chat` tmux
+session (never the captain's sessions or `fm-<id>` windows) and tear it down on exit.
+
+## Web app — `npm run serve`
+
+A single-page browser front-end to the same pipeline ([`src/server/`](./src/server/)).
+Open the printed URL and you get:
+
+- a **live terminal view** of the dedicated `ceo-chat` agent session (xterm.js,
+  fed colour-preserving `capture-pane` snapshots over the WebSocket);
+- a **text input** that sends your message to firstmate (via the same `fm-send`
+  verified submit);
+- the **speakability narration** as it is produced, and the **raw agent reply**;
+- the **TTS audio played back in the page** (Web Audio decodes raw PCM — the mock
+  server returns playable synthetic audio so this works with **no MiniMax key**, and
+  live MiniMax streams the same way once paired);
+- **status indicators** — listening / thinking / speaking / awaiting-confirmation —
+  driven off real pipeline stages;
+- a **push-to-talk mic** using the browser's built-in speech recognition
+  (`webkitSpeechRecognition`) as a quick STT path; where unsupported, the text input
+  is the always-reliable fallback. (Real cloud/local STT is a later phase.)
+
+```bash
+npm run serve                          # bind 127.0.0.1:8420 (mock TTS unless creds present)
+CEOCHAT_PORT=9000 npm run serve        # choose the port
+CEOCHAT_HOST=0.0.0.0 npm run serve     # bind all interfaces (prefer the tunnel below)
+npm run serve -- --mock                # force the fully-offline path even with creds
+```
+
+The server serves plain HTTP on `127.0.0.1` and brokers everything over a
+**same-origin** WebSocket (`/ws`). `npm start` is an alias for `npm run serve`.
+
+### Behind the Cloudflare named tunnel
+
+The app is built to sit behind a Cloudflare **named tunnel** on `acb-apps.com` at
+**`https://ceo-chat.acb-apps.com`**. Cloudflare terminates TLS and forwards to the
+local HTTP port; the page upgrades to a **relative** `wss://…/ws`, so nothing in the
+app assumes a public host and the same build works on localhost and through the
+tunnel. firstmate wires `cloudflared` separately once the domain is active — this
+app just needs to be running on the bound port (the tunnel's `service:` target,
+e.g. `http://127.0.0.1:8420`).
 
 ## Validation harness — `npm run validate`
 
@@ -59,7 +101,7 @@ It covers:
 
 | Group | What it asserts |
 |---|---|
-| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e |
+| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 
@@ -123,8 +165,10 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    ```
 2. `npm run validate:live` — the live MiniMax leg flips from PENDING to PASS and
    prints the real time-to-first-audio.
-3. `npm run dev "..."` — TTS now streams from live MiniMax automatically (no code
-   change). The international endpoint is `wss://api.minimax.io` (not `minimaxi.com`).
+3. `npm run serve` (or `npm run dev "..."`) — TTS now streams from live MiniMax
+   automatically (no code change); the browser plays the live audio through the same
+   Web Audio path. The international endpoint is `wss://api.minimax.io` (not
+   `minimaxi.com`).
 
 ## Layout
 
@@ -137,9 +181,14 @@ src/
   speakability/            rewrite-for-the-ear (anthropic-api | claude-cli | mock)
   tts/minimax.ts           MiniMax streaming TTS client
   tts/mock-server.ts       in-process MiniMax mock (real protocol, synthetic PCM)
-  broker/pipeline.ts       the one injected end-to-end orchestration
+  broker/pipeline.ts       the one injected end-to-end orchestration (+ onStage hook)
   broker/broker.ts         the runnable broker (owns session + tts mode)
   cli/dev.ts               the CLI driver entrypoint
+  server/protocol.ts       the browser <-> broker WS message contract
+  server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
+  server/app.ts            HTTP + WS transport (static UI, status, terminal stream)
+  server/serve.ts          the web server entrypoint (npm run serve)
+  server/public/           the single-page UI (index.html, app.js, styles.css, xterm.js)
 test/
   validate.ts              the validation harness (npm run validate)
   harness/                 reporter + transcript/turn fixtures
@@ -152,7 +201,8 @@ phase0/                    the original de-risking spikes (preserved)
 |---|---|
 | `npm run validate` | end-to-end harness, mock mode (the gate — must be green) |
 | `npm run validate:live` | same harness against real services where creds exist |
-| `npm run dev` / `npm start` | run the product (interactive or one-shot) |
+| `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker) |
+| `npm run dev` | run the CLI driver (interactive or one-shot) |
 | `npm run typecheck` / `build` / `lint` | `tsc --noEmit` (we run `.ts` directly on Node ≥22) |
 | `npm test` | alias for `npm run validate` |
 

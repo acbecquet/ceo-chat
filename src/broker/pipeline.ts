@@ -12,6 +12,10 @@
 import type { SpeakifyResult } from '../speakability/speakability.ts';
 import type { SynthResult } from '../tts/minimax.ts';
 
+// Coarse pipeline stages, emitted via onStage so a front-end (the web UI) can drive
+// listening/thinking/speaking status indicators without scraping log strings.
+export type PipelineStage = 'inject' | 'reply' | 'speak' | 'synth' | 'done';
+
 export interface PipelineDeps {
   /** Inject the typed line into firstmate (verified submit). */
   inject: (text: string) => Promise<void>;
@@ -23,6 +27,8 @@ export interface PipelineDeps {
   synth: (chunks: string[]) => Promise<SynthResult>;
   /** Optional: a snapshot of the visual terminal (capture-pane). */
   terminalView?: () => string;
+  /** Optional: notified as each stage begins (drives UI status indicators). */
+  onStage?: (stage: PipelineStage) => void;
   log?: (msg: string) => void;
 }
 
@@ -50,20 +56,26 @@ export function sentenceChunks(narration: string): string[] {
 
 export async function runPipeline(typed: string, deps: PipelineDeps): Promise<PipelineResult> {
   const log = deps.log ?? (() => {});
+  const stage = deps.onStage ?? (() => {});
 
+  stage('inject');
   log('inject -> firstmate');
   await deps.inject(typed);
 
+  stage('reply');
   log('read agent reply (transcript tap)');
   const reply = await deps.readReply();
   if (!reply.trim()) throw new Error('agent reply was empty');
 
+  stage('speak');
   log('speakability rewrite');
   const { narration, backend } = await deps.speakify(reply);
   if (!narration.trim()) throw new Error('speakability produced empty narration');
 
+  stage('synth');
   log('MiniMax streaming TTS');
   const synth = await deps.synth(sentenceChunks(narration));
+  stage('done');
 
   return {
     typed,

@@ -11,13 +11,15 @@
     "validate": "node test/validate.ts",
     "validate:live": "node test/validate.ts --live",
     "dev": "node src/cli/dev.ts",
-    "start": "node src/cli/dev.ts",
+    "serve": "node src/server/serve.ts",
+    "start": "node src/server/serve.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "node test/validate.ts"
   },
   "dependencies": {
+    "@xterm/xterm": "^6.0.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
