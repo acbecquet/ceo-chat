@@ -13,7 +13,7 @@
 // and measures true time-to-first-audio; an unpaired-credential 1004/1008 is
 // reported as PENDING (expected), never a crash.
 
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, realpathSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, realpathSync, utimesSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -31,12 +31,28 @@ import {
   verifiedSubmit, paneHoldsText, resolveTargetFromEnv, attachTarget, paneCurrentPath,
   sessionExists, capturePane, capturePaneAnsi, resolveSessionWindow,
 } from '../src/session/session.ts';
-import { runPipeline } from '../src/broker/pipeline.ts';
+import { runPipeline, sentenceChunks } from '../src/broker/pipeline.ts';
 import { Reporter } from './harness/report.ts';
 import { startMockMinimax } from '../src/tts/mock-server.ts';
 import { createWebApp } from '../src/server/app.ts';
-import { WS_PATH, AUDIO_FORMAT } from '../src/server/protocol.ts';
+import { WS_PATH, AUDIO_FORMAT, STT_SAMPLE_RATE } from '../src/server/protocol.ts';
 import type { Driver } from '../src/server/driver.ts';
+import { findPiper, synthLocal } from '../src/tts/local-tts.ts';
+import { makeWhisperTranscriber } from '../src/server/stt.ts';
+import { parseWav } from '../src/tts/minimax.ts';
+// Shared browser modules — the SAME files the page loads at /lib/… (asserted here so
+// the mobile audio-unlock / STT-restart / confirmation logic can't silently regress).
+import {
+  base64ToBytes, bytesToBase64, pcmS16leToFloat32, float32ToPcmS16le, downsampleFloat32,
+} from '../src/web/pcm.js';
+import { looksConsequential, classifyReply, guardUtterance } from '../src/web/confirm.js';
+import { AudioPlayer } from '../src/web/audio-player.js';
+import type { AudioCtxLike, AudioSrcLike } from '../src/web/audio-player.js';
+import { SpeechController } from '../src/web/speech.js';
+import type { RecognitionLike } from '../src/web/speech.js';
+import {
+  STT_SAMPLE_RATE as WEB_STT_SR, AUDIO_FORMAT as WEB_AUDIO_FORMAT, WS_PATH as WEB_WS_PATH,
+} from '../src/web/protocol-consts.js';
 import { WebSocket as WsClient } from 'ws';
 import {
   assistantSay, assistantThinking, assistantToolUse, userPrompt, userToolResult,
@@ -55,6 +71,20 @@ const MOCK_GROUP = 'mock-group-123';
 
 // Count sentences for the "<=3 spoken sentences" assertions.
 const sentenceCount = (s: string): number => (s.match(/[.!?]+/g) || []).length || (s.trim() ? 1 : 0);
+
+// ---- fakes for the browser-module legs (no real Web Audio / SpeechRecognition) ----
+interface FakeSource extends AudioSrcLike { started: boolean; stopped: boolean; }
+function makeRecog(): RecognitionLike {
+  return {
+    lang: '', continuous: false, interimResults: false, maxAlternatives: 1,
+    onstart: null, onresult: null, onerror: null, onend: null,
+    start() {}, stop() {}, abort() {},
+  };
+}
+// One SpeechRecognition "result" item: array-like `[{transcript}]` carrying `isFinal`.
+function mkRes(transcript: string, isFinal: boolean): unknown {
+  return Object.assign([{ transcript }], { isFinal });
+}
 
 // ───────────────────────── leg 1: config / secrets ─────────────────────────
 await reporter.leg('config — secrets loader (gitignored, outside repo)', (t) => {
@@ -179,7 +209,7 @@ await reporter.leg('web server — serves the page + brokers the WS pipeline', a
   const mock = await startMockMinimax();
   // In-memory driver: same pipeline the product runs, mock-injected.
   const driver: Driver = {
-    meta: () => ({ ttsMode: 'mock', speakBackend: 'mock', sampleRate: 32000 }),
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
     start: async () => {},
     send: async (text, _turnIndex, hooks) => {
       const r = await runPipeline(text, {
@@ -553,6 +583,293 @@ await reporter.leg('edge — long-op & thinking handling (stays short, screen-sa
   t.notIncludes(narration, 'package.json', 'file path dropped');
   // the same compression directly via the contract reference
   t.ok(mockSpeakify(LONG_CODE_TURN).length > 0, 'contract reference (mockSpeakify) yields speakable text');
+});
+
+// ═══════════════════════ MOBILE UX (the hands-free phone-call surface) ═══════
+
+// M1 — pcm helpers: the portable codec the browser player + STT capture share.
+await reporter.leg('mobile — pcm codec (base64 / s16le / downsample, browser↔node)', (t) => {
+  // base64 round-trips AND matches Node's Buffer (so server-decoded bytes == sent bytes).
+  const bytes = new Uint8Array([0, 1, 2, 250, 128, 64, 255, 7, 9]);
+  const b64 = bytesToBase64(bytes);
+  t.eq(b64, Buffer.from(bytes).toString('base64'), 'bytesToBase64 matches Node Buffer base64');
+  t.eq(Buffer.from(base64ToBytes(b64)).toString('hex'), Buffer.from(bytes).toString('hex'), 'base64ToBytes round-trips');
+  // s16le <-> float32 round-trips within quantization.
+  const f = new Float32Array([0, 0.5, -0.5, 0.999, -1]);
+  const back = pcmS16leToFloat32(float32ToPcmS16le(f));
+  let maxErr = 0;
+  for (let i = 0; i < f.length; i++) maxErr = Math.max(maxErr, Math.abs(back[i]! - f[i]!));
+  t.ok(maxErr < 0.001, 's16le<->float32 round-trips within quantization', `maxErr ${maxErr.toFixed(5)}`);
+  // downsample 48k -> 16k reduces frame count ~3x; equal rates are a no-op.
+  const src = new Float32Array(4800);
+  const down = downsampleFloat32(src, 48000, 16000);
+  t.ok(Math.abs(down.length - 1600) <= 1, '48k->16k downsample yields ~1/3 frames', `${down.length}`);
+  t.eq(downsampleFloat32(src, 16000, 16000).length, src.length, 'equal-rate downsample is a no-op (STT path)');
+});
+
+// M2 — protocol constants the browser hard-codes must match the typed server source.
+await reporter.leg('mobile — browser protocol constants match the server', (t) => {
+  t.eq(WEB_STT_SR, STT_SAMPLE_RATE, 'STT_SAMPLE_RATE matches protocol.ts');
+  t.eq(WEB_AUDIO_FORMAT, AUDIO_FORMAT, 'AUDIO_FORMAT matches protocol.ts');
+  t.eq(WEB_WS_PATH, WS_PATH, 'WS_PATH matches protocol.ts');
+});
+
+// M3 — voice-safety confirmation guard (plan §3.5): a misheard phrase can't approve.
+await reporter.leg('mobile — confirmation guard (no misheard approval, §3.5)', (t) => {
+  t.ok(looksConsequential('Want me to merge it?'), 'detects a consequential action (merge)');
+  t.ok(looksConsequential('Should I force-push to main?'), 'detects force-push');
+  t.ok(!looksConsequential('I changed three files; the tests pass.'), 'plain status is not consequential');
+  t.eq(classifyReply('confirm'), 'confirm', '"confirm" -> confirm');
+  t.eq(classifyReply('yes do it'), 'confirm', '"yes do it" -> confirm');
+  t.eq(classifyReply('yeah'), 'unclear', 'a bare affirmative noise is NOT a confirm');
+  t.eq(classifyReply('no'), 'cancel', '"no" -> cancel');
+  t.eq(classifyReply('cancel'), 'cancel', '"cancel" -> cancel');
+  // typed input is always explicit.
+  t.eq(guardUtterance({ source: 'text', text: 'merge it', awaitingConfirmation: true, lastNarration: 'Want me to merge it?' }).action, 'send', 'typed input always sends');
+  // voice during a consequential confirmation: ambiguous -> held & re-prompted.
+  const ambiguous = guardUtterance({ source: 'voice', text: 'yeah sure ok', awaitingConfirmation: true, lastNarration: 'Want me to merge it?' });
+  t.eq(ambiguous.action, 'reprompt', 'ambiguous spoken reply to a danger Q is held, not sent');
+  t.ok((ambiguous as { speak: string }).speak.length > 0, 're-prompt speaks an explicit ask');
+  // voice clear confirm/cancel -> forwarded.
+  t.eq(guardUtterance({ source: 'voice', text: 'confirm', awaitingConfirmation: true, lastNarration: 'Want me to merge it?' }).action, 'send', 'a clear spoken "confirm" is forwarded');
+  t.eq(guardUtterance({ source: 'voice', text: 'cancel', awaitingConfirmation: true, lastNarration: 'Want me to merge it?' }).action, 'send', 'a clear spoken "cancel" is forwarded');
+  // voice for a NON-consequential turn passes straight through.
+  t.eq(guardUtterance({ source: 'voice', text: 'tell me more', awaitingConfirmation: false, lastNarration: 'The tests pass.' }).action, 'send', 'ordinary speech is not gated');
+});
+
+// M4 — AudioPlayer: the core mobile fix. Audio that arrives BEFORE the unlock tap is
+// buffered, then auto-plays once unlocked; playback serializes; speaking-state drives
+// half-duplex; stop() hard-cuts. Asserted against a fake AudioContext (no audio device).
+await reporter.leg('mobile — audio auto-speak (unlock, queue, barge-in)', async (t) => {
+  const started: FakeSource[] = [];
+  const makeCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'suspended', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { ctx.state = 'running'; return Promise.resolve(); },
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, connect() {}, start() { s.started = true; started.push(s); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const speakingLog: boolean[] = [];
+  const player = new AudioPlayer({ createContext: makeCtx, onSpeakingChange: (s) => speakingLog.push(s) });
+  const pcm = float32ToPcmS16le(new Float32Array([0.1, -0.1, 0.2, -0.2, 0.05]));
+
+  // Audio BEFORE unlock: must not play (suspended), must be buffered — the iOS bug.
+  player.enqueue(pcm, 22050);
+  t.eq(started.length, 0, 'audio before unlock does NOT play (AudioContext suspended)');
+
+  // The unlock gesture resumes + flushes the buffered audio.
+  const ok = await player.unlock();
+  t.ok(ok, 'unlock() resumes the context (running)');
+  t.ok(started.length >= 1, 'buffered pre-unlock audio auto-plays after the tap', `${started.length} source(s)`);
+  t.ok(player.speaking, 'player reports speaking while audio is scheduled');
+  t.eq(speakingLog[0], true, 'onSpeakingChange fired true (mic mutes for half-duplex)');
+
+  // A second reply queues and plays (auto-speak, no extra tap).
+  const before = started.length;
+  player.enqueue(pcm, 22050);
+  t.ok(started.length === before + 1, 'a later reply auto-plays (no per-message tap)');
+
+  // Finish all sources -> speaking flips false (mic may resume).
+  for (const s of started) if (s.onended) s.onended();
+  t.ok(!player.speaking, 'speaking clears when the queue drains');
+  t.eq(speakingLog[speakingLog.length - 1], false, 'onSpeakingChange fired false at drain');
+
+  // Barge-in: stop() hard-cuts everything still scheduled.
+  player.enqueue(pcm, 22050);
+  player.stop();
+  t.ok(!player.speaking, 'stop() ends speaking immediately (barge-in)');
+
+  // Regression: a throwing src.start() must NOT wedge speaking=true forever
+  // (half-duplex would stay muted and never re-arm the mic).
+  const throwCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'running', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { return Promise.resolve(); },
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, connect() {}, start() { throw new Error('start blocked'); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const tp = new AudioPlayer({ createContext: throwCtx });
+  await tp.unlock();
+  tp.enqueue(pcm, 22050);
+  t.ok(!tp.speaking, 'a failed src.start() does not leave speaking stuck (mic re-arms)');
+
+  // Pre-unlock backlog is bounded: if unlock never resolves while replies keep
+  // arriving, the oldest are dropped (symmetric to the server STT cap) — never
+  // grows unbounded for the page's life.
+  const capStarted: FakeSource[] = [];
+  const capMakeCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'suspended', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { return Promise.resolve(); }, // stays suspended — unlock never resolves
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, connect() {}, start() { s.started = true; capStarted.push(s); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const capPlayer = new AudioPlayer({ createContext: capMakeCtx, pendingMaxBytes: pcm.length * 3 });
+  for (let i = 0; i < 100; i++) capPlayer.enqueue(pcm, 22050);
+  const capInternals = capPlayer as unknown as { _pendingBytes: number; _pending: unknown[] };
+  t.eq(capStarted.length, 0, 'still suspended — nothing played (pending only)');
+  t.ok(capInternals._pendingBytes <= pcm.length * 3, 'pre-unlock backlog stays under the byte cap', `${capInternals._pendingBytes} bytes`);
+  t.ok(capInternals._pending.length >= 1, 'cap keeps at least the newest reply buffered');
+});
+
+// M5 — SpeechController: iOS-shaped robustness (restart-on-end keep-alive, permanent
+// vs transient errors, half-duplex pause/resume). Fake recognizer + injected clock.
+await reporter.leg('mobile — speech STT controller (iOS restart, half-duplex, errors)', (t) => {
+  const created: RecognitionLike[] = [];
+  const results: Array<{ text: string; final: boolean }> = [];
+  const errors: Array<{ kind: string }> = [];
+  let clock = 0;
+  const ctrl = new SpeechController({
+    createRecognition: () => { const r = makeRecog(); created.push(r); return r; },
+    now: () => (clock += 1000),
+    setTimeout: (fn: () => void) => { fn(); return 0; },     // run re-arm synchronously
+    clearTimeout: () => {},
+    minRestartMs: 0,
+    onResult: (text: string, meta: { isFinal: boolean }) => results.push({ text, final: meta.isFinal }),
+    onError: (e: { kind: string }) => errors.push(e),
+  });
+
+  ctrl.start();
+  t.eq(created.length, 1, 'start() arms a recognizer');
+  created[0]!.onstart!();
+  t.ok(ctrl.listening, 'onstart -> listening');
+
+  // interim + final results surface through onResult.
+  created[0]!.onresult!({ results: [mkRes('merge it', false)] });
+  created[0]!.onresult!({ results: [mkRes('merge it', true)] });
+  t.ok(results.some((r) => !r.final && r.text === 'merge it'), 'interim result delivered (live UI)');
+  t.ok(results.some((r) => r.final && r.text === 'merge it'), 'final result delivered');
+
+  // iOS ends the session after an utterance -> controller RE-ARMS (the keep-alive).
+  created[0]!.onend!();
+  t.eq(created.length, 2, 'onend re-arms a fresh recognizer (iOS keep-alive)');
+
+  // half-duplex: pause() (first mate speaking) stops listening + suppresses re-arm.
+  ctrl.pause();
+  created[1]!.onend!();
+  t.eq(created.length, 2, 'paused (speaking) -> no re-arm while muted');
+  ctrl.resume();
+  t.eq(created.length, 3, 'resume() re-arms after first mate finishes');
+
+  // a PERMANENT error (no mic permission) stops and tells the UI; no busy-loop re-arm.
+  created[2]!.onerror!({ error: 'not-allowed' });
+  t.ok(errors.some((e) => e.kind === 'permission'), 'permission error surfaced to the UI');
+  const afterPerm = created.length;
+  created[2]!.onend!();
+  t.eq(created.length, afterPerm, 'after a permanent error it does NOT re-arm (no busy loop)');
+});
+
+// M6 — server-side STT seam over the REAL WS: mic PCM (stt-audio) -> stt-end ->
+// transcription handed BACK as a `transcript` frame (NOT auto-run — the client guard
+// applies first). Asserted with an in-memory driver + a MOCK transcriber (no whisper).
+await reporter.leg('mobile — server STT seam (stt-audio -> transcript over WS)', async (t) => {
+  const mock = await startMockMinimax();
+  const HEARD = 'merge the branch';
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async (text, _i, hooks) => {
+      const r = await runPipeline(text, {
+        inject: async () => {}, readReply: async () => SAMPLE_AGENT_TURN,
+        speakify: (s) => speakify(s, { backend: 'mock' }),
+        synth: (chunks) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: chunks, endpoint: mock.endpoint, timeoutMs: 8000 }),
+        onStage: hooks.onStage,
+      });
+      return { reply: r.reply, narration: r.narration, speakBackend: r.speakBackend, audio: { pcm: r.audio.pcm, sampleRate: r.audio.sampleRate, ttfbMs: r.audio.ttfbMs, bytes: r.audio.bytes } };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  let gotPcmBytes = 0;
+  let gotRate = 0;
+  const app = await createWebApp({
+    driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {},
+    sttLabel: 'mock-asr',
+    transcribe: async (pcm, sr) => { gotPcmBytes = pcm.length; gotRate = sr; return HEARD; },
+  });
+  try {
+    const frames: Record<string, unknown>[] = [];
+    const samplePcm = bytesToBase64(float32ToPcmS16le(new Float32Array(320).fill(0.05)));
+    await new Promise<void>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('STT WS timed out')); }, 8000);
+      client.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        frames.push(m);
+        if (m.type === 'hello') {
+          client.send(JSON.stringify({ type: 'stt-audio', pcm: samplePcm, sampleRate: STT_SAMPLE_RATE }));
+          client.send(JSON.stringify({ type: 'stt-end' }));
+        }
+        if (m.type === 'transcript') { clearTimeout(timer); client.close(); resolve(); }
+      });
+      client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+    const hello = frames.find((m) => m.type === 'hello') as { serverStt?: boolean; sttLabel?: string } | undefined;
+    t.ok(hello?.serverStt === true, 'hello advertises server-side STT availability');
+    t.eq(hello?.sttLabel, 'mock-asr', 'hello advertises the STT backend label');
+    const transcript = frames.find((m) => m.type === 'transcript') as { text?: string; final?: boolean } | undefined;
+    t.eq(transcript?.text, HEARD, 'transcription returned to the client (not auto-run)');
+    t.eq(transcript?.final, true, 'transcript marked final');
+    t.ok(gotPcmBytes > 0, 'broker received the streamed mic PCM', `${gotPcmBytes} bytes`);
+    t.eq(gotRate, STT_SAMPLE_RATE, 'mic PCM tagged 16 kHz for the transcriber');
+    // No transcript means no auto-run: the turn only happens when the client sends `send`.
+    t.ok(!frames.some((m) => m.type === 'narration'), 'server STT did NOT auto-run a turn (client confirms first)');
+  } finally {
+    await app.close();
+    await mock.close();
+  }
+});
+
+// M7 — REAL audio e2e (the captain's requested generated-audio gate): a first-mate
+// reply -> speakability -> LOCAL piper TTS -> a valid decodable speech WAV -> local
+// whisper STT -> assert the spoken words carry the decision. Uses the offline stack
+// (bin/setup-local-voice.sh); PENDING (never red) if it isn't installed.
+await reporter.leg('mobile — REAL audio e2e: reply → speakify → piper TTS → whisper STT', async (t) => {
+  const voice = findPiper();
+  if (!voice) { t.pending('local voice not installed — run `npm run voice` (piper) to enable the real-audio gate'); return; }
+
+  // reply (has code + a URL + a decision) -> screen-safe narration.
+  const { narration } = await speakify(SAMPLE_AGENT_TURN, { backend: 'mock' });
+  t.ok(narration.length > 0 && /merge/i.test(narration), 'narration keeps the decision word', narration);
+
+  // speak it for REAL with the offline neural voice.
+  const synth = await synthLocal(voice, sentenceChunks(narration));
+  const durationSec = synth.pcm.length / 2 / synth.sampleRate;
+  t.ok(synth.pcm.length > 0, 'piper produced real PCM audio', `${synth.pcm.length} bytes`);
+  t.ok(durationSec > 0.6, 'spoken audio has a sane duration (> 0.6s)', `${durationSec.toFixed(2)}s`);
+  t.ok(typeof synth.ttfbMs === 'number', 'time-to-first-audio measured', `${synth.ttfbMs}ms`);
+
+  // it's a valid, decodable speech WAV (real RIFF header + matching data).
+  const wav = toWav(synth);
+  const outDir = join(process.cwd(), 'out');
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, 'validate-e2e.wav'), wav); // listen: out/validate-e2e.wav
+  const parsed = parseWav(wav);
+  t.eq(parsed.sampleRate, synth.sampleRate, 'WAV header sample rate matches the voice');
+  t.eq(parsed.bitsPerSample, 16, 'WAV is 16-bit PCM');
+  t.eq(parsed.pcm.length, synth.pcm.length, 'WAV data chunk == synthesized PCM');
+
+  // round-trip: transcribe the generated speech and confirm the words survived.
+  const transcriber = makeWhisperTranscriber();
+  if (!transcriber) { t.pending('whisper not installed — TTS asserted; STT round-trip skipped (run `npm run voice`)'); return; }
+  const heard = (await transcriber.transcribe(synth.pcm, synth.sampleRate)).toLowerCase();
+  t.ok(heard.length > 0, 'whisper transcribed the generated speech', JSON.stringify(heard));
+  t.ok(/merge/.test(heard), 'the spoken decision word "merge" round-trips through real audio', JSON.stringify(heard));
 });
 
 // ═══════════════════════ LIVE legs (creds required) ═════════════════════════

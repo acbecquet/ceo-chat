@@ -112,9 +112,12 @@ streaming TTS. Decision-ready plan:
   `runPipeline` with mock deps — so the HTTP serving + WS contract are asserted with NO
   creds and NO agent session. Keep this seam: never make `app.ts` import tmux/claude.
 - **WS contract** lives in `src/server/protocol.ts` (`WS_PATH=/ws`). Client→server:
-  `send`/`listening`/`ping`. Server→client: `hello` (modes+sampleRate+audioFormat),
+  `send`/`listening`/`ping` plus the Phase-4 server-STT frames `stt-audio`
+  (base64 s16le mono chunk)/`stt-end`/`stt-cancel`. Server→client: `hello`
+  (`ttsMode`+`ttsVoice`+`speakBackend`+`sampleRate`+`audioFormat`+`serverStt`+`sttLabel`),
   `status`, `terminal` (full ANSI pane snapshot), `reply`, `narration`, `audio`
-  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `turn-done`, `error`,
+  (**base64 PCM s16le mono**, decoded by Web Audio in the page), `transcript`
+  (server-STT result handed BACK to the client, never auto-run), `turn-done`, `error`,
   `pong`.
 - **Status indicators** are derived from the pipeline `onStage` hook added to
   `pipeline.ts`/`Broker.send` (inject/reply/speak → thinking; synth → speaking; after the
@@ -186,6 +189,71 @@ streaming TTS. Decision-ready plan:
   transcript-narrate → mock TTS audio + pane mirror, two sequential turns each
   speaking only their new reply (baseline proven), clean detach leaving the session
   alive.
+
+## Phase 4 — REAL offline voice + mobile hands-free UX
+- **Local neural voice is the DEFAULT offline TTS.** TTS backend precedence in the
+  broker (`src/broker/broker.ts`): **MiniMax** (premium, creds present) → **local
+  piper** (`src/tts/local-tts.ts`, real intelligible speech, NO key — the default) →
+  **mock** (synthetic tone, unit tests / no voice installed). `TtsMode` is now
+  `'minimax'|'local'|'mock'` (was `'live'|'mock'`) and lives in `protocol.ts`. The
+  mock tone is ONLY for `--mock`/`CEOCHAT_MOCK=1` or when no voice is installed.
+- **The offline voice stack lives OUTSIDE the repo** in `$CEOCHAT_VOICE_DIR`
+  (default `~/.local/share/ceo-chat`), installed by `bin/setup-local-voice.sh`
+  (`npm run voice`): **piper** (prebuilt x86_64 binary + `en_US-lessac-medium` voice)
+  and **whisper.cpp** (built static via a downloaded cmake + `ggml-tiny.en`). Sudo-free,
+  persists across worktrees. Probed by `findPiper()` / `findWhisper()` (overridable via
+  `CEOCHAT_PIPER_BIN/_MODEL/_VOICE`, `CEOCHAT_WHISPER_BIN/_MODEL/_THREADS`). piper emits
+  raw s16le PCM at its native rate (22.05k for *-medium) via `piper --output_raw`.
+- **CONFIRMED real round-trip on hub:** piper speaks a phrase → whisper transcribes it
+  back verbatim. `npm run validate` leg **"mobile — REAL audio e2e"** asserts it for
+  real (reply → speakability → piper TTS → a valid decodable speech WAV written to
+  `out/validate-e2e.wav` → whisper STT → the decision word "merge" survives). PENDING
+  (never red) if the stack isn't installed.
+- **Server-side STT** (`src/server/stt.ts`, `Transcriber` = whisper.cpp) powers BOTH
+  the browser's STT fallback AND that e2e gate. whisper requires 16 kHz mono — we
+  resample with the SAME pure helper the browser uses (`src/web/pcm.js#downsampleFloat32`),
+  one resampler asserted by the harness. It is INJECTED into `createWebApp`
+  (`transcribe?`/`sttLabel?` in `WebAppOptions`) — `app.ts` never imports whisper/tmux.
+- **Shared browser logic is pure ESM in `src/web/`**, served at `/lib/…` by `app.ts`
+  (like vendored xterm) AND imported directly by `npm run validate` — so the SAME files
+  the phone runs are unit-asserted headlessly. Each `*.js` has a sibling `*.d.ts` so
+  `tsc --noEmit` types the harness import (the `.js` are NOT in `tsconfig.include`; only
+  the `.d.ts` are). Modules: `pcm.js` (portable base64/s16le/downsample — NO atob/Buffer
+  so browser==node bytes), `audio-player.js`, `speech.js`, `confirm.js`,
+  `protocol-consts.js` (browser copy of the few WS constants, drift-guarded by a leg),
+  `capture-worklet.js` (AudioWorklet — the iOS-safe mic capture, NOT MediaRecorder).
+- **Mobile audio = the core fix.** iOS Safari starts the AudioContext SUSPENDED; it
+  only resumes inside a user gesture. `AudioPlayer.unlock()` (resume + a 1-frame silent
+  prime) runs in the **Start-call tap**; thereafter every reply's PCM is `enqueue`d and
+  AUTO-SPOKEN, gapless, on the AudioContext clock (no per-message tap). Audio arriving
+  before unlock is BUFFERED then flushed (never dropped). The opportunistic resume in
+  `enqueue` is async and flushes ONLY when it truly resolves to running — never
+  synchronously, or audio would play before the tap. A **Wake Lock** is held through
+  the call; the player's speaking-state drives **half-duplex** (mic muted while first
+  mate talks) and the status ring.
+- **STT robustness.** `SpeechController` encodes the iOS Web Speech pattern:
+  `continuous=false` + `interimResults=true`, **re-armed on every `end`** (the iOS
+  keep-alive — a session that ended and was never restarted is the "mic on but no words"
+  bug), permanent (`not-allowed`) vs transient error split, `pause()/resume()` for
+  half-duplex, min-restart debounce. If Web Speech is unavailable, the page falls back
+  to **server-side STT** (tap-to-talk: getUserMedia → AudioWorklet → 16 kHz PCM →
+  `stt-audio`/`stt-end` → broker whisper → a `transcript` frame handed BACK to the
+  client). The transcript is NOT auto-run server-side — the client applies the
+  confirmation guard first.
+- **Voice safety (§3.5)** is `src/web/confirm.js#guardUtterance`: when first mate asks
+  to confirm a **consequential** action (merge/push/deploy/delete/…), a SPOKEN reply is
+  forwarded only if it's a CLEAR confirm/cancel — a bare "yeah" is held and re-prompted,
+  never auto-approved. Typed input is always explicit. Asserted by a leg.
+- **Call mode** (`app.js`): a manual toggle (and, after `DeviceMotionEvent.requestPermission`
+  on iOS, a raise-to-ear heuristic on `deviceorientation` beta) shows a full-screen
+  black overlay that **swallows touches** (cheek-proof) while audio keeps running and
+  the Wake Lock is held. **HARD WEB LIMIT (document, don't fight):** iOS Safari cannot
+  read the proximity sensor or power the backlight off — only a native/CallKit wrapper
+  can. `enterCallMode()`/`exitCallMode()` are the seam a future native app hooks.
+- **Needs the captain's real-device retest (iPhone 14 / Safari):** actual Web Speech
+  reliability, the raise-to-ear gesture thresholds, and that read-aloud is audible
+  through the tunnel. The headless gate proves the logic + real audio; the device proves
+  the sensors/permissions. The dev box has no mic, so STT legs use injected fakes.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

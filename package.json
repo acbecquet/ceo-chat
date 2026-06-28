@@ -11,6 +11,7 @@
     "validate": "node test/validate.ts",
     "validate:live": "node test/validate.ts --live",
     "dev": "node src/cli/dev.ts",
+    "voice": "bash bin/setup-local-voice.sh",
     "firstmate": "bash bin/launch-firstmate.sh",
     "serve": "node src/server/serve.ts",
     "start": "node src/server/serve.ts",

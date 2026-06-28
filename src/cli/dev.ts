@@ -72,7 +72,7 @@ async function drive(line: string): Promise<void> {
 }
 
 console.log('ceo-chat — voice interface to firstmate (CLI driver)');
-console.log(`TTS mode: ${broker.ttsMode.toUpperCase()}${broker.ttsMode === 'mock' ? '  (add MiniMax creds to go live)' : ''}`);
+console.log(`TTS: ${broker.ttsMode.toUpperCase()} (${broker.ttsVoiceLabel()})${broker.ttsMode === 'mock' ? '  — run `npm run voice` for real offline speech' : ''}`);
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
 console.log(`target: ${broker.targetLabel()}`);
 

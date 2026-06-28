@@ -24,9 +24,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Broker } from '../broker/broker.ts';
-import { DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
 import { BrokerDriver } from './driver.ts';
 import { createWebApp, type WebApp } from './app.ts';
+import { makeWhisperTranscriber } from './stt.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(HERE, '..', '..', 'out');
@@ -37,12 +37,21 @@ const forceMock = argv.includes('--mock') || process.env.CEOCHAT_MOCK === '1';
 const log = (m: string): void => console.log('  ·', m);
 
 const broker = new Broker({ outDir: OUT_DIR, log, mock: forceMock });
-const driver = new BrokerDriver(broker, DEFAULT_SAMPLE_RATE);
+const driver = new BrokerDriver(broker);
+// Optional server-side STT fallback (local whisper.cpp). null if not installed —
+// the browser's own Web Speech is the primary path either way.
+const transcriber = forceMock ? null : makeWhisperTranscriber({ log });
 
 const attached = broker.isAttached();
 
+const ttsLine =
+  broker.ttsMode === 'local' ? `LOCAL piper (${broker.ttsVoiceLabel()}) — real offline speech`
+  : broker.ttsMode === 'minimax' ? 'MINIMAX (premium cloud voice)'
+  : 'MOCK tone (no voice installed — run `npm run voice` for real speech)';
+
 console.log('ceo-chat — web interface to firstmate');
-console.log(`TTS mode: ${broker.ttsMode.toUpperCase()}${broker.ttsMode === 'mock' ? '  (add MiniMax creds to go live)' : ''}`);
+console.log(`TTS: ${ttsLine}`);
+console.log(`STT fallback: ${transcriber ? transcriber.label + ' (server-side)' : 'browser Web Speech only'}`);
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
 console.log(`target: ${broker.targetLabel()}`);
 console.log(attached
@@ -52,7 +61,12 @@ console.log(attached
 
 let app: WebApp;
 try {
-  app = await createWebApp({ driver, log });
+  app = await createWebApp({
+    driver,
+    log,
+    transcribe: transcriber ? (pcm, sr) => transcriber.transcribe(pcm, sr) : undefined,
+    sttLabel: transcriber ? transcriber.label : '',
+  });
 } catch (e) {
   console.error('  ✗ startup failed:', (e as Error)?.message ?? e);
   if (!attached) console.error('  tearing down the dedicated ceo-chat session…');

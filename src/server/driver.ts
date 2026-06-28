@@ -7,9 +7,12 @@
 
 import type { PipelineStage } from '../broker/pipeline.ts';
 import type { Broker } from '../broker/broker.ts';
+import type { TtsMode } from './protocol.ts';
 
 export interface DriverMeta {
-  ttsMode: 'live' | 'mock';
+  ttsMode: TtsMode;
+  /** Voice/backend label for the UI (e.g. "en_US-lessac-medium", "minimax", "mock tone"). */
+  ttsVoice: string;
   speakBackend: string;
   sampleRate: number;
 }
@@ -41,18 +44,19 @@ export interface Driver {
 // just exposes them through the Driver shape the web layer consumes.
 export class BrokerDriver implements Driver {
   private readonly broker: Broker;
-  private readonly sampleRate: number;
 
-  constructor(broker: Broker, sampleRate = 32000) {
+  constructor(broker: Broker) {
     this.broker = broker;
-    this.sampleRate = sampleRate;
   }
 
   meta(): DriverMeta {
     return {
       ttsMode: this.broker.ttsMode,
+      ttsVoice: this.broker.ttsVoiceLabel(),
       speakBackend: this.broker.speakBackendHint(),
-      sampleRate: this.sampleRate,
+      // Hint only — each audio frame carries its own sampleRate (piper 22.05k,
+      // MiniMax 32k). The player reads the per-frame rate.
+      sampleRate: this.broker.ttsSampleRate(),
     };
   }
 

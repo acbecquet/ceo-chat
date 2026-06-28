@@ -94,6 +94,48 @@ export function toWav(result: Pick<SynthResult, 'pcm' | 'sampleRate'>): Buffer {
   return Buffer.concat([wavHeader(result.pcm.length, result.sampleRate), result.pcm]);
 }
 
+export interface ParsedWav {
+  pcm: Buffer;
+  sampleRate: number;
+  channels: number;
+  bitsPerSample: number;
+}
+
+// Parse a 16-bit PCM WAV (the shape piper / our own toWav emit) into raw samples.
+// Walks the RIFF chunk list rather than assuming a fixed 44-byte header, so it
+// tolerates extra chunks (LIST/fact) some encoders insert before `data`. Throws on
+// a non-PCM / non-16-bit file (we only ever feed it our own + piper output).
+export function parseWav(buf: Buffer): ParsedWav {
+  if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error('not a RIFF/WAVE file');
+  }
+  let sampleRate = DEFAULT_SAMPLE_RATE;
+  let channels = 1;
+  let bitsPerSample = 16;
+  let audioFormat = 1;
+  let pcm: Buffer | null = null;
+  let off = 12;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4);
+    const size = buf.readUInt32LE(off + 4);
+    const body = off + 8;
+    if (id === 'fmt ') {
+      audioFormat = buf.readUInt16LE(body);
+      channels = buf.readUInt16LE(body + 2);
+      sampleRate = buf.readUInt32LE(body + 4);
+      bitsPerSample = buf.readUInt16LE(body + 14);
+    } else if (id === 'data') {
+      pcm = buf.subarray(body, Math.min(buf.length, body + size));
+    }
+    off = body + size + (size & 1); // chunks are word-aligned
+  }
+  if (audioFormat !== 1 || bitsPerSample !== 16) {
+    throw new Error(`unsupported WAV (format=${audioFormat}, bits=${bitsPerSample}); expected 16-bit PCM`);
+  }
+  if (!pcm) throw new Error('WAV has no data chunk');
+  return { pcm, sampleRate, channels, bitsPerSample };
+}
+
 // The global undici WebSocket accepts a Node-only `{ headers }` option that the
 // WHATWG type omits — narrow it here rather than scatter `any` casts.
 type WsCtor = new (url: string, opts?: { headers?: Record<string, string> }) => WsLike;
