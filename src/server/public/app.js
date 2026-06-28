@@ -232,7 +232,12 @@ import { STT_SAMPLE_RATE } from '/lib/protocol-consts.js';
   // ---- mic button + server STT (tap-to-talk fallback) ----
   els.micToggle.addEventListener('click', function () {
     micWanted = !micWanted;
-    if (micWanted) { if (webSpeechOk) speech.start(); } else { speech.stop(); stopServerCapture(); }
+    if (micWanted) {
+      if (webSpeechOk) speech.start();
+      else if (serverStt) startServerCapture();
+    } else {
+      speech.stop(); stopServerCapture(true);
+    }
     refreshMicUi();
   });
   els.mic.addEventListener('click', function () {

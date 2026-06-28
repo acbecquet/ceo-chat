@@ -31,6 +31,8 @@ export class AudioPlayer {
     this._playHead = 0;
     this._active = new Set();
     this._pending = []; // {bytes, sampleRate} queued before unlock
+    this._pendingBytes = 0;
+    this._pendingMaxBytes = opts.pendingMaxBytes || 10 * 1024 * 1024;
     this._speaking = false;
   }
 
@@ -70,6 +72,7 @@ export class AudioPlayer {
     if (!this._pending.length) return;
     const queued = this._pending;
     this._pending = [];
+    this._pendingBytes = 0;
     for (const item of queued) this._schedule(item.bytes, item.sampleRate);
   }
 
@@ -85,6 +88,15 @@ export class AudioPlayer {
     // is also flushed by the next explicit unlock().
     if (!this.unlocked || (ctx.state && ctx.state !== 'running')) {
       this._pending.push({ bytes, sampleRate });
+      this._pendingBytes += bytes.length;
+      // Bound the pre-unlock backlog (symmetric to the server STT cap): if unlock
+      // never resolves while replies keep arriving, drop the OLDEST so it can't grow
+      // unbounded. Always keep at least the newest reply.
+      while (this._pendingBytes > this._pendingMaxBytes && this._pending.length > 1) {
+        const dropped = this._pending.shift();
+        this._pendingBytes -= dropped.bytes.length;
+        this._log('dropped oldest pre-unlock audio (pending cap)');
+      }
       if (ctx.state !== 'running' && ctx.resume) {
         Promise.resolve()
           .then(() => ctx.resume())
@@ -133,6 +145,7 @@ export class AudioPlayer {
     for (const src of this._active) { try { src.stop(0); } catch (e) { void e; } src.onended = null; }
     this._active.clear();
     this._pending = [];
+    this._pendingBytes = 0;
     this._playHead = this.ctx ? this.ctx.currentTime : 0;
     this._setSpeaking(false);
   }

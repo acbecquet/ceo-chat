@@ -25,6 +25,7 @@ export interface AudioPlayerOptions {
   now?: () => number;
   onSpeakingChange?: (speaking: boolean) => void;
   log?: (msg: string) => void;
+  pendingMaxBytes?: number;
 }
 export class AudioPlayer {
   constructor(opts: AudioPlayerOptions);

@@ -702,6 +702,29 @@ await reporter.leg('mobile — audio auto-speak (unlock, queue, barge-in)', asyn
   await tp.unlock();
   tp.enqueue(pcm, 22050);
   t.ok(!tp.speaking, 'a failed src.start() does not leave speaking stuck (mic re-arms)');
+
+  // Pre-unlock backlog is bounded: if unlock never resolves while replies keep
+  // arriving, the oldest are dropped (symmetric to the server STT cap) — never
+  // grows unbounded for the page's life.
+  const capStarted: FakeSource[] = [];
+  const capMakeCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'suspended', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { return Promise.resolve(); }, // stays suspended — unlock never resolves
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, connect() {}, start() { s.started = true; capStarted.push(s); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const capPlayer = new AudioPlayer({ createContext: capMakeCtx, pendingMaxBytes: pcm.length * 3 });
+  for (let i = 0; i < 100; i++) capPlayer.enqueue(pcm, 22050);
+  const capInternals = capPlayer as unknown as { _pendingBytes: number; _pending: unknown[] };
+  t.eq(capStarted.length, 0, 'still suspended — nothing played (pending only)');
+  t.ok(capInternals._pendingBytes <= pcm.length * 3, 'pre-unlock backlog stays under the byte cap', `${capInternals._pendingBytes} bytes`);
+  t.ok(capInternals._pending.length >= 1, 'cap keeps at least the newest reply buffered');
 });
 
 // M5 — SpeechController: iOS-shaped robustness (restart-on-end keep-alive, permanent
