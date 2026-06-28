@@ -255,5 +255,46 @@ streaming TTS. Decision-ready plan:
   through the tunnel. The headless gate proves the logic + real audio; the device proves
   the sensors/permissions. The dev box has no mic, so STT legs use injected fakes.
 
+## Phase 4.1 — iOS hands-free audio/mic hardening + diagnostics (CONFIRMED on hub Chrome)
+- **The "reply text shows, zero audio" bug = AudioContext idle-suspend.** iOS Safari
+  resumes the context only inside a gesture AND auto-re-suspends it when idle. Replies
+  arrive seconds after the unlock tap, by which time it's suspended again, so a buffered
+  reply never plays. `audio-player.js` now defends on TWO fronts:
+  1. **Keep-alive:** `_ensureKeepAlive()` runs a continuous near-silent looping
+     `AudioBufferSource` (zero buffer → ~0 gain → destination) so the context never goes
+     idle and stays `'running'` for the delayed reply. Started on unlock (and re-armed in
+     `_play` if it dies); torn down by `stop()`.
+  2. **HTMLAudioElement fallback:** one persistent `<audio>`, created + **muted-played
+     inside the unlock gesture** (iOS user-activation), then fed each reply as a WAV Blob
+     objectURL (`pcm.js#wavBytesFromPcm`). Used whenever the context is NOT genuinely
+     `'running'`. PREFER Web Audio when running; fall back otherwise. This is the path
+     that survives the silent switch later.
+- **`unlocked` now means "the gesture ran", NOT "ctx is running".** Don't gate playback on
+  ctx state alone — the fallback exists exactly for the suspended case. `unlock()` still
+  RETURNS `ctx.state==='running'` (so callers know if Web Audio is live), but always arms
+  the element + flushes pending via `_play` (which picks webaudio→element→buffer).
+- **Player is DOM-free + DI'd:** `createAudioElement` / `makeObjectUrl` / `revokeObjectUrl`
+  / `onDiag` are injected so the SAME logic is asserted headlessly (validate leg
+  "audio keep-alive + HTMLAudioElement fallback"). Real `<audio>`/`URL.createObjectURL`
+  live only in `app.js`.
+- **Mic (Bug 2):** resume the CAPTURE AudioContext inside the mic tap; if `audioWorklet`/
+  `AudioWorkletNode` is unavailable or silent, fall back to a **ScriptProcessorNode**
+  (`createScriptProcessor`) so older iOS still streams PCM. The server (`app.ts`) now
+  **always returns a `transcript` frame** — even empty — with `empty:true`+`reason`+`bytes`
+  (protocol extended), and logs bytes-in / whisper result. So "mic on, no words" is VISIBLE
+  instead of a silent drop. The client shows it ("Heard nothing — …").
+- **On-screen Diagnostics panel** (`index.html` `#diag-details`, off by default,
+  **auto-opens on the first audio/mic error**): live ctx state + keep-alive + mic chips,
+  per-reply play path (Web Audio vs HTMLAudio fallback vs buffered) + play errors, mic
+  gUM/worklet-vs-scriptprocessor/bytes-streamed/server transcript, and a **Copy
+  diagnostics** button (clipboard, with a textarea fallback). Data model is the DOM-free,
+  unit-tested `src/web/diagnostics.js` (ring buffer, ts-stamped `text()` dump); app.js owns
+  the render. THIS is how the captain's next device test is sighted — paste the log back.
+- **CONFIRMED in a real browser (hub Chrome, smoke seam = `createWebApp` + in-memory
+  driver + mock TTS, NO claude/tmux):** Start call → `ctx running, keep-alive on, element
+  armed`; typed send → `reply audio: 4096 bytes → Web Audio`; WebSpeech permission error
+  auto-opened the panel. Headless can't emit sound or grant a mic, so the suspended→fallback
+  path and STT-empty path are proven by the deterministic validate legs.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

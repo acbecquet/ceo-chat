@@ -43,11 +43,12 @@ import { parseWav } from '../src/tts/minimax.ts';
 // Shared browser modules — the SAME files the page loads at /lib/… (asserted here so
 // the mobile audio-unlock / STT-restart / confirmation logic can't silently regress).
 import {
-  base64ToBytes, bytesToBase64, pcmS16leToFloat32, float32ToPcmS16le, downsampleFloat32,
+  base64ToBytes, bytesToBase64, pcmS16leToFloat32, float32ToPcmS16le, downsampleFloat32, wavBytesFromPcm,
 } from '../src/web/pcm.js';
 import { looksConsequential, classifyReply, guardUtterance } from '../src/web/confirm.js';
 import { AudioPlayer } from '../src/web/audio-player.js';
-import type { AudioCtxLike, AudioSrcLike } from '../src/web/audio-player.js';
+import type { AudioCtxLike, AudioSrcLike, AudioElLike, AudioDiag } from '../src/web/audio-player.js';
+import { Diagnostics } from '../src/web/diagnostics.js';
 import { SpeechController } from '../src/web/speech.js';
 import type { RecognitionLike } from '../src/web/speech.js';
 import {
@@ -605,6 +606,35 @@ await reporter.leg('mobile — pcm codec (base64 / s16le / downsample, browser�
   const down = downsampleFloat32(src, 48000, 16000);
   t.ok(Math.abs(down.length - 1600) <= 1, '48k->16k downsample yields ~1/3 frames', `${down.length}`);
   t.eq(downsampleFloat32(src, 16000, 16000).length, src.length, 'equal-rate downsample is a no-op (STT path)');
+  // wavBytesFromPcm wraps s16le PCM in a valid 44-byte RIFF header (HTMLAudio fallback).
+  const pcm = float32ToPcmS16le(new Float32Array([0.1, -0.1, 0.2]));
+  const wav = wavBytesFromPcm(pcm, 22050);
+  t.eq(wav.length, 44 + pcm.length, 'WAV is 44-byte header + PCM data');
+  t.eq(String.fromCharCode(wav[0]!, wav[1]!, wav[2]!, wav[3]!), 'RIFF', 'WAV starts with RIFF');
+  t.eq(String.fromCharCode(wav[8]!, wav[9]!, wav[10]!, wav[11]!), 'WAVE', 'WAV has WAVE format tag');
+  const wavDv = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+  t.eq(wavDv.getUint32(24, true), 22050, 'WAV header carries the sample rate');
+  t.eq(wavDv.getUint16(34, true), 16, 'WAV is 16-bit PCM');
+  t.eq(wavDv.getUint32(40, true), pcm.length, 'WAV data chunk length matches the PCM');
+});
+
+// M1b — Diagnostics ring buffer (the on-screen panel's data model): timestamped
+// lines, error flagging (drives auto-open), a copy-pasteable dump, bounded size.
+await reporter.leg('mobile — diagnostics ring buffer (sighted device testing)', (t) => {
+  let clock = 1000;
+  const errors: string[] = [];
+  const diag = new Diagnostics({ now: () => clock, onError: (r) => errors.push(r.msg), max: 3 });
+  clock = 1500; diag.add('AudioContext → running');
+  clock = 2000; diag.error('play error (element): play() rejected');
+  t.eq(diag.count, 2, 'two lines recorded');
+  t.eq(errors.length, 1, 'onError fired for the error line (panel auto-opens)');
+  t.ok(/\[\+0\.50s\] AudioContext/.test(diag.text()), 'text() stamps lines relative to first use', diag.text().split('\n')[0]);
+  t.ok(/ERR/.test(diag.text()), 'error lines are marked in the dump');
+  // bounded: never grows past max (the panel can run for a long call).
+  clock = 3000; diag.add('a'); clock = 3100; diag.add('b'); clock = 3200; diag.add('c');
+  t.ok(diag.count <= 3, 'ring buffer is bounded by max', `count ${diag.count}`);
+  diag.clear();
+  t.eq(diag.count, 0, 'clear() empties the buffer');
 });
 
 // M2 — protocol constants the browser hard-codes must match the typed server source.
@@ -727,6 +757,78 @@ await reporter.leg('mobile — audio auto-speak (unlock, queue, barge-in)', asyn
   t.ok(capInternals._pending.length >= 1, 'cap keeps at least the newest reply buffered');
 });
 
+// M4b — the PRIMARY iOS bug fix: (1) unlock() starts a keep-alive so the context stays
+// 'running' for the delayed reply; (2) when the context is NOT running, the reply still
+// plays via the HTMLAudioElement fallback (WAV Blob) instead of going silent. Asserted
+// against fake context + fake <audio> (no audio device).
+await reporter.leg('mobile — audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend)', async (t) => {
+  // (1) keep-alive: a context that resumes to running gets a persistent keep-alive
+  // source on unlock, and stop() tears it down.
+  const started: FakeSource[] = [];
+  const runCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'suspended', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { ctx.state = 'running'; return Promise.resolve(); },
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, loop: false, connect() {}, disconnect() {}, start() { s.started = true; started.push(s); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const kp = new AudioPlayer({ createContext: runCtx });
+  await kp.unlock();
+  t.ok(kp.keepAliveActive, 'unlock() starts the keep-alive (context stays running for the delayed reply)');
+  kp.stop();
+  t.ok(!kp.keepAliveActive, 'stop() tears the keep-alive down');
+
+  // (2) the fallback: a context stuck SUSPENDED (iOS idle-suspend) + an armed <audio>
+  // element. A reply that arrives must play via the element, NOT silently vanish.
+  const elPlays: Array<{ src: string; muted: boolean }> = [];
+  let fakeEl: AudioElLike;
+  const stuckSources: FakeSource[] = [];
+  const stuckCtx = (): AudioCtxLike => {
+    const ctx = {
+      state: 'suspended', sampleRate: 48000, currentTime: 0, destination: {},
+      resume() { return Promise.resolve(); }, // never un-suspends — the bug condition
+      createBuffer(_ch: number, len: number, rate: number) { return { length: len, sampleRate: rate, getChannelData: () => new Float32Array(len) }; },
+      createBufferSource(): FakeSource {
+        const s: FakeSource = { buffer: null, onended: null, started: false, stopped: false, loop: false, connect() {}, disconnect() {}, start() { s.started = true; stuckSources.push(s); }, stop() { s.stopped = true; } };
+        return s;
+      },
+    };
+    return ctx as unknown as AudioCtxLike;
+  };
+  const diags: AudioDiag[] = [];
+  const player = new AudioPlayer({
+    createContext: stuckCtx,
+    createAudioElement: () => { fakeEl = { src: '', muted: true, autoplay: false, preload: '', onended: null, onerror: null, play() { elPlays.push({ src: fakeEl.src, muted: fakeEl.muted }); return Promise.resolve(); }, pause() {} }; return fakeEl; },
+    makeObjectUrl: (bytes: Uint8Array) => 'blob:wav/' + bytes.length,
+    revokeObjectUrl: () => {},
+    onDiag: (r: AudioDiag) => diags.push(r),
+  });
+  const ok = await player.unlock();
+  t.ok(!ok, 'unlock() reports Web Audio NOT running (context stuck suspended)');
+  t.ok(!player.keepAliveActive, 'no keep-alive while the context is suspended');
+
+  t.ok(elPlays.some((p) => p.muted), 'element was primed muted inside the unlock gesture (iOS user-activation)');
+  const pcm = float32ToPcmS16le(new Float32Array([0.1, -0.1, 0.2, -0.2, 0.05]));
+  player.enqueue(pcm, 22050);
+  const replyPlays = elPlays.filter((p) => !p.muted);
+  t.eq(replyPlays.length, 1, 'a reply that arrives while suspended PLAYS via the HTMLAudioElement fallback (unmuted)');
+  t.ok(/^blob:wav\//.test(replyPlays[0]?.src || ''), 'the reply is fed to the element as a WAV Blob url', replyPlays[0]?.src);
+  t.ok(player.speaking, 'fallback playback marks the player speaking (half-duplex mutes the mic)');
+  t.ok(diags.some((d) => d.t === 'play' && d.via === 'element'), 'diagnostics record the element-fallback play');
+  // the reply did NOT go through Web Audio (no buffer source scheduled for it; only the
+  // unlock prime exists since the context never ran).
+  t.ok(stuckSources.length <= 1, 'reply did NOT schedule a Web Audio source (used the fallback)', `${stuckSources.length} source(s)`);
+
+  // draining the element queue clears speaking (mic can re-arm).
+  if (fakeEl!.onended) fakeEl!.onended();
+  t.ok(!player.speaking, 'speaking clears when the element queue drains');
+});
+
 // M5 — SpeechController: iOS-shaped robustness (restart-on-end keep-alive, permanent
 // vs transient errors, half-duplex pause/resume). Fake recognizer + injected clock.
 await reporter.leg('mobile — speech STT controller (iOS restart, half-duplex, errors)', (t) => {
@@ -833,6 +935,54 @@ await reporter.leg('mobile — server STT seam (stt-audio -> transcript over WS)
     await app.close();
     await mock.close();
   }
+});
+
+// M6b — Bug 2: an empty OR failed server transcription must surface a CLEAR signal
+// (transcript frame with empty=true + a reason) rather than silently nothing — so the
+// device shows "heard nothing" instead of the mic swallowing the utterance. Asserted
+// over the real WS with a transcriber that returns '' / throws.
+await reporter.leg('mobile — server STT empty/failed surfaces a clear signal (Bug 2)', async (t) => {
+  const mkDriver = (): Driver => ({
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async () => ({ reply: '', narration: '', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 32000, ttfbMs: null, bytes: 0 } }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  });
+  const samplePcm = bytesToBase64(float32ToPcmS16le(new Float32Array(320).fill(0.0)));
+  const runCase = async (transcribe: (pcm: Buffer, sr: number) => Promise<string>): Promise<Record<string, unknown>> => {
+    const app = await createWebApp({ driver: mkDriver(), host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {}, sttLabel: 'mock-asr', transcribe });
+    try {
+      return await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+        const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('STT empty WS timed out')); }, 8000);
+        client.on('message', (raw: Buffer) => {
+          const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+          if (m.type === 'hello') {
+            client.send(JSON.stringify({ type: 'stt-audio', pcm: samplePcm, sampleRate: STT_SAMPLE_RATE }));
+            client.send(JSON.stringify({ type: 'stt-end' }));
+          }
+          if (m.type === 'transcript') { clearTimeout(timer); client.close(); resolve(m); }
+        });
+        client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+      });
+    } finally { await app.close(); }
+  };
+
+  // whisper recognized nothing -> still a transcript frame, flagged empty + reason.
+  const empty = await runCase(async () => '');
+  t.eq(empty.type, 'transcript', 'empty transcription still returns a transcript frame (not silence)');
+  t.eq(empty.text, '', 'empty transcript carries no text');
+  t.eq(empty.empty, true, 'empty transcript is flagged empty=true (UI shows "heard nothing")');
+  t.ok(typeof empty.reason === 'string' && (empty.reason as string).length > 0, 'empty transcript explains WHY', String(empty.reason));
+  t.ok((empty.bytes as number) > 0, 'empty transcript reports the bytes that were received', `${empty.bytes} bytes`);
+
+  // transcriber throws -> surfaced as an empty transcript with the error reason (not a
+  // bare silent drop; the client can render it).
+  const failed = await runCase(async () => { throw new Error('whisper exited 1'); });
+  t.eq(failed.type, 'transcript', 'a transcription FAILURE surfaces as a transcript frame');
+  t.eq(failed.empty, true, 'failed transcription flagged empty=true');
+  t.ok(/whisper exited 1/.test(String(failed.reason)), 'failure reason carries the underlying error', String(failed.reason));
 });
 
 // M7 — REAL audio e2e (the captain's requested generated-audio gate): a first-mate
