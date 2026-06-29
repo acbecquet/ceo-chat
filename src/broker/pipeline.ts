@@ -70,7 +70,12 @@ export interface StreamingPipelineDeps {
   inject: (text: string) => Promise<void>;
   /** Stream the reply, invoking onUnit for each complete speakable unit. */
   streamReply: (onUnit: (unitText: string) => void) => Promise<string>;
-  speakify: (text: string) => Promise<SpeakifyResult>;
+  /**
+   * Rewrite a unit for the ear. `context` is the reply-so-far (earlier units already
+   * spoken) — passed so a per-unit rewrite keeps whole-reply context and doesn't drift
+   * (which topic matters, which option was recommended). Ignored by whole-turn callers.
+   */
+  speakify: (text: string, context?: string) => Promise<SpeakifyResult>;
   synth: (chunks: string[]) => Promise<SynthResult>;
   /** Emitted as each unit finishes synth — drives progressive broadcast/playback. */
   onChunk: (chunk: PipelineChunk) => void;
@@ -109,14 +114,20 @@ export async function runStreamingPipeline(
   let speakBackend: SpeakifyResult['backend'] = 'noop';
 
   // Process units one at a time so audio stays ORDERED and synth never overlaps. Each
-  // unit: rewrite (speakify) -> TTS (synth) -> emit a chunk for progressive playback.
+  // unit: rewrite (speakify, with the reply-so-far as context) -> TTS (synth) -> emit a
+  // chunk for progressive playback. `contextAcc` is the raw text of units already spoken;
+  // passing it lets the rewriter see the whole reply so far and not drift on a fragment.
   let queue: Promise<void> = Promise.resolve();
+  let contextAcc = '';
+  const CONTEXT_CAP = 4000; // keep prompts bounded on very long turns (memoir read-outs)
   const handleUnit = (unitText: string): void => {
     queue = queue.then(async () => {
       if (aborted()) return;
       const text = unitText.trim();
       if (!text) return;
-      const { narration, backend } = await deps.speakify(text);
+      const context = contextAcc || undefined;
+      contextAcc = (contextAcc ? contextAcc + '\n\n' + text : text).slice(-CONTEXT_CAP);
+      const { narration, backend } = await deps.speakify(text, context);
       if (aborted() || !narration.trim()) return;
       speakBackend = backend;
       const synth = await deps.synth(sentenceChunks(narration));

@@ -388,5 +388,54 @@ streaming TTS. Decision-ready plan:
   selection, request shape, clean output, and the fail-safe fallback with a faked HTTP —
   NO real Gemini call. MiniMax stays off; piper TTS + whisper STT remain the voice stack.
 
+## Phase 7 — Speakability drift on long / multi-topic replies (FIXED, CONFIRMED live)
+- **The bug (captain-reproduced, `data/ceochat-test-convo.md`):** Gemini summaries are
+  great on short acks but DRIFT on long / multi-topic replies. Five patterns:
+  (1) **multi-ask** (e.g. claim-the-lock AND install-tooling) → one topic silently
+  DROPPED; (2) **numbered options with a recommendation** → the WRONG option reported as
+  recommended; (3) **very long multi-section** (memoir read-out) → three stories collapsed
+  / conflated; (4) **answer buried late or behind a caveat** → head-biased summary surfaces
+  the wrong thing; (5) **path/number/PID-heavy** → TTS fixates on `manuscript/entries/` or
+  `process 66035` instead of the point.
+- **Root cause (CONFIRMED, not just hypothesized):** the streaming path summarized each
+  SENTENCE in isolation (`runStreamingPipeline` called `speakify` per `splitCompleteUnits`
+  unit). A fragment can't know which topic matters or which option was recommended. Proof:
+  feeding ONLY the recommendation sentence to live Gemini yields *"my recommendation
+  matches working locally on all three…"* — the captain never hears it's **SSH**.
+- **The fix — three layers, low-latency PRESERVED:**
+  1. **Topic-block granularity, not per-sentence.** `reply.ts#splitCompleteBlocks` carves
+     the stream at BLANK-LINE (paragraph) boundaries; `streamReply` takes an injectable
+     `split` (default `splitCompleteUnits`; the broker passes `splitCompleteBlocks`). A
+     contiguous numbered list (no blank lines) stays ONE block, so a recommendation is
+     never separated from its options. First audio is still ~1-2s (the opening paragraph
+     completes fast) — NOT the old 36s whole-turn latch.
+  2. **Reply-so-far CONTEXT per chunk.** `runStreamingPipeline` accumulates the spoken
+     text and passes it as `SpeakifyOptions.context` (capped 4000 chars); the prompt folds
+     it in as read-only "already spoken — understand but do NOT repeat" so a later block
+     knows what came before without re-speaking it (`speakability.ts#buildUserContent`).
+  3. **Hardened §7.3 prompt** (`SYSTEM_PROMPT`): cover EVERY distinct ask (never drop a
+     topic), NAME the recommended option correctly, LEAD with the answer not the preamble,
+     never speak code/paths/URLs/raw-IDs (+ `RAW_ID_RE` turns "process 66035" → "a
+     process"), say counts as words, concise (≤2-3 sentences; a little more only for
+     genuinely multi-topic). `mockSpeakify` mirrors this offline: topic-block aware
+     (`splitBlocks`), force-keeps questions/decisions/recommendations, strips markdown.
+- **Tradeoff chosen:** block-granularity + accumulated context (over: per-sentence;
+  whole-turn-at-end which reintroduces silence; or a separate correction pass). It keeps
+  the captain's loved first-audio-in-1-2s AND continuous mid-turn audio while giving each
+  summary a whole coherent topic — the best latency/quality point. A single-paragraph reply
+  with NO blank lines speaks only at idle (rare; documented) — most real replies are
+  multi-paragraph.
+- **Tests.** `npm run validate` (deterministic, no network) gains the DRIFT legs:
+  `drift — root cause` (sentence units split an option from its recommendation; blocks keep
+  them together), `drift — streaming summarizes blocks with reply-so-far context` (asserts
+  the two fix layers over `runStreamingPipeline`), and `drift — mock contract summaries`
+  (per-fixture coverage / recommendation / screen-safe / question, incl. the PID strip).
+  Fixtures (`test/harness/fixtures.ts#DRIFT_FIXTURES`) are the real reply shapes.
+- **Live E2E:** `npm run validate:live` adds `live — Gemini drift fixtures` — the SAME
+  contract against real `gemini-2.5-flash` (thinkingBudget:0). It is a quality REPORT, not
+  a hard gate: gemini is non-deterministic, so a miss is surfaced as PENDING with the
+  offending narration (never red); the deterministic mock legs are the hard guard. Needs
+  `GEMINI_API_KEY` in `~/.config/ceo-chat/secrets.env` (never committed) else PENDING.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

@@ -28,7 +28,7 @@ import {
   PROJECTS_DIR, mangleCwd, parseTranscript,
   latestTranscriptWithPrompt, findPromptAnchor, saysAfterAnchor,
 } from '../transcript/transcript.ts';
-import { streamReply } from '../transcript/reply.ts';
+import { streamReply, splitCompleteBlocks } from '../transcript/reply.ts';
 import { speakify, GEMINI_MODEL, type SpeakabilityBackend } from '../speakability/speakability.ts';
 import { synthStreaming, toWav, INTL_WS, DEFAULT_SAMPLE_RATE } from '../tts/minimax.ts';
 import { findPiper, synthLocal, type LocalVoice } from '../tts/local-tts.ts';
@@ -198,10 +198,11 @@ export class Broker {
       // Anchor the reply to the transcript that recorded OUR prompt (multi-session safe)
       // and stream its says as speakable units.
       streamReply: (onUnit) => this.streamReplyFor(target, typed, () => baselineTs, onUnit, opts.signal),
-      speakify: (text) => speakify(text, {
+      speakify: (text, context) => speakify(text, {
         apiKey: has(this.secrets, 'ANTHROPIC_API_KEY') ? this.secrets.ANTHROPIC_API_KEY : null,
         geminiApiKey: hasGeminiCreds(this.secrets) ? this.secrets.GEMINI_API_KEY : null,
         backend: this.streamSpeakBackend(),
+        context,
         log: this.log,
       }),
       synth: (chunks) => this.synth(chunks),
@@ -314,6 +315,9 @@ export class Broker {
       sleep,
       now: () => performance.now(),
       onUnit,
+      // Speak at TOPIC-block granularity (not per sentence): each unit carries enough of
+      // the reply for the rewriter to keep the right topic/recommendation and not drift.
+      split: splitCompleteBlocks,
       signal,
       log: this.log,
     }, { sayBefore: 0 });
