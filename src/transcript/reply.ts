@@ -49,11 +49,41 @@ export function splitCompleteUnits(buffer: string): { units: string[]; rest: str
   return { units, rest: buffer.slice(lastEnd) };
 }
 
+// Split a streaming buffer into COMPLETE topic blocks (paragraphs separated by a blank
+// line), holding the trailing partial block in `rest` until a blank line terminates it
+// (or the turn ends and it's flushed). This is the granularity the broker speaks at:
+// summarizing a whole topic at once — not each sentence — is what stops the Gemini drift
+// where a fragment loses which option was recommended or silently drops the other ask.
+// A contiguous list (e.g. "1. … 2. … 3. …" with no blank lines) stays ONE block, so its
+// recommendation is never separated from its options. See AGENTS.md "Speakability drift".
+export function splitCompleteBlocks(buffer: string): { units: string[]; rest: string } {
+  const units: string[] = [];
+  let lastEnd = 0;
+  // Each match = text up to (non-greedy) a blank-line block terminator.
+  const re = /([\s\S]*?)\n[ \t]*\n+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(buffer)) !== null) {
+    if (re.lastIndex === m.index) { re.lastIndex++; continue; } // guard zero-width
+    const b = m[1]!.trim();
+    if (b) units.push(b);
+    lastEnd = re.lastIndex;
+  }
+  return { units, rest: buffer.slice(lastEnd) };
+}
+
 const unitKey = (s: string): string => s.replace(/\s+/g, ' ').trim().toLowerCase();
+
+export type UnitSplitter = (buffer: string) => { units: string[]; rest: string };
 
 export interface StreamReplyDeps extends WaitForReplyDeps {
   /** Called with each COMPLETE speakable unit as it becomes available (progressive). */
   onUnit: (unitText: string) => void;
+  /**
+   * How to carve the streaming buffer into units. Default: sentence/newline boundaries
+   * (splitCompleteUnits). The broker passes splitCompleteBlocks so each unit is a whole
+   * topic block — enough context for the rewriter to not drift.
+   */
+  split?: UnitSplitter;
   /** Barge-in / hangup: when aborted, stop streaming and return what we have. */
   signal?: { readonly aborted: boolean };
 }
@@ -68,6 +98,7 @@ export async function streamReply(
   { sayBefore, timeoutMs = 150000, settleMs = 2000, pollMs = 1000 }: WaitForReplyOpts,
 ): Promise<string> {
   const { readSays, isIdle, sleep, now, onUnit } = deps;
+  const split = deps.split ?? splitCompleteUnits;
   const log = deps.log ?? (() => {});
   const start = now();
   const seen = new Set<string>();   // normalized units already spoken — dedup across
@@ -77,7 +108,7 @@ export async function streamReply(
   // trailing partial (turn is done, nothing more is coming). Dedup is what makes a
   // mid-turn transcript rotation (re-reading the reply from a fresh file) a non-event.
   const pump = (text: string, flush: boolean): void => {
-    const { units, rest } = splitCompleteUnits(text);
+    const { units, rest } = split(text);
     const all = flush && rest.trim() ? [...units, rest.trim()] : units;
     for (const u of all) {
       const key = unitKey(u);
