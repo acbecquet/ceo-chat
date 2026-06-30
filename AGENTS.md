@@ -20,7 +20,8 @@ streaming TTS. Decision-ready plan:
 
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
-  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
+  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `MINIMAX_VOICE_ID` (the captain's
+  cloned voice — see Phase 8), `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
   Never hardcode or
   commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
   `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
