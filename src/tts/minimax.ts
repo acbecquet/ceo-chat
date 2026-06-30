@@ -27,8 +27,16 @@
 
 export const INTL_WS = 'wss://api.minimax.io/ws/v1/t2a_v2';
 
-// Reasonable default international system voice. Cheap to swap (plan §13.6).
+// Reasonable default international system voice. Cheap to swap (plan §13.6). The
+// captain can override it with their OWN CLONED voice: `npm run clone-voice` registers
+// a custom voice_id (src/tts/voice-clone.ts), which flows in via SynthOptions.voiceId
+// (broker reads MINIMAX_VOICE_ID from secrets). A cloned voice_id is just a voice_id —
+// it rides the exact same voice_setting field; no other protocol change.
 export const DEFAULT_VOICE_ID = 'male-qn-qingse';
+// speech-2.8-turbo is the latency pick AND supports cloned voice_ids (confirmed against
+// MiniMax's live docs, 2026-06 — the same 2.8 family as speech-2.8-hd, which trades
+// latency for fidelity). The captain asked for "2.8"; turbo is the right default for a
+// streaming phone-call UX. If task_start rejects the model, fall back to speech-2.6-turbo.
 export const DEFAULT_MODEL = 'speech-2.8-turbo';
 export const DEFAULT_SAMPLE_RATE = 32000;
 

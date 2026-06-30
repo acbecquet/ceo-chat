@@ -2,7 +2,10 @@
 //
 // Secrets live at ~/.config/ceo-chat/secrets.env (KEY=value, one per line). They
 // are NEVER committed and NEVER hardcoded. The broker loads them here. Recognized
-// names: MINIMAX_API_KEY, MINIMAX_GROUP_ID, ANTHROPIC_API_KEY, GEMINI_API_KEY.
+// names: MINIMAX_API_KEY, MINIMAX_GROUP_ID, MINIMAX_VOICE_ID, ANTHROPIC_API_KEY,
+// GEMINI_API_KEY. MINIMAX_VOICE_ID is the captain's CLONED voice id (created by
+// `npm run clone-voice`); when set the live MiniMax client speaks in that voice
+// instead of the default system voice — see src/tts/minimax.ts + src/tts/voice-clone.ts.
 //
 // A blank/absent key does NOT throw — callers decide whether to run the real
 // credentialed call or gracefully fall back to the mock path. This is what lets
@@ -49,6 +52,12 @@ export function has(secrets: Secrets, key: string): boolean {
 // recommended but empirically not strictly required for WS auth — plan §6.1.)
 export function hasMinimaxCreds(secrets: Secrets): boolean {
   return has(secrets, 'MINIMAX_API_KEY');
+}
+
+// The captain's CLONED MiniMax voice id, or undefined when none is configured. When
+// present, the live MiniMax client speaks in this voice instead of DEFAULT_VOICE_ID.
+export function minimaxVoiceId(secrets: Secrets): string | undefined {
+  return has(secrets, 'MINIMAX_VOICE_ID') ? secrets.MINIMAX_VOICE_ID : undefined;
 }
 
 // Is the Google Gemini speakability key available? It gates the PREFERRED streaming

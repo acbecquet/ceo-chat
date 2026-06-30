@@ -18,7 +18,7 @@
 import { mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, type Secrets } from '../config/secrets.ts';
+import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, minimaxVoiceId, type Secrets } from '../config/secrets.ts';
 import {
   spawnCeoChat, attachTarget, resolveTargetFromEnv, teardown, waitForComposer, fmSend,
   capturePane, capturePaneAnsi, sendKey, dismissBenignModals, sleep,
@@ -113,7 +113,10 @@ export class Broker {
   /** Human label of the TTS voice/backend in use (for logs + the UI). */
   ttsVoiceLabel(): string {
     if (this.ttsMode === 'local') return this.voice ? this.voice.name : 'local';
-    if (this.ttsMode === 'minimax') return 'minimax';
+    if (this.ttsMode === 'minimax') {
+      const cloned = minimaxVoiceId(this.secrets);
+      return cloned ? `minimax (cloned: ${cloned})` : 'minimax (default voice)';
+    }
     return 'mock tone';
   }
 
@@ -248,6 +251,10 @@ export class Broker {
         apiKey: this.secrets.MINIMAX_API_KEY!,
         groupId: this.secrets.MINIMAX_GROUP_ID || '',
         textChunks: chunks,
+        // The captain's CLONED voice when MINIMAX_VOICE_ID is set; otherwise
+        // synthStreaming falls back to DEFAULT_VOICE_ID. This is the whole wiring
+        // for "speak in my own voice" — register once via `npm run clone-voice`.
+        voiceId: minimaxVoiceId(this.secrets),
         endpoint: INTL_WS,
         log: this.log,
       });

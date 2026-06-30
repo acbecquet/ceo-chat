@@ -46,7 +46,7 @@ const attached = broker.isAttached();
 
 const ttsLine =
   broker.ttsMode === 'local' ? `LOCAL piper (${broker.ttsVoiceLabel()}) — real offline speech`
-  : broker.ttsMode === 'minimax' ? 'MINIMAX (premium cloud voice)'
+  : broker.ttsMode === 'minimax' ? `MINIMAX premium cloud voice — ${broker.ttsVoiceLabel()}`
   : 'MOCK tone (no voice installed — run `npm run voice` for real speech)';
 
 console.log('ceo-chat — web interface to firstmate');

@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, type Secrets } from '../src/config/secrets.ts';
+import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, minimaxVoiceId, type Secrets } from '../src/config/secrets.ts';
 import {
   parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
   findPromptAnchor, saysAfterAnchor, latestTranscriptWithPrompt,
@@ -39,7 +39,10 @@ import {
 } from '../src/session/session.ts';
 import { runPipeline, sentenceChunks } from '../src/broker/pipeline.ts';
 import { Reporter } from './harness/report.ts';
-import { startMockMinimax } from '../src/tts/mock-server.ts';
+import { startMockMinimax, startMockMinimaxRest } from '../src/tts/mock-server.ts';
+import {
+  uploadReferenceAudio, registerVoiceClone, cloneVoice, isValidVoiceId, INTL_REST_BASE,
+} from '../src/tts/voice-clone.ts';
 import { createWebApp } from '../src/server/app.ts';
 import { WS_PATH, AUDIO_FORMAT, STT_SAMPLE_RATE } from '../src/server/protocol.ts';
 import type { Driver } from '../src/server/driver.ts';
@@ -258,6 +261,116 @@ await reporter.leg('MiniMax TTS — real WS protocol against mock server', async
   } finally {
     await mock.close();
   }
+});
+
+// ───────── voice clone: upload + register REST flow (mock REST server) ──────
+// The captain's "speak in my own voice" feature. We DON'T create a real clone (that
+// spends credits + pollutes the account); instead we assert the upload/register
+// plumbing against an in-process HTTP server speaking the real MiniMax REST contract.
+await reporter.leg('voice clone — upload + register against mock REST (real multipart/JSON)', async (t) => {
+  const rest = await startMockMinimaxRest({ fileId: 'file-abc-123' });
+  try {
+    const audio = Buffer.from('ID3fake-mp3-bytes-for-the-multipart-body'.repeat(8));
+    const fileId = await uploadReferenceAudio({
+      apiKey: MOCK_KEY, groupId: MOCK_GROUP, baseUrl: rest.baseUrl,
+      fileBytes: new Uint8Array(audio), fileName: 'captain.mp3',
+    });
+    t.eq(fileId, 'file-abc-123', 'upload returns file.file_id');
+    const up = rest.observed.upload!;
+    t.ok(!!up, 'upload request observed');
+    t.eq(up.method, 'POST', 'files/upload is POST');
+    t.eq(up.path, '/v1/files/upload', 'international files/upload path');
+    t.eq(up.authHeader, `Bearer ${MOCK_KEY}`, 'Authorization: Bearer <key> sent');
+    t.eq(up.groupId, MOCK_GROUP, 'GroupId sent in URL query (not body)');
+    t.ok((up.contentType || '').startsWith('multipart/form-data'), 'multipart/form-data body', up.contentType);
+    t.eq(up.purpose, 'voice_clone', 'purpose=voice_clone form field sent');
+    t.ok(up.hasFilePart, 'file form part present');
+    t.eq(up.fileName, 'captain.mp3', 'reference filename preserved');
+    t.ok(up.bodyBytes >= audio.length, 'reference audio bytes rode through the multipart body', `${up.bodyBytes} bytes`);
+
+    const voiceId = await registerVoiceClone({
+      apiKey: MOCK_KEY, groupId: MOCK_GROUP, baseUrl: rest.baseUrl,
+      fileId, voiceId: 'CaptainVoice1',
+    });
+    t.eq(voiceId, 'CaptainVoice1', 'voice_clone echoes the registered voice_id');
+    const cl = rest.observed.clone!;
+    t.eq(cl.path, '/v1/voice_clone', 'international voice_clone path');
+    t.eq(cl.authHeader, `Bearer ${MOCK_KEY}`, 'Bearer auth on voice_clone');
+    t.eq(cl.groupId, MOCK_GROUP, 'GroupId in query on voice_clone');
+    t.eq((cl.body || {}).file_id, fileId, 'voice_clone body carries file_id');
+    t.eq((cl.body || {}).voice_id, 'CaptainVoice1', 'voice_clone body carries voice_id');
+    t.ok(!('text' in (cl.body || {})) && !('model' in (cl.body || {})), 'no text/model preview field (avoids burning credits)');
+
+    // cloneVoice() = upload + register in one call.
+    const rest2 = await startMockMinimaxRest({ fileId: 'file-xyz-9' });
+    try {
+      const v = await cloneVoice({
+        apiKey: MOCK_KEY, groupId: MOCK_GROUP, baseUrl: rest2.baseUrl,
+        fileBytes: new Uint8Array(audio), fileName: 'c.wav', voiceId: 'MyOwnVoice42',
+      });
+      t.eq(v, 'MyOwnVoice42', 'cloneVoice() runs the full upload->register flow');
+      t.eq((rest2.observed.clone!.body || {}).file_id, 'file-xyz-9', 'second flow used its own file_id');
+    } finally { await rest2.close(); }
+  } finally {
+    await rest.close();
+  }
+});
+
+// voice_id validation + a MiniMax base_resp error (bad GroupId / auth) surfaces, never silently.
+await reporter.leg('voice clone — voice_id rules + base_resp error surfaced', async (t) => {
+  t.ok(isValidVoiceId('CaptainVoice1'), 'valid: letter-start, >=8, alphanumeric');
+  t.ok(isValidVoiceId('test1234'), 'valid: test1234');
+  t.ok(!isValidVoiceId('1captain9'), 'invalid: must start with a letter');
+  t.ok(!isValidVoiceId('Cap1'), 'invalid: too short (<8)');
+  t.ok(!isValidVoiceId('Captain Voice1'), 'invalid: no spaces/symbols');
+  t.eq(INTL_REST_BASE, 'https://api.minimax.io', 'INTERNATIONAL REST host (api.minimax.io, not minimaxi.com)');
+
+  const rest = await startMockMinimaxRest({ failWith: { status_code: 1004, status_msg: 'invalid api key/GroupId' } });
+  try {
+    let threw = '';
+    try {
+      await uploadReferenceAudio({
+        apiKey: 'bad', groupId: 'bad', baseUrl: rest.baseUrl,
+        fileBytes: new Uint8Array(Buffer.from('x'.repeat(64))), fileName: 'c.mp3',
+      });
+    } catch (e) { threw = (e as Error).message; }
+    t.ok(/1004/.test(threw), 'a non-zero base_resp.status_code throws (auth/GroupId error surfaced)', threw);
+  } finally {
+    await rest.close();
+  }
+  // registerVoiceClone rejects a bad voice_id BEFORE any network call.
+  let vErr = '';
+  try {
+    await registerVoiceClone({ apiKey: MOCK_KEY, fileId: 'f1', voiceId: 'bad', baseUrl: 'http://127.0.0.1:1' });
+  } catch (e) { vErr = (e as Error).message; }
+  t.ok(/invalid voice_id/.test(vErr), 'registerVoiceClone validates voice_id before calling out', vErr);
+});
+
+// The cloned voice_id must flow from secrets -> the live MiniMax WS client's voice_setting.
+await reporter.leg('voice clone — MINIMAX_VOICE_ID flows into the synth voice_setting', async (t) => {
+  // secrets -> minimaxVoiceId()
+  t.eq(minimaxVoiceId({ MINIMAX_VOICE_ID: 'CaptainVoice1' }), 'CaptainVoice1', 'secrets.MINIMAX_VOICE_ID -> cloned voice');
+  t.eq(minimaxVoiceId({}), undefined, 'no MINIMAX_VOICE_ID -> undefined (falls back to default voice)');
+
+  // The WS client actually sends it in task_start.voice_setting.voice_id.
+  const mock = await startMockMinimax();
+  try {
+    await synthStreaming({
+      apiKey: MOCK_KEY, groupId: MOCK_GROUP, voiceId: 'CaptainVoice1',
+      textChunks: ['speak in my own voice'], endpoint: mock.endpoint, timeoutMs: 8000,
+    });
+    t.eq(mock.observed.voiceId, 'CaptainVoice1', 'cloned voice_id reaches MiniMax voice_setting');
+  } finally { await mock.close(); }
+
+  // Omitting voiceId falls back to the default system voice (no accidental blank).
+  const mock2 = await startMockMinimax();
+  try {
+    await synthStreaming({
+      apiKey: MOCK_KEY, groupId: MOCK_GROUP,
+      textChunks: ['default voice'], endpoint: mock2.endpoint, timeoutMs: 8000,
+    });
+    t.eq(mock2.observed.voiceId, 'male-qn-qingse', 'no voiceId -> DEFAULT_VOICE_ID');
+  } finally { await mock2.close(); }
 });
 
 // ─────────────────── leg 5: full e2e pipeline (mock) ────────────────────────
@@ -1510,6 +1623,36 @@ if (LIVE) {
     }
   });
 
+  // Live MiniMax REST auth probe — confirms the API key + GroupId are valid WITHOUT
+  // spending credits or creating a clone: a read-only POST /v1/get_voice (lists voices).
+  // This is the same auth surface the clone pipeline uses (Bearer + GroupId-in-query),
+  // so a green probe means `npm run clone-voice` will authenticate. PENDING (never red)
+  // when creds are absent or the account/GroupId is not yet paired.
+  await reporter.leg('live — MiniMax REST auth probe (get_voice, no credits)', async (t) => {
+    if (!hasMinimaxCreds(secrets)) {
+      t.pending('MINIMAX_API_KEY not in secrets.env — add it to probe REST auth');
+      return;
+    }
+    try {
+      const url = `https://api.minimax.io/v1/get_voice?GroupId=${encodeURIComponent(secrets.MINIMAX_GROUP_ID || '')}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${secrets.MINIMAX_API_KEY!}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ voice_type: 'all' }),
+      });
+      const data = (await res.json()) as { base_resp?: { status_code?: number; status_msg?: string } };
+      const code = data.base_resp?.status_code;
+      if (code && code !== 0) {
+        t.pending(`MiniMax auth/GroupId not paired (base_resp ${code}: ${data.base_resp?.status_msg}) — fix before cloning`);
+        return;
+      }
+      t.ok(res.ok, 'get_voice reachable', `HTTP ${res.status}`);
+      t.ok(!code || code === 0, 'API key + GroupId authenticate (status_code 0) — clone pipeline will work');
+    } catch (e) {
+      t.pending('REST transport blocker (egress/TLS) — ' + (e as Error).message);
+    }
+  });
+
   // Live speakability — sanity-check the REAL LLM stays screen-safe (tolerant).
   await reporter.leg('live — speakability real backend (screen-safe)', async (t) => {
     const apiKey = has(secrets, 'ANTHROPIC_API_KEY') ? secrets.ANTHROPIC_API_KEY! : null;
@@ -1568,6 +1711,7 @@ if (LIVE) {
   });
 } else {
   reporter.skip('live — MiniMax real WS', 'run `npm run validate:live` with creds in secrets.env');
+  reporter.skip('live — MiniMax REST auth probe (get_voice)', 'run `npm run validate:live` with creds in secrets.env');
   reporter.skip('live — speakability real backend', 'run `npm run validate:live` with creds in secrets.env');
   reporter.skip('live — Gemini drift fixtures', 'run `npm run validate:live` with GEMINI_API_KEY in secrets.env');
 }
