@@ -69,6 +69,23 @@ import {
   bookkeeping, SAMPLE_AGENT_TURN, CONFIRM_TURN, LONG_CODE_TURN,
   DRIFT_FIXTURES, MULTI_ASK_REPLY, OPTIONS_REPLY,
 } from './harness/fixtures.ts';
+// Call Mode (Twilio phone leg) + the verbatim web transcript.
+import {
+  linearToMulawSample, mulawToLinearSample, pcmS16leToMulaw, mulawToPcmS16le,
+  pcmChunkToPhoneMulaw, phoneMulawToWhisperPcm, upsampleFloat32, frameRms,
+  UtteranceDetector, PHONE_SAMPLE_RATE,
+} from '../src/server/phone-audio.ts';
+import {
+  twimlConnectStream, twilioSignature, validateTwilioSignature, sameNumber, placeCall,
+} from '../src/server/twilio.ts';
+import {
+  createPhoneApp, digitsFromSpoken, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
+  PHONE_WS_PATH, PHONE_TWIML_PATH, type PhoneTimers,
+} from '../src/server/phone.ts';
+import { TurnRunner } from '../src/server/turns.ts';
+import { makeTranscriptVerbatim } from '../src/server/verbatim.ts';
+import { phoneSecrets, phoneCapabilities, type PhoneSecrets } from '../src/config/secrets.ts';
+import { splitFencedSegments, extractPrompt } from '../src/web/prompt-card.js';
 
 const LIVE = process.argv.includes('--live');
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -1591,6 +1608,690 @@ await reporter.leg('mobile — REAL audio e2e: reply → speakify → piper TTS 
   const heard = (await transcriber.transcribe(synth.pcm, synth.sampleRate)).toLowerCase();
   t.ok(heard.length > 0, 'whisper transcribed the generated speech', JSON.stringify(heard));
   t.ok(/merge/.test(heard), 'the spoken decision word "merge" round-trips through real audio', JSON.stringify(heard));
+});
+
+// ═══════════════ CALL MODE (Twilio phone leg) + verbatim transcript ══════════
+// The phone transport is proven with a MOCK Media Streams client - no Twilio
+// account, no network. The mock speaks Twilio's real wire protocol (start/media/
+// dtmf/mark/stop frames, 8 kHz mu-law base64 payloads with no header bytes) at the
+// real WS endpoint mounted by createWebApp, against the in-memory driver.
+
+const PHONE_TEST_SECRETS: PhoneSecrets = {
+  accountSid: 'ACtest000000000000000000000000000',
+  authToken: 'test-auth-token',
+  phoneNumber: '+15559998888',
+  allowedCaller: '+15550001111',
+  pin: '4321',
+};
+const PHONE_PUBLIC_URL = 'https://ceo-chat.acb-apps.com';
+const PHONE_TWIML_URL = PHONE_PUBLIC_URL + PHONE_TWIML_PATH;
+
+const until = async (cond: () => boolean, ms = 6000): Promise<boolean> => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (cond()) return true;
+    await realSleep(20);
+  }
+  return cond();
+};
+
+// One 20ms speech frame (160 samples @8k, loud sine - rms well above the VAD gate)
+// and one silence frame, as s16le PCM.
+function speechFramePcm(): Buffer {
+  const b = Buffer.alloc(320);
+  for (let i = 0; i < 160; i++) b.writeInt16LE(Math.round(Math.sin(i / 3) * 8000), i * 2);
+  return b;
+}
+const silenceFramePcm = (): Buffer => Buffer.alloc(320);
+const asMediaFrame = (pcm: Buffer): string =>
+  JSON.stringify({ event: 'media', media: { payload: Buffer.from(pcmS16leToMulaw(pcm)).toString('base64') } });
+
+interface PhoneWsClient {
+  ws: InstanceType<typeof WsClient>;
+  out: Array<Record<string, unknown>>;
+  mediaPayloads: string[];
+  closed: boolean;
+  send: (obj: unknown) => void;
+  speakUtterance: () => void;
+  close: () => void;
+}
+
+// A mock Twilio Media Streams client. echoMarks mirrors what Twilio does: it sends
+// a `mark` event back once the named audio finished playing (here: immediately).
+function connectPhoneClient(port: number, { echoMarks = true } = {}): Promise<PhoneWsClient> {
+  return new Promise((resolve, reject) => {
+    const ws = new WsClient(`ws://127.0.0.1:${port}${PHONE_WS_PATH}`);
+    const client: PhoneWsClient = {
+      ws, out: [], mediaPayloads: [], closed: false,
+      send: (obj) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); },
+      speakUtterance: () => {
+        for (let i = 0; i < 10; i++) ws.send(asMediaFrame(speechFramePcm()));
+        for (let i = 0; i < 30; i++) ws.send(asMediaFrame(silenceFramePcm()));
+      },
+      close: () => { try { ws.close(); } catch { /* ignore */ } },
+    };
+    ws.on('open', () => resolve(client));
+    ws.on('close', () => { client.closed = true; });
+    ws.on('error', (e: Error) => reject(e));
+    ws.on('message', (raw: Buffer) => {
+      let m: Record<string, unknown>;
+      try { m = JSON.parse(raw.toString()) as Record<string, unknown>; } catch { return; }
+      client.out.push(m);
+      if (m.type === undefined && m.event === 'media') {
+        client.mediaPayloads.push(((m.media as { payload?: string })?.payload) || '');
+      }
+      if (echoMarks && m.event === 'mark') {
+        client.send({ event: 'mark', streamSid: m.streamSid, mark: m.mark });
+      }
+    });
+  });
+}
+
+// POST the Twilio voice webhook with a VALID signature and return the response.
+async function postTwiml(baseUrl: string, params: Record<string, string>, sign = true): Promise<{ status: number; body: string }> {
+  const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
+  if (sign) headers['x-twilio-signature'] = twilioSignature(PHONE_TEST_SECRETS.authToken!, PHONE_TWIML_URL, params);
+  const res = await fetch(baseUrl.replace(/\/$/, '') + PHONE_TWIML_PATH, {
+    method: 'POST', headers, body: new URLSearchParams(params).toString(),
+  });
+  return { status: res.status, body: await res.text() };
+}
+
+const tokenFromTwiml = (xml: string): string =>
+  (/name="token" value="([0-9a-f]+)"/.exec(xml) || [])[1] || '';
+
+// P1 - the pure wire transcode: G.711 mu-law both ways, no header bytes, the
+// 8 kHz downconvert for outbound chunks, the 16 kHz upconvert for whisper.
+await reporter.leg('phone - mu-law codec + 8 kHz transcode (Twilio wire format)', (t) => {
+  t.eq(linearToMulawSample(0), 0xff, 'G.711: linear 0 encodes to 0xFF');
+  t.eq(mulawToLinearSample(0xff), 0, 'G.711: 0xFF decodes back to 0');
+  // round-trip stays within mu-law quantization (relative error on loud samples)
+  let worst = 0;
+  for (const s of [-32000, -12345, -700, -80, 0, 80, 700, 12345, 32000]) {
+    const back = mulawToLinearSample(linearToMulawSample(s));
+    const err = Math.abs(back - s) / Math.max(64, Math.abs(s));
+    worst = Math.max(worst, err);
+  }
+  t.ok(worst < 0.13, 'mu-law round-trip within quantization tolerance', `worst rel err ${(worst * 100).toFixed(1)}%`);
+
+  const pcm = speechFramePcm();
+  const mulaw = pcmS16leToMulaw(pcm);
+  t.eq(mulaw.length, pcm.length / 2, 'mu-law is 8-bit: HALF the s16le byte count (no header bytes)');
+  t.eq(mulawToPcmS16le(mulaw).length, pcm.length, 'decode restores the s16le byte count');
+
+  // outbound: a 100ms piper-rate chunk -> 8 kHz mu-law payload bytes
+  const chunk = Buffer.alloc(2205 * 2); // 100ms @ 22050
+  for (let i = 0; i < 2205; i++) chunk.writeInt16LE(Math.round(Math.sin(i / 9) * 9000), i * 2);
+  const wire = pcmChunkToPhoneMulaw(chunk, 22050);
+  t.ok(Math.abs(wire.length - 800) <= 4, '100ms @22.05k downconverts to ~800 mu-law bytes @8k', `${wire.length}`);
+  t.ok(frameRms(new Int16Array(mulawToPcmS16le(wire).buffer)) > 500, 'the transcoded audio still carries the signal energy');
+
+  // inbound: 8 kHz phone audio -> 16 kHz for whisper (its resampler never upsamples)
+  const up = phoneMulawToWhisperPcm(mulaw);
+  t.eq(up.sampleRate, 16000, 'whisper feed is tagged 16 kHz');
+  t.ok(Math.abs(up.pcm.length - pcm.length * 2) <= 4, '8k->16k doubles the frame count', `${up.pcm.length}`);
+  t.eq(upsampleFloat32(new Float32Array(100), 16000, 16000).length, 100, 'equal-rate upsample is a no-op');
+  t.eq(PHONE_SAMPLE_RATE, 8000, 'the wire rate constant is 8000 Hz');
+
+  // the deterministic utterance detector (frame-count endpointing + barge-in)
+  const utterances: number[] = [];
+  let barges = 0;
+  const det = new UtteranceDetector({
+    onUtterance: (u) => utterances.push(u.length),
+    onBargeIn: () => barges++,
+  });
+  for (let i = 0; i < 20; i++) det.feed(silenceFramePcm());
+  t.eq(utterances.length, 0, 'pure silence never emits an utterance');
+  for (let i = 0; i < 10; i++) det.feed(speechFramePcm());
+  for (let i = 0; i < 30; i++) det.feed(silenceFramePcm());
+  t.eq(utterances.length, 1, 'speech followed by 500ms silence emits ONE utterance');
+  t.ok(utterances[0]! >= 10 * 320, 'the utterance carries the speech frames (with pre-roll)', `${utterances[0]} bytes`);
+  for (let i = 0; i < 3; i++) det.feed(speechFramePcm());
+  for (let i = 0; i < 30; i++) det.feed(silenceFramePcm());
+  t.eq(utterances.length, 1, 'a too-short blip (below minSpeechFrames) is dropped as noise');
+  det.playing = true;
+  for (let i = 0; i < 12; i++) det.feed(speechFramePcm());
+  t.eq(barges, 1, 'sustained speech DURING playback fires barge-in (once per playback)');
+  t.eq(utterances.length, 1, 'barge-in speech is not ALSO collected as an utterance while playing');
+
+  // spoken PIN digits
+  t.eq(digitsFromSpoken('four three two one'), '4321', 'word digits parse ("four three two one")');
+  t.eq(digitsFromSpoken('4 3, 2 1.'), '4321', 'numeric digits parse with punctuation');
+  t.eq(digitsFromSpoken('please merge it'), '', 'non-digit speech yields no digits');
+  t.ok(sameNumber('+1 555-000-1111', '+15550001111') && !sameNumber('+15550001111', '+15550002222'), 'phone-number compare ignores formatting');
+  const caps = phoneCapabilities(PHONE_TEST_SECRETS);
+  t.ok(caps.inbound && caps.outbound, 'full secrets -> inbound + outbound capable');
+  t.ok(!phoneCapabilities(phoneSecrets({})).inbound, 'no secrets -> phone off');
+});
+
+// P2 - the TwiML webhook: caller-ID allowlist, X-Twilio-Signature validation, the
+// <Connect><Stream> bridge with a single-use stream token, and the outbound
+// "Call me" REST call (faked fetch - never a real Twilio request).
+await reporter.leg('phone - TwiML webhook: allowlist + signature + stream bridge + Call me', async (t) => {
+  const mock = await startMockMinimax();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async () => ({ reply: 'ok', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 32000, ttfbMs: null, bytes: 0 } }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // inbound call from the captain -> bridged
+    const good = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!, Direction: 'inbound' });
+    t.eq(good.status, 200, 'allowlisted caller -> 200');
+    t.includes(good.body, '<Connect><Stream url="wss://ceo-chat.acb-apps.com/phone">', 'TwiML bridges into our Media Streams WS (wss through the tunnel)');
+    t.ok(tokenFromTwiml(good.body).length === 32, 'a single-use stream token rides as a <Parameter>');
+
+    // the outbound "Call me" leg: the captain is in To, From is our own number
+    const outb = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.phoneNumber!, To: PHONE_TEST_SECRETS.allowedCaller!, Direction: 'outbound-api' });
+    t.includes(outb.body, '<Connect><Stream', 'outbound leg (captain in To) is bridged too');
+
+    // an unknown caller is REJECTED - no stream, no token
+    const bad = await postTwiml(app.url, { From: '+15667770000', To: PHONE_TEST_SECRETS.phoneNumber! });
+    t.eq(bad.status, 200, 'unknown caller answered with TwiML (not an HTTP error)');
+    t.includes(bad.body, '<Reject', 'unknown caller gets <Reject/> - the call never connects');
+    t.notIncludes(bad.body, '<Stream', 'no stream is ever offered to an unknown caller');
+
+    // a forged webhook (bad signature) can't mint a token at all
+    const forged = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! }, false);
+    t.eq(forged.status, 403, 'missing/invalid X-Twilio-Signature -> 403 (webhook authenticated)');
+
+    // signature helper sanity (the documented HMAC-SHA1 scheme)
+    const params = { From: '+15550001111', CallSid: 'CA123' };
+    const sig = twilioSignature('tok', 'https://x.example/phone/twiml', params);
+    t.ok(validateTwilioSignature('tok', 'https://x.example/phone/twiml', params, sig), 'signature validates against itself');
+    t.ok(!validateTwilioSignature('tok', 'https://x.example/phone/twiml', { ...params, From: '+1_spoofed' }, sig), 'any param change breaks the signature');
+
+    // TwiML XML escaping (a hostile parameter value can't break out of the attribute)
+    t.includes(twimlConnectStream('wss://x/phone', { a: '"<&>"' }), '&quot;&lt;&amp;&gt;&quot;', 'parameter values are XML-escaped');
+
+    // outbound "Call me" REST call - faked fetch, assert the documented request
+    let calledUrl = '';
+    let calledAuth = '';
+    let calledBody = '';
+    const fakeFetch = (async (url: string, init: { headers: Record<string, string>; body: string }) => {
+      calledUrl = url; calledAuth = init.headers.Authorization || ''; calledBody = init.body;
+      return { ok: true, status: 201, json: async () => ({ sid: 'CAfake123' }) };
+    }) as unknown as typeof fetch;
+    const placed = await placeCall({
+      accountSid: PHONE_TEST_SECRETS.accountSid!, authToken: PHONE_TEST_SECRETS.authToken!,
+      from: PHONE_TEST_SECRETS.phoneNumber!, to: PHONE_TEST_SECRETS.allowedCaller!,
+      twimlUrl: PHONE_TWIML_URL, fetchImpl: fakeFetch,
+    });
+    t.ok(placed.ok && placed.detail === 'CAfake123', '"Call me" returns the Twilio Call SID');
+    t.includes(calledUrl, `/2010-04-01/Accounts/${PHONE_TEST_SECRETS.accountSid}/Calls.json`, 'POSTs the documented Calls.json endpoint');
+    t.includes(calledAuth, 'Basic ', 'HTTP Basic auth (sid:token)');
+    const sent = new URLSearchParams(calledBody);
+    t.eq(sent.get('To'), PHONE_TEST_SECRETS.allowedCaller!, 'rings the captain (To = allowlisted caller)');
+    t.eq(sent.get('From'), PHONE_TEST_SECRETS.phoneNumber!, 'from our Twilio number');
+    t.eq(sent.get('Url'), PHONE_TWIML_URL, 'the answered call fetches OUR TwiML webhook');
+
+    // a client hello advertises the Call me availability
+    const hello = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const c = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { c.close(); reject(new Error('hello timed out')); }, 5000);
+      c.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (m.type === 'hello') { clearTimeout(timer); c.close(); resolve(m); }
+      });
+      c.on('error', reject);
+    });
+    t.eq(hello.phone, true, 'hello advertises the outbound "Call me" capability');
+  } finally {
+    await app.close();
+    await mock.close();
+  }
+});
+
+// P3 - the Media Streams bridge end-to-end over the REAL phone WS: the stream
+// token, the PIN gate (NOTHING reaches the driver until it passes), spoken-PIN,
+// STT -> TurnRunner.run, and onChunk -> media+mark framing whose payload decodes
+// back to the pipeline audio at 8 kHz.
+await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; media+mark framing', async (t) => {
+  const sends: string[] = [];
+  const spoken: string[] = [];
+  const heard = ['four three two one', 'run the checks'];
+  const CHUNK_SAMPLES = 2205; // 100ms @ 22050
+  const chunkPcm = Buffer.alloc(CHUNK_SAMPLES * 2);
+  for (let i = 0; i < CHUNK_SAMPLES; i++) chunkPcm.writeInt16LE(Math.round(Math.sin(i / 9) * 9000), i * 2);
+
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 22050 }),
+    start: async () => {},
+    send: async (text, _i, hooks) => {
+      sends.push(text);
+      hooks.onChunk?.({ index: 0, narration: 'Checks are running.', speakBackend: 'mock', pcm: chunkPcm, sampleRate: 22050 });
+      return {
+        reply: 'Checks are running now.', narration: 'Checks are running.', speakBackend: 'mock',
+        audio: { pcm: chunkPcm, sampleRate: 22050, ttfbMs: 5, bytes: chunkPcm.length }, chunks: 1,
+      };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner,
+    secrets: PHONE_TEST_SECRETS,
+    publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: silenceFramePcm(), sampleRate: 8000 }; },
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // a direct WS hit WITHOUT a webhook-minted token is closed before anything runs
+    const intruder = await connectPhoneClient(app.port);
+    intruder.send({ event: 'start', start: { streamSid: 'MZbad', customParameters: { token: 'deadbeef'.repeat(4) } } });
+    t.ok(await until(() => intruder.closed), 'a stream start with a forged token is CLOSED immediately');
+    t.eq(sends.length, 0, 'no injection from the refused stream');
+
+    // the real path: webhook mints the token, the stream presents it
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const token = tokenFromTwiml(twiml.body);
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZtest1', callSid: 'CAtest1', customParameters: { token } } });
+    t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinPrompt)), 'the call is greeted with the PIN prompt (before any injection)');
+
+    // wrong DTMF PIN -> retry prompt, still NO injection
+    for (const d of '9999') call.send({ event: 'dtmf', dtmf: { digit: d } });
+    t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinRetry)), 'a wrong DTMF PIN is refused (retry prompt)');
+    t.eq(sends.length, 0, 'REGRESSION GUARD: no Broker.send before a valid PIN');
+
+    // spoken PIN ("four three two one") -> authenticated
+    call.speakUtterance();
+    t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the SPOKEN pin ("four three two one") authenticates the call');
+    t.eq(sends.length, 0, 'the PIN utterance itself is never injected');
+
+    // now a real command: utterance -> whisper stub -> TurnRunner -> driver.send
+    await realSleep(100); // let the greeting's mark echo settle half-duplex
+    call.mediaPayloads.length = 0;
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 1), 'the transcribed utterance reaches the pipeline (STT -> send)');
+    t.eq(sends[0], 'run the checks', 'the exact transcribed text is injected');
+
+    // the reply chunk comes back as media frames + a mark, 8 kHz mu-law, no header
+    t.ok(await until(() => call.out.some((m) => m.event === 'mark' && (m.mark as { name?: string })?.name?.startsWith('m'))), 'a named mark follows the reply audio');
+    const replyMulaw = Buffer.concat(call.mediaPayloads.filter(Boolean).map((p) => Buffer.from(p, 'base64')));
+    const expected = Math.round(CHUNK_SAMPLES * 8000 / 22050);
+    t.ok(Math.abs(replyMulaw.length - expected) <= 8, 'payload bytes = the chunk downconverted to 8 kHz mu-law (no header bytes)', `${replyMulaw.length} vs ~${expected}`);
+    const replyPcm8k = mulawToPcmS16le(replyMulaw);
+    t.ok(frameRms(new Int16Array(replyPcm8k.buffer, 0, replyPcm8k.length >> 1)) > 500, 'decoded payload carries the chunk audio energy (round-trips)');
+    const mediaIdx = call.out.findIndex((m) => m.event === 'media' && call.mediaPayloads.length > 0);
+    const markIdx = call.out.findIndex((m) => m.event === 'mark' && (m.mark as { name?: string })?.name?.startsWith('m'));
+    t.ok(mediaIdx >= 0 && markIdx > mediaIdx, 'media frames are sent BEFORE their mark');
+    const anyOut = call.out.find((m) => m.event === 'media') as { streamSid?: string } | undefined;
+    t.eq(anyOut?.streamSid, 'MZtest1', 'outbound frames carry the streamSid from start');
+
+    // the phone-initiated turn ALSO reached the web transcript (companion screen)
+    const webFrames: Record<string, unknown>[] = [];
+    const web = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+    web.on('message', (raw: Buffer) => webFrames.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+    await until(() => webFrames.some((m) => m.type === 'sent'));
+    const sentFrame = webFrames.find((m) => m.type === 'sent') as { text?: string; source?: string } | undefined;
+    t.eq(sentFrame?.text, 'run the checks', 'the phone turn is replayed into the web transcript');
+    t.eq(sentFrame?.source, 'phone', 'labelled as spoken on the call');
+    web.close();
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// P4 - barge-in and hangup: sustained captain speech while first mate talks sends
+// Twilio `clear` (flush the buffered audio) AND aborts the in-flight turn; a `stop`
+// frame (hangup) aborts it too. The driver observes signal.aborted for real.
+await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the turn', async (t) => {
+  const sends: string[] = [];
+  let sawAborted = 0;
+  const chunk = speechFramePcm();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    // A long-running turn: emits one chunk, then keeps "streaming" until aborted.
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      sends.push(text);
+      hooks.onChunk?.({ index: 0, narration: 'Working on it.', speakBackend: 'mock', pcm: chunk, sampleRate: 8000 });
+      const timer = setInterval(() => {
+        if (hooks.signal?.aborted) {
+          clearInterval(timer);
+          sawAborted++;
+          resolve({ reply: '', narration: '', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 1 });
+        }
+      }, 20);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const heard = ['4321', 'start the deploy build', '4321', 'summarize the logs'];
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // ---- call 1: barge-in. The client does NOT echo marks, so the reply audio is
+    // "still playing" when the captain starts talking over it.
+    const twiml1 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call1 = await connectPhoneClient(app.port, { echoMarks: false });
+    call1.send({ event: 'start', start: { streamSid: 'MZbarge', customParameters: { token: tokenFromTwiml(twiml1.body) } } });
+    call1.speakUtterance(); // spoken PIN "4321"
+    call1.speakUtterance(); // the command -> long turn starts
+    t.ok(await until(() => sends.length === 1), 'the command started a turn');
+    t.ok(await until(() => call1.out.some((m) => m.event === 'mark')), 'reply audio is on the wire (unacked mark = still playing)');
+    // the captain talks over it: sustained speech during playback (raw frames -
+    // asMediaFrame is already the encoded wire message)
+    for (let i = 0; i < 14; i++) call1.ws.send(asMediaFrame(speechFramePcm()));
+    t.ok(await until(() => call1.out.some((m) => m.event === 'clear')), 'barge-in sends Twilio `clear` (flush buffered audio)');
+    t.ok(await until(() => sawAborted === 1), 'barge-in aborts the in-flight turn (driver saw signal.aborted)');
+    call1.close();
+    t.ok(await until(() => !runner.busy), 'the aborted turn settles');
+
+    // ---- call 2: hangup mid-turn. Twilio sends `stop` when the caller hangs up.
+    const twiml2 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call2 = await connectPhoneClient(app.port);
+    call2.send({ event: 'start', start: { streamSid: 'MZhang', customParameters: { token: tokenFromTwiml(twiml2.body) } } });
+    call2.speakUtterance(); // PIN
+    await until(() => heard.length === 1);
+    call2.speakUtterance(); // command -> long turn
+    t.ok(await until(() => sends.length === 2), 'the second call started its own turn');
+    call2.send({ event: 'stop' });
+    t.ok(await until(() => sawAborted === 2), 'hangup (stop frame) aborts the in-flight turn');
+    call2.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// P5 - the captain-approved INTERACTIVE-PROMPT FALLBACK: an unclear spoken answer
+// to a consequential prompt is RE-ASKED once; still unclear (or pure silence, via
+// the answer timer) -> a safe default that takes NO consequential action. The
+// safe default is a small config (PromptPolicy) - 'send-cancel' is the one-line
+// change, asserted here too. Silence can NEVER approve.
+await reporter.leg('phone - interactive prompt: re-ask once, then the safe default (never approve)', async (t) => {
+  const mkRig = async (policy: Partial<typeof DEFAULT_PROMPT_POLICY>, heardScript: string[], timers?: PhoneTimers) => {
+    const sends: string[] = [];
+    const spoken: string[] = [];
+    const heard = [...heardScript];
+    const driver: Driver = {
+      meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+      start: async () => {},
+      send: async (text) => {
+        sends.push(text);
+        const narration = text === 'cancel' ? 'Cancelled.' : 'Want me to merge and deploy it?';
+        return { reply: narration, narration, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+      },
+      terminalSnapshot: () => 'ceo-chat',
+      stop: async () => {},
+    };
+    const runner = new TurnRunner({ driver });
+    const phone = createPhoneApp({
+      runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+      transcribe: async () => heard.shift() ?? '',
+      synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
+      promptPolicy: policy,
+      timers,
+      log: () => {},
+    });
+    const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZprompt', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+    return { sends, spoken, call, app, runner };
+  };
+
+  // ---- rig A (default policy = no-action): two unclear spoken answers
+  const a = await mkRig({}, ['ship the release', 'umm banana maybe', 'still just mumbling here']);
+  try {
+    a.call.speakUtterance(); // the command -> consequential question turn
+    t.ok(await until(() => a.sends.length === 1 && !a.runner.busy), 'turn 1 ran and awaits a consequential answer');
+    t.ok(a.runner.awaitingConfirmation, 'the runner is awaiting confirmation (narration asked)');
+    a.call.speakUtterance(); // "umm banana maybe" - unclear
+    t.ok(await until(() => a.spoken.includes(DEFAULT_PROMPT_POLICY.reAskText)), 'an UNCLEAR spoken answer is RE-ASKED (not sent, not approved)');
+    t.eq(a.sends.length, 1, 'the unclear answer was NOT injected');
+    a.call.speakUtterance(); // still unclear -> past the re-ask budget
+    t.ok(await until(() => a.spoken.includes(DEFAULT_PROMPT_POLICY.giveUpTextNoAction)), 'a second unclear answer hits the SAFE DEFAULT (announced)');
+    await realSleep(150);
+    t.eq(a.sends.length, 1, 'safe default = NO consequential action: nothing was injected on silence/mumbling');
+    a.call.close();
+  } finally {
+    await a.app.close();
+  }
+
+  // ---- rig B (config flip: onUnresolved 'send-cancel') driven by the ANSWER TIMER
+  // (pure silence, no utterances at all) - manual timers make it deterministic.
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const fireAnswerTimer = (): boolean => {
+    const i = pending.findIndex((p) => p.ms === DEFAULT_PROMPT_POLICY.answerTimeoutMs);
+    if (i < 0) return false;
+    const [h] = pending.splice(i, 1);
+    h!.fn();
+    return true;
+  };
+  const b = await mkRig({ onUnresolved: 'send-cancel' }, ['ship the release'], manualTimers);
+  try {
+    b.call.speakUtterance();
+    t.ok(await until(() => b.sends.length === 1 && !b.runner.busy), 'turn 1 ran (send-cancel rig)');
+    t.ok(await until(() => fireAnswerTimer()), 'the answer timer was armed after the consequential turn');
+    t.ok(await until(() => b.spoken.includes(DEFAULT_PROMPT_POLICY.reAskText)), 'SILENCE past the window -> re-ask once');
+    t.ok(fireAnswerTimer(), 'the re-ask re-armed the timer');
+    t.ok(await until(() => b.spoken.includes(DEFAULT_PROMPT_POLICY.giveUpTextCancel)), 'still silent -> the configured safe default announces the cancel');
+    t.ok(await until(() => b.sends.length === 2 && b.sends[1] === 'cancel'), "config 'send-cancel' injects an explicit cancel - NEVER an approval");
+    b.call.close();
+  } finally {
+    await b.app.close();
+  }
+});
+
+// V1 - the 1:1 VERBATIM transcript, byte-exact. The tap streams the exact assistant
+// text (code fences, odd whitespace and all) while the reply grows, and the final
+// read equals the session transcript text byte-for-byte.
+await reporter.leg('web - verbatim transcript: live streaming + BYTE-EXACT final text', async (t) => {
+  const SAY_1 = 'Here is the config, captain - two things stand out.';
+  const SAY_2 = 'The relevant section:\n\n```yaml\nserver:\n  host: 0.0.0.0   # note the double-space indents\n  port: 8420\n```\n\nWant me to tighten the host binding?';
+  const EXPECTED = SAY_1 + '\n\n' + SAY_2;
+
+  // ---- the pure tap over a real JSONL fixture
+  const dir = mkdtempSync(join(tmpdir(), 'ceochat-verbatim-'));
+  try {
+    const file = join(dir, 'session.jsonl');
+    const PROMPT = 'show me the server config';
+    const t0 = new Date(Date.now() - 1000).toISOString();
+    writeFileSync(file, userPrompt(PROMPT, new Date().toISOString()) + '\n' + assistantSay(SAY_1, new Date().toISOString()) + '\n');
+    const tap = makeTranscriptVerbatim({ resolveProjectDir: () => dir, pollMs: 20 });
+    const growth: string[] = [];
+    const handle = tap({ prompt: PROMPT, afterTs: t0, onText: (text) => growth.push(text) });
+    await until(() => growth.length >= 1);
+    appendFileSync(file, assistantSay(SAY_2, new Date().toISOString()) + '\n');
+    await until(() => growth.length >= 2);
+    const final = handle.stop();
+    t.eq(growth[0], SAY_1, 'the tap streams the first say while the turn is still running');
+    t.ok(growth.length >= 2, 'the verbatim text GROWS live as says append', `${growth.length} snapshots`);
+    t.ok(Object.is(final, EXPECTED), 'BYTE-EXACT: the final verbatim equals the transcript says exactly (fences, spaces, newlines)');
+    t.includes(final, '  host: 0.0.0.0   # note the double-space indents', 'inner code whitespace is untouched');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // ---- the same guarantee over the REAL web WS: a driver that appends to a live
+  // JSONL while "replying"; the browser receives progressive `verbatim` frames and
+  // a final:true frame that is byte-exact.
+  const dir2 = mkdtempSync(join(tmpdir(), 'ceochat-verbatim-ws-'));
+  const file2 = join(dir2, 'session.jsonl');
+  writeFileSync(file2, '');
+  const mock = await startMockMinimax();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async (text) => {
+      appendFileSync(file2, userPrompt(text, new Date().toISOString()) + '\n');
+      appendFileSync(file2, assistantSay(SAY_1, new Date().toISOString()) + '\n');
+      await realSleep(150); // let the tap emit a mid-turn snapshot
+      appendFileSync(file2, assistantSay(SAY_2, new Date().toISOString()) + '\n');
+      await realSleep(150);
+      const r = await synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: ['done'], endpoint: mock.endpoint, timeoutMs: 8000 });
+      // NOTE: reply is the pipeline's whitespace-NORMALIZED text - the verbatim tap
+      // must win over it for the byte-exact final frame.
+      return { reply: (SAY_1 + ' ' + SAY_2).replace(/\s+/g, ' '), narration: 'Config is up. Want me to tighten it?', speakBackend: 'mock', audio: { pcm: r.pcm, sampleRate: r.sampleRate, ttfbMs: r.ttfbMs, bytes: r.pcm.length }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const app = await createWebApp({
+    driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {},
+    verbatim: makeTranscriptVerbatim({ resolveProjectDir: () => dir2, pollMs: 20 }),
+  });
+  try {
+    const frames: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const c = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { c.close(); reject(new Error('verbatim WS timed out')); }, 12000);
+      let sent = false;
+      c.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        frames.push(m);
+        if (m.type === 'hello' && !sent) { sent = true; c.send(JSON.stringify({ type: 'send', text: 'show me the server config' })); }
+        if (m.type === 'turn-done') { clearTimeout(timer); c.close(); resolve(); }
+      });
+      c.on('error', reject);
+    });
+    const verbatims = frames.filter((m) => m.type === 'verbatim');
+    t.ok(verbatims.some((m) => !m.final), 'verbatim frames stream DURING the turn (live 1:1 view)');
+    const finalFrame = verbatims.find((m) => m.final === true) as { text?: string } | undefined;
+    t.ok(!!finalFrame, 'a final verbatim frame closes the turn');
+    t.ok(Object.is(finalFrame?.text, EXPECTED), 'BYTE-EXACT over the WS: final verbatim == the exact session reply text');
+    t.notIncludes((frames.find((m) => m.type === 'reply') as { text?: string })?.text || '', '\n', 'control: the legacy reply frame is whitespace-normalized (verbatim is the exact one)');
+  } finally {
+    await app.close();
+    await mock.close();
+    rmSync(dir2, { recursive: true, force: true });
+  }
+});
+
+// V2 - the iPhone UI building blocks: lossless fenced-segment rendering, the
+// tappable answer card, the installable-PWA static surface, and reconnect resume
+// (multi-turn history replay + the shared `sent` echo).
+await reporter.leg('web - iPhone UI: lossless segments, answer card, PWA assets, reconnect resume', async (t) => {
+  // splitFencedSegments is LOSSLESS - the rendered characters ARE the reply text.
+  const tricky = [
+    'plain only',
+    'before\n```js\nconst a = 1;\n```\nafter',
+    '```sh\nnpm test\n```',
+    'stream cut mid-fence\n```py\nprint("hi")',
+    'two\n```a\n1\n```\nmid\n```b\n2\n```\n',
+    '',
+  ];
+  for (const input of tricky) {
+    const segs = splitFencedSegments(input);
+    t.ok(Object.is(segs.map((s) => s.text).join(''), input), `segments reconstruct byte-exact (${JSON.stringify(input.slice(0, 24))}…)`);
+  }
+  const withCode = splitFencedSegments(tricky[1]!);
+  t.ok(withCode.some((s) => s.kind === 'code' && s.text.includes('const a = 1;')), 'the fenced block renders as a code segment (scrollable container)');
+  t.ok(splitFencedSegments(tricky[3]!).some((s) => s.kind === 'code'), 'an unterminated fence (still streaming) renders as code, not plain');
+
+  // the tappable answer card
+  const card = extractPrompt(OPTIONS_REPLY);
+  t.ok(!!card, 'an options reply yields an answer card');
+  t.ok((card?.options.length ?? 0) >= 3, 'each numbered option becomes a tappable button', `${card?.options.length}`);
+  t.eq(card?.options[0]?.send, '1', 'tapping option 1 submits "1" (same as speaking it)');
+  t.includes(card?.question || '', '?', 'the card shows the verbatim closing question');
+  const yesno = extractPrompt('All tests pass.\n\nShould I proceed with the deploy?');
+  t.ok(!!yesno && yesno.options.some((o) => o.send === 'yes') && yesno.options.some((o) => o.send === 'no'), 'a yes/no question gets Yes and No buttons');
+  t.eq(extractPrompt('Deployed. All done, no action needed.'), null, 'a statement turn pins no card');
+
+  // installable PWA static surface (Add to Home Screen)
+  const mock = await startMockMinimax();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 32000 }),
+    start: async () => {},
+    send: async (text, _i, hooks) => {
+      const r = await runPipeline(text, {
+        inject: async () => {}, readReply: async () => SAMPLE_AGENT_TURN,
+        speakify: (s) => speakify(s, { backend: 'mock' }),
+        synth: (chunks) => synthStreaming({ apiKey: MOCK_KEY, groupId: MOCK_GROUP, textChunks: chunks, endpoint: mock.endpoint, timeoutMs: 8000 }),
+        onStage: hooks.onStage,
+      });
+      return { reply: r.reply, narration: r.narration, speakBackend: r.speakBackend, audio: { pcm: r.audio.pcm, sampleRate: r.audio.sampleRate, ttfbMs: r.audio.ttfbMs, bytes: r.audio.bytes } };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const app = await createWebApp({ driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const html = await (await fetch(app.url)).text();
+    t.includes(html, 'viewport-fit=cover', 'viewport covers the notch (safe-area ready)');
+    t.includes(html, 'apple-mobile-web-app-capable', 'standalone full-screen when added to the Home Screen');
+    t.includes(html, '/manifest.webmanifest', 'the page links the web app manifest');
+    t.includes(html, '/icons/apple-touch-icon.png', 'the page links the apple-touch-icon');
+    const manifest = await fetch(app.url + 'manifest.webmanifest');
+    t.eq(manifest.status, 200, 'manifest.webmanifest is served');
+    t.includes(manifest.headers.get('content-type') || '', 'manifest+json', 'manifest served with the manifest MIME type');
+    const mf = JSON.parse(await manifest.text()) as { display?: string; icons?: unknown[] };
+    t.eq(mf.display, 'standalone', 'manifest requests a standalone (full-screen) app');
+    t.ok((mf.icons?.length ?? 0) >= 2, 'manifest carries the icon set');
+    const icon = await fetch(app.url + 'icons/apple-touch-icon.png');
+    t.eq(icon.status, 200, 'apple-touch-icon.png is served');
+    t.includes(icon.headers.get('content-type') || '', 'image/png', 'icon served as image/png');
+
+    // ---- reconnect resume: run TWO turns, then a fresh client gets the WHOLE
+    // conversation back (deduped by turn) - dead zones never lose history.
+    const runTurn = (text: string): Promise<Record<string, unknown>[]> => new Promise((resolve, reject) => {
+      const frames: Record<string, unknown>[] = [];
+      const c = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { c.close(); reject(new Error('turn WS timed out')); }, 12000);
+      let sent = false;
+      c.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        frames.push(m);
+        if (m.type === 'hello' && !sent) { sent = true; c.send(JSON.stringify({ type: 'send', text })); }
+        if (m.type === 'turn-done' && !m.replay) { clearTimeout(timer); c.close(); resolve(frames); }
+      });
+      c.on('error', reject);
+    });
+    const live1 = await runTurn('first question');
+    await runTurn('second question');
+    const liveSent = live1.find((m) => m.type === 'sent') as { text?: string; source?: string; ts?: number } | undefined;
+    t.eq(liveSent?.text, 'first question', 'every accepted captain line is echoed to all clients (`sent`)');
+    t.eq(liveSent?.source, 'web', 'the sent frame carries its source');
+    t.ok(typeof liveSent?.ts === 'number', 'the sent frame carries a timestamp for the transcript');
+
+    const replayFrames: Record<string, unknown>[] = await new Promise((resolve, reject) => {
+      const frames: Record<string, unknown>[] = [];
+      const c = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { c.close(); reject(new Error('resume WS timed out')); }, 8000);
+      c.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        frames.push(m);
+        if (m.type === 'turn-done') { clearTimeout(timer); c.close(); resolve(frames); }
+      });
+      c.on('error', reject);
+    });
+    const replayedSent = replayFrames.filter((m) => m.type === 'sent' && m.replay === true);
+    t.eq(replayedSent.length, 2, 'a reconnecting client is replayed BOTH turns (full history, not just the last)');
+    t.eq((replayedSent[0] as { text?: string }).text, 'first question', 'history replays in order');
+    const replayedVerbatim = replayFrames.filter((m) => m.type === 'verbatim' && m.replay === true && m.final === true);
+    t.eq(replayedVerbatim.length, 2, 'each replayed turn carries its final verbatim text');
+    const replayedAudio = replayFrames.filter((m) => m.type === 'audio' && m.replay === true);
+    t.eq(replayedAudio.length, 1, 'audio is replayed for the NEWEST turn only (bounded payload, arms Replay)');
+  } finally {
+    await app.close();
+    await mock.close();
+  }
 });
 
 // ═══════════════════════ LIVE legs (creds required) ═════════════════════════

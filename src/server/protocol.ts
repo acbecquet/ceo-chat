@@ -30,6 +30,13 @@ export type TtsMode = 'minimax' | 'local' | 'mock';
 // Sample rate the SERVER-SIDE STT path expects the browser to send mic PCM at.
 export const STT_SAMPLE_RATE = 16000;
 
+// Where a turn was initiated from. Phone turns broadcast to the web clients too -
+// the web app is the in-call companion screen showing the verbatim transcript.
+export type TurnSource = 'web' | 'phone';
+
+// Twilio call state surfaced to the browser (the "Call me" flow + on-call status).
+export type PhoneState = 'unavailable' | 'idle' | 'dialing' | 'in-call' | 'ended' | 'failed';
+
 // ---- client -> server ----
 export type ClientMessage =
   // The captain typed (or spoke, via browser STT) a line for firstmate.
@@ -44,6 +51,8 @@ export type ClientMessage =
   | { type: 'stt-cancel' }
   // Barge-in / hangup: cancel the in-flight turn (stop pending speech + synthesis).
   | { type: 'stop' }
+  // Outbound Call Mode: ask the broker to ring the captain's phone (Twilio REST).
+  | { type: 'call-me' }
   // Liveness.
   | { type: 'ping' };
 
@@ -61,6 +70,8 @@ export type ServerMessage =
       // own Web Speech; this is the fallback when that's unavailable/flaky.
       serverStt: boolean;
       sttLabel: string;
+      // Is the outbound "Call me" phone trigger available (Twilio creds paired)?
+      phone: boolean;
     }
   // Result of a SERVER-SIDE STT transcription — handed BACK to the client (not
   // auto-run) so the confirmation guard (§3.5) applies before it reaches firstmate.
@@ -71,6 +82,18 @@ export type ServerMessage =
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.
   | { type: 'terminal'; data: string }
+  // Echo of an ACCEPTED captain line (typed, spoken, or over the phone) so every
+  // connected client renders the same conversation - including turns the captain
+  // started from the phone call. `ts` = epoch ms for the transcript timestamps.
+  | { type: 'sent'; turn: number; text: string; source: TurnSource; ts: number; replay?: boolean }
+  // The 1:1 VERBATIM transcript of first mate's ACTUAL reply - the exact assistant
+  // text from the session transcript, streamed live as the turn runs (each frame is
+  // the full text-so-far; the client re-renders). The `final:true` frame is the
+  // byte-exact complete reply - the authoritative text the captain reads for detail
+  // the spoken summary compressed away.
+  | { type: 'verbatim'; turn: number; text: string; final?: boolean; ts?: number; replay?: boolean }
+  // Twilio Call Mode status (the "Call me" flow + on-call indicator).
+  | { type: 'phone'; state: PhoneState; detail?: string }
   // The raw agent reply text (shown in the transcript column). `replay` = state
   // re-sent to a reconnecting client (page refresh) — show it, don't re-run anything.
   | { type: 'reply'; turn: number; text: string; replay?: boolean }

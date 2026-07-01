@@ -7,6 +7,14 @@
 // `npm run clone-voice`); when set the live MiniMax client speaks in that voice
 // instead of the default system voice — see src/tts/minimax.ts + src/tts/voice-clone.ts.
 //
+// Call Mode (Twilio phone leg - see docs/call-mode.md) adds:
+//   TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN - the Twilio account credentials.
+//   TWILIO_PHONE_NUMBER   - the purchased US local number calls come from.
+//   CEOCHAT_ALLOWED_CALLER - the captain's mobile (caller-ID allowlist; also the
+//                            number the outbound "Call me" button rings).
+//   CEOCHAT_PHONE_PIN     - 4-6 digit PIN required (DTMF or spoken) before the
+//                            first injection on ANY call, inbound or outbound.
+//
 // A blank/absent key does NOT throw — callers decide whether to run the real
 // credentialed call or gracefully fall back to the mock path. This is what lets
 // `npm run validate` run fully green with no creds and flip to live cleanly.
@@ -65,4 +73,37 @@ export function minimaxVoiceId(secrets: Secrets): string | undefined {
 // backend in src/speakability/speakability.ts.
 export function hasGeminiCreds(secrets: Secrets): boolean {
   return has(secrets, 'GEMINI_API_KEY');
+}
+
+// ── Call Mode (Twilio phone leg) ───────────────────────────────────────────────
+
+// Everything the phone transport reads from secrets, in one shape. Absent values
+// are undefined - the phone leg degrades feature-by-feature (see phoneCapabilities).
+export interface PhoneSecrets {
+  accountSid?: string;
+  authToken?: string;
+  phoneNumber?: string;
+  allowedCaller?: string;
+  pin?: string;
+}
+
+export function phoneSecrets(secrets: Secrets): PhoneSecrets {
+  const get = (k: string): string | undefined => (has(secrets, k) ? secrets[k] : undefined);
+  return {
+    accountSid: get('TWILIO_ACCOUNT_SID'),
+    authToken: get('TWILIO_AUTH_TOKEN'),
+    phoneNumber: get('TWILIO_PHONE_NUMBER'),
+    allowedCaller: get('CEOCHAT_ALLOWED_CALLER'),
+    pin: get('CEOCHAT_PHONE_PIN'),
+  };
+}
+
+// What the configured secrets actually enable. The media bridge itself (TwiML +
+// WS + PIN gate) only needs the allowlist + PIN - that is what the mock validation
+// leg exercises with NO Twilio account. The outbound "Call me" REST trigger
+// additionally needs the account creds + a purchased number.
+export function phoneCapabilities(p: PhoneSecrets): { inbound: boolean; outbound: boolean } {
+  const inbound = !!(p.allowedCaller && p.pin);
+  const outbound = inbound && !!(p.accountSid && p.authToken && p.phoneNumber);
+  return { inbound, outbound };
 }
