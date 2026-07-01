@@ -72,14 +72,15 @@ import {
 // Call Mode (Twilio phone leg) + the verbatim web transcript.
 import {
   linearToMulawSample, mulawToLinearSample, pcmS16leToMulaw, mulawToPcmS16le,
-  pcmChunkToPhoneMulaw, phoneMulawToWhisperPcm, upsampleFloat32, frameRms,
+  pcmChunkToPhoneMulaw, phoneMulawToWhisperPcm, phonePcmToWhisperPcm,
+  upsampleFloat32, frameRms, s16leView,
   UtteranceDetector, PHONE_SAMPLE_RATE,
 } from '../src/server/phone-audio.ts';
 import {
   twimlConnectStream, twilioSignature, validateTwilioSignature, sameNumber, placeCall,
 } from '../src/server/twilio.ts';
 import {
-  createPhoneApp, digitsFromSpoken, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
+  createPhoneApp, digitsFromSpoken, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
   PHONE_WS_PATH, PHONE_TWIML_PATH, type PhoneTimers,
 } from '../src/server/phone.ts';
 import { TurnRunner } from '../src/server/turns.ts';
@@ -1733,6 +1734,22 @@ await reporter.leg('phone - mu-law codec + 8 kHz transcode (Twilio wire format)'
   t.eq(upsampleFloat32(new Float32Array(100), 16000, 16000).length, 100, 'equal-rate upsample is a no-op');
   t.eq(PHONE_SAMPLE_RATE, 8000, 'the wire rate constant is 8000 Hz');
 
+  // REGRESSION GUARD (double mu-law decode): the detector hands over ALREADY
+  // decoded s16le@8k PCM - the PCM-in upconvert must equal the mu-law path
+  // byte-for-byte and must never re-decode PCM bytes as mu-law samples.
+  const pcm8kDecoded = mulawToPcmS16le(mulaw);
+  const upFromPcm = phonePcmToWhisperPcm(pcm8kDecoded);
+  t.eq(upFromPcm.sampleRate, 16000, 'PCM-in upconvert is tagged 16 kHz');
+  t.ok(Buffer.from(upFromPcm.pcm).equals(Buffer.from(up.pcm)), 'phonePcmToWhisperPcm(decoded) === phoneMulawToWhisperPcm(mulaw), byte-exact (decoded exactly ONCE)');
+  const srcRms = frameRms(s16leView(pcm8kDecoded));
+  const upRms = frameRms(s16leView(upFromPcm.pcm));
+  t.ok(Math.abs(upRms - srcRms) / srcRms < 0.1, 'upconvert preserves the signal energy (no mu-law garbage)', `rms ${srcRms.toFixed(0)} -> ${upRms.toFixed(0)}`);
+
+  // expired stream tokens are pruned on mint (the pure sweep)
+  const tokenMap = new Map<string, number>([['stale', 100], ['fresh', 200]]);
+  pruneExpiredTokens(tokenMap, 150);
+  t.ok(!tokenMap.has('stale') && tokenMap.has('fresh'), 'expired stream tokens are swept; live ones survive');
+
   // the deterministic utterance detector (frame-count endpointing + barge-in)
   const utterances: number[] = [];
   let barges = 0;
@@ -1876,11 +1893,18 @@ await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; medi
     stop: async () => {},
   };
   const runner = new TurnRunner({ driver });
+  const heardAudio: Array<{ bytes: number; sampleRate: number; rms: number; peak: number }> = [];
   const phone = createPhoneApp({
     runner,
     secrets: PHONE_TEST_SECRETS,
     publicUrl: PHONE_PUBLIC_URL,
-    transcribe: async () => heard.shift() ?? '',
+    transcribe: async (pcm, sampleRate) => {
+      const samples = s16leView(pcm);
+      let peak = 0;
+      for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]!));
+      heardAudio.push({ bytes: pcm.length, sampleRate, rms: frameRms(samples), peak });
+      return heard.shift() ?? '';
+    },
     synthPrompt: async (text) => { spoken.push(text); return { pcm: silenceFramePcm(), sampleRate: 8000 }; },
     log: () => {},
   });
@@ -1915,6 +1939,17 @@ await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; medi
     call.speakUtterance();
     t.ok(await until(() => sends.length === 1), 'the transcribed utterance reaches the pipeline (STT -> send)');
     t.eq(sends[0], 'run the checks', 'the exact transcribed text is injected');
+
+    // REGRESSION GUARD (double mu-law decode): whisper must receive the captain's
+    // REAL audio - 16 kHz, the sine's sane amplitude and energy. A second mu-law
+    // decode of already-decoded PCM turns it into near-full-scale garbage.
+    t.ok(heardAudio.length >= 2, 'the transcribe stub saw the PIN and command utterances', `${heardAudio.length}`);
+    for (const [i, a] of heardAudio.entries()) {
+      t.eq(a.sampleRate, 16000, `utterance ${i}: handed to whisper at 16 kHz`);
+      t.ok(a.bytes > 0 && a.bytes % 2 === 0, `utterance ${i}: whole s16le samples`, `${a.bytes} bytes`);
+      t.ok(a.peak > 4000 && a.peak < 12000, `utterance ${i}: peak matches the spoken sine (decoded exactly once)`, `peak ${a.peak}`);
+      t.ok(a.rms > 1500, `utterance ${i}: carries real speech energy`, `rms ${a.rms.toFixed(0)}`);
+    }
 
     // the reply chunk comes back as media frames + a mark, 8 kHz mu-law, no header
     t.ok(await until(() => call.out.some((m) => m.event === 'mark' && (m.mark as { name?: string })?.name?.startsWith('m'))), 'a named mark follows the reply audio');
@@ -2007,6 +2042,72 @@ await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the tur
     call2.send({ event: 'stop' });
     t.ok(await until(() => sawAborted === 2), 'hangup (stop frame) aborts the in-flight turn');
     call2.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// P4b - unauthenticated-WS hardening on the tunnel-exposed /phone path: a
+// connection that never presents a webhook-minted token is closed at the
+// handshake deadline (it can NOT hold the single call slot), and an anonymous
+// connect/refused-token disconnect NEVER cancels the captain's in-flight turn.
+await reporter.leg('phone - unauth WS: handshake deadline frees the slot; anonymous disconnect never cancels a turn', async (t) => {
+  const HANDSHAKE_MS = 7777;
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  let sawAborted = 0;
+  let finishTurn = false;
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (_text, _i, hooks) => new Promise((resolve) => {
+      const timer = setInterval(() => {
+        if (hooks.signal?.aborted) sawAborted++;
+        if (finishTurn || hooks.signal?.aborted) {
+          clearInterval(timer);
+          resolve({ reply: 'done', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 });
+        }
+      }, 20);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    handshakeTimeoutMs: HANDSHAKE_MS, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // an anonymous connection (never sends `start`) grabs the single call slot...
+    const idle = await connectPhoneClient(app.port);
+    t.ok(await until(() => phone.activeCall), 'an idle anonymous connection holds the call slot');
+    const shutOut = await connectPhoneClient(app.port);
+    t.ok(await until(() => shutOut.closed), 'a real call arriving meanwhile is refused (busy)');
+    // ...until the handshake deadline fires and frees it
+    const armed = pending.find((p) => p.ms === HANDSHAKE_MS);
+    t.ok(!!armed, 'a handshake deadline was armed for the fresh connection');
+    armed!.fn();
+    t.ok(await until(() => idle.closed), 'the never-started connection is CLOSED at the deadline');
+    t.ok(await until(() => !phone.activeCall), 'the call slot is freed for real calls');
+
+    // an in-flight turn survives anonymous churn on /phone
+    const turnDone = runner.run('long job', 'web');
+    t.ok(await until(() => runner.busy), 'a (web-initiated) turn is in flight');
+    const intruder = await connectPhoneClient(app.port);
+    intruder.send({ event: 'start', start: { streamSid: 'MZevil', customParameters: { token: 'ff'.repeat(16) } } });
+    t.ok(await until(() => intruder.closed), 'the forged-token stream is refused');
+    const ghost = await connectPhoneClient(app.port);
+    ghost.close();
+    await realSleep(150);
+    t.ok(runner.busy, 'the turn is STILL running after the refused stream + anonymous disconnect');
+    t.eq(sawAborted, 0, 'REGRESSION GUARD: unauthenticated teardown never runner.cancel()s the captain turn');
+    finishTurn = true;
+    await turnDone;
+    t.ok(!runner.busy, 'the turn completed normally');
   } finally {
     await app.close();
   }

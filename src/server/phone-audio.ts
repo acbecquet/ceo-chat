@@ -104,15 +104,20 @@ export function pcmChunkToPhoneMulaw(pcm: Uint8Array, sampleRate: number): Uint8
 }
 
 /**
- * Inbound transcode: Twilio mu-law bytes -> s16le PCM at 16 kHz, the rate the
+ * Inbound upconvert: s16le PCM at the 8 kHz wire rate (already mu-law-decoded,
+ * e.g. by the UtteranceDetector feed path) -> s16le PCM at 16 kHz, the rate the
  * whisper Transcriber requires (its own resampler never upsamples, so we hand it
  * audio already at 16 kHz and tag it as such).
  */
-export function phoneMulawToWhisperPcm(mulaw: Uint8Array): { pcm: Uint8Array; sampleRate: number } {
-  const pcm8k = mulawToPcmS16le(mulaw);
+export function phonePcmToWhisperPcm(pcm8k: Uint8Array): { pcm: Uint8Array; sampleRate: number } {
   const f32 = pcmS16leToFloat32(pcm8k);
   const up = upsampleFloat32(f32, PHONE_SAMPLE_RATE, 16000);
   return { pcm: float32ToPcmS16le(up), sampleRate: 16000 };
+}
+
+/** Inbound transcode: raw Twilio mu-law bytes -> s16le PCM at 16 kHz for whisper. */
+export function phoneMulawToWhisperPcm(mulaw: Uint8Array): { pcm: Uint8Array; sampleRate: number } {
+  return phonePcmToWhisperPcm(mulawToPcmS16le(mulaw));
 }
 
 /** RMS of one s16 frame - the energy measure the utterance detector gates on. */

@@ -43,7 +43,7 @@ import {
   twimlConnectStream, twimlReject, parseFormBody, validateTwilioSignature, sameNumber, placeCall,
 } from './twilio.ts';
 import {
-  pcmChunkToPhoneMulaw, mulawToPcmS16le, phoneMulawToWhisperPcm,
+  pcmChunkToPhoneMulaw, mulawToPcmS16le, phonePcmToWhisperPcm,
   UtteranceDetector, type VadConfig,
 } from './phone-audio.ts';
 import { guardUtterance, looksConsequential } from '../web/confirm.js';
@@ -57,6 +57,17 @@ export const PHONE_TWIML_PATH = '/phone/twiml';
 const MEDIA_MESSAGE_BYTES = 4000;
 const PIN_MAX_ATTEMPTS = 3;
 const TOKEN_TTL_MS = 5 * 60 * 1000;
+// A connection must present a valid webhook-minted token in its `start` frame
+// within this window, or it is closed - an anonymous WS hit on the tunnel-exposed
+// /phone path can never hold the single call slot.
+const HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+
+/** Drop expired stream tokens so unconsumed mints never accumulate. Pure. */
+export function pruneExpiredTokens(tokens: Map<string, number>, now: number): void {
+  for (const [token, expiry] of tokens) {
+    if (now > expiry) tokens.delete(token);
+  }
+}
 
 // ── captain-tunable behavior (the "small config" the task asks for) ───────────
 
@@ -143,6 +154,8 @@ export interface PhoneAppOptions {
   /** Default: validate X-Twilio-Signature whenever the auth token is configured. */
   validateSignature?: boolean;
   tokenTtlMs?: number;
+  /** How long a fresh WS may sit without an authorized `start` before it is closed. */
+  handshakeTimeoutMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -185,6 +198,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
   const twimlUrl = publicUrl + PHONE_TWIML_PATH;
   const validateSig = opts.validateSignature ?? !!secrets.authToken;
   const tokenTtlMs = opts.tokenTtlMs ?? TOKEN_TTL_MS;
+  const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
 
   const stateListeners = new Set<(state: PhoneState, detail?: string) => void>();
   const emitState = (state: PhoneState, detail?: string): void => {
@@ -195,6 +209,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
   // Single-use stream tokens minted by the webhook, consumed by the WS start frame.
   const tokens = new Map<string, number>();
   const mintToken = (): string => {
+    pruneExpiredTokens(tokens, Date.now());
     const token = randomBytes(16).toString('hex');
     tokens.set(token, Date.now() + tokenTtlMs);
     return token;
@@ -212,7 +227,9 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
   class CallSession {
     private readonly ws: WebSocket;
     private streamSid = '';
+    private started = false;
     private authed = false;
+    private handshakeTimer: unknown = null;
     private pinBuffer = '';
     private pinAttempts = 0;
     private outstandingMarks = 0;
@@ -237,6 +254,13 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       const gone = (): void => this.teardown('socket closed');
       ws.on('close', gone);
       ws.on('error', gone);
+      this.handshakeTimer = timers.setTimeout(() => {
+        this.handshakeTimer = null;
+        if (!this.started && !this.closed) {
+          log('phone: no authorized start within the handshake window - closing');
+          this.teardown('handshake timeout');
+        }
+      }, handshakeTimeoutMs);
     }
 
     // ---- inbound Twilio frames ----
@@ -254,6 +278,8 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
             this.ws.close(1008, 'unauthorized');
             return;
           }
+          this.started = true;
+          if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
           emitState('in-call', msg.start?.callSid);
           // The PIN gate: nothing reaches the broker until it passes (see checkPin).
           this.speak(phrases.pinPrompt);
@@ -307,6 +333,10 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         this.unsubRunner = runner.on((ev) => this.onTurnEvent(ev));
         return;
       }
+      this.pinFailed();
+    }
+
+    private pinFailed(): void {
       this.pinAttempts++;
       if (this.pinAttempts >= PIN_MAX_ATTEMPTS) {
         log('phone: PIN locked out after ' + this.pinAttempts + ' attempts - ending call');
@@ -324,7 +354,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         if (this.authed && !this.sttWarned) { this.sttWarned = true; this.speak(phrases.sttUnavailable); }
         return;
       }
-      const { pcm, sampleRate } = phoneMulawToWhisperPcm(pcm8k); // already mu-law-decoded s16le@8k in, 16k out
+      const { pcm, sampleRate } = phonePcmToWhisperPcm(pcm8k);
       let text = '';
       try {
         text = (await opts.transcribe(Buffer.from(pcm), sampleRate)).trim();
@@ -337,7 +367,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         const digits = digitsFromSpoken(text);
         const pin = secrets.pin || '';
         if (pin && digits.length >= pin.length) this.tryPin(digits.slice(-pin.length));
-        else if (digits) { this.pinAttempts++; this.speak(this.pinAttempts >= PIN_MAX_ATTEMPTS ? phrases.pinLocked : phrases.pinRetry); if (this.pinAttempts >= PIN_MAX_ATTEMPTS) this.closeAfterAudio(); }
+        else if (digits) this.pinFailed();
         return;
       }
       this.handleCommand(text);
@@ -491,10 +521,13 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       if (this.closed) return;
       this.closed = true;
       this.clearAnswerTimer();
+      if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
       this.detector.reset();
       if (this.unsubRunner) { this.unsubRunner(); this.unsubRunner = null; }
-      // Hanging up cancels the in-flight turn (stops speech + synthesis).
-      runner.cancel('phone hangup (' + reason + ')');
+      // Hanging up cancels the in-flight turn (stops speech + synthesis) - but only
+      // an AUTHENTICATED call has a stake in it; an anonymous/refused connection
+      // dropping must never abort the captain's live turn.
+      if (this.authed) runner.cancel('phone hangup (' + reason + ')');
       try { this.ws.close(); } catch { /* ignore */ }
       if (session === this) session = null;
       emitState('ended', reason);
