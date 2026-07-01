@@ -16,7 +16,8 @@ round-trip** (offline neural TTS → STT).
 ([piper](https://github.com/rhasspy/piper)) is the default TTS, and a local transcriber
 ([whisper.cpp](https://github.com/ggerganov/whisper.cpp)) powers STT — both installed
 sudo-free by `npm run voice`. MiniMax is an optional premium voice when its creds are
-present.
+present — and it can speak in **your own cloned voice**
+([`docs/voice-clone.md`](./docs/voice-clone.md)).
 
 ## The pipeline
 
@@ -214,7 +215,7 @@ It covers:
 
 | Group | What it asserts |
 |---|---|
-| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · **Gemini backend (selection precedence, request shape incl. `thinkingBudget:0`, fail-safe fallback; faked HTTP)** · MiniMax WS protocol (auth/query/hex/WAV) · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
+| **Legs** | secrets loader · transcript JSONL normalize · speakability wiring · **Gemini backend (selection precedence, request shape incl. `thinkingBudget:0`, fail-safe fallback; faked HTTP)** · MiniMax WS protocol (auth/query/hex/WAV) · **voice clone (REST upload + register against the mock server, voice_id rules, base_resp errors, `MINIMAX_VOICE_ID` → synth `voice_setting`; `validate:live` adds a read-only `get_voice` auth probe, no credits)** · full `runPipeline` e2e · **web server (serves the page + brokers the WS pipeline contract)** · **attach mode (`CEOCHAT_TARGET` env resolution, pane mirror + cwd-derivation, non-ownership; PENDING without tmux)** |
 | **Regressions** | the 3 fixed phase-0 bugs (below) + fm-send false-negative handling |
 | **Streaming & robustness** | prompt-anchored transcript tap (ignores concurrent sessions in a shared project dir) · incremental speakable units (audio starts mid-turn) · `runStreamingPipeline` emits chunks before completion + aborts on barge-in · benign-modal auto-dismiss · web progressive chunks + `notice` + reconnect replay |
 | **Speakability drift** | root cause (sentence fragments lose context, topic blocks keep it) · `runStreamingPipeline` summarizes blocks with the reply-so-far as context · mock-contract summaries cover every topic, name the recommended option, strip paths/URLs/PIDs (real reply-shape fixtures); `validate:live` adds a real-Gemini quality report (PENDING, never red) |
@@ -281,6 +282,9 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    ```env
    MINIMAX_API_KEY=...
    MINIMAX_GROUP_ID=...
+   # optional — speak in YOUR OWN cloned voice (register it via `npm run clone-voice`;
+   # see docs/voice-clone.md). Unset → MiniMax's default system voice:
+   MINIMAX_VOICE_ID=...
    # optional — the PREFERRED speakability backend (fast, free-tier, no Anthropic key):
    GEMINI_API_KEY=...
    # optional — switches speakability to the Anthropic Messages API:
@@ -292,6 +296,22 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    automatically (no code change); the browser plays the live audio through the same
    Web Audio path. The international endpoint is `wss://api.minimax.io` (not
    `minimaxi.com`).
+
+### Speak in your own voice — `npm run clone-voice`
+
+MiniMax can read replies aloud in **your own cloned voice**. Record ~30s of clean
+speech, register it once, and set one secret:
+
+```bash
+npm run clone-voice -- ~/.config/ceo-chat/voice-samples/captain.mp3 CaptainVoice1
+# → prints the voice_id; then add MINIMAX_VOICE_ID=CaptainVoice1 to secrets.env
+```
+
+The CLI uploads the reference audio and registers the clone via MiniMax's REST API
+(no preview synthesis, so registering spends no synthesis credits). Once
+`MINIMAX_VOICE_ID` is set the live MiniMax path speaks in that voice — voice
+precedence is unchanged (MiniMax > piper > mock). Full recording guide and the
+read-aloud script: [`docs/voice-clone.md`](./docs/voice-clone.md).
 
 ## Layout
 
@@ -305,9 +325,10 @@ src/
   transcript/transcript.ts JSONL tap (normalize/parse/tail; prompt-anchored resolution)
   transcript/reply.ts      reply-wait latch + incremental streamReply (injectable, regression-guarded)
   speakability/            rewrite-for-the-ear (gemini | anthropic-api | claude-cli | mock)
-  tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec)
+  tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec; cloned voice_id support)
+  tts/voice-clone.ts       register the captain's OWN cloned voice (npm run clone-voice)
   tts/local-tts.ts         LOCAL piper neural voice — the default offline TTS
-  tts/mock-server.ts       in-process MiniMax mock (real protocol, synthetic PCM)
+  tts/mock-server.ts       in-process MiniMax mock (real WS protocol + voice-clone REST, synthetic PCM)
   broker/pipeline.ts       the injected orchestration: aggregate runPipeline + streaming runStreamingPipeline (+ onStage hook)
   broker/broker.ts         the runnable broker (owns session + TTS backend: minimax|local|mock)
   cli/dev.ts               the CLI driver entrypoint
@@ -335,6 +356,7 @@ phase0/                    the original de-risking spikes (preserved)
 | `npm run validate` | end-to-end harness, mock mode (the gate — must be green) |
 | `npm run validate:live` | same harness against real services where creds exist |
 | `npm run voice` | install the LOCAL offline voice (piper TTS + whisper STT) outside the repo |
+| `npm run clone-voice -- <audio> <voice_id>` | register the captain's OWN cloned MiniMax voice (see `docs/voice-clone.md`) |
 | `npm run firstmate` | launch a first mate in tmux to attach to (prints `CEOCHAT_TARGET`) |
 | `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker) |
 | `npm run dev` | run the CLI driver (interactive or one-shot) |

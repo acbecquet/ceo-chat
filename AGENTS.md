@@ -20,7 +20,8 @@ streaming TTS. Decision-ready plan:
 
 ## Secrets
 - Live in a gitignored file OUTSIDE the repo: `~/.config/ceo-chat/secrets.env`
-  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
+  (`MINIMAX_API_KEY`, `MINIMAX_GROUP_ID`, optional `MINIMAX_VOICE_ID` (the captain's
+  cloned voice — see Phase 8), `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
   Never hardcode or
   commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
   `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
@@ -436,6 +437,39 @@ streaming TTS. Decision-ready plan:
   a hard gate: gemini is non-deterministic, so a miss is surfaced as PENDING with the
   offending narration (never red); the deterministic mock legs are the hard guard. Needs
   `GEMINI_API_KEY` in `~/.config/ceo-chat/secrets.env` (never committed) else PENDING.
+
+## Phase 8 — captain's OWN cloned voice (MiniMax voice clone)
+- **Goal:** the captain hears first mate in THEIR voice. A cloned MiniMax `voice_id` is
+  just a `voice_id` — it rides the SAME `voice_setting.voice_id` field as a stock voice,
+  so once it exists nothing else in the pipeline changes.
+- **Secret:** `MINIMAX_VOICE_ID` in `~/.config/ceo-chat/secrets.env` (gitignored). When
+  set, `minimaxVoiceId(secrets)` (`src/config/secrets.ts`) feeds it as `SynthOptions.voiceId`
+  in `Broker#synth` → `synthStreaming`; unset → falls back to `DEFAULT_VOICE_ID`
+  (`male-qn-qingse`). Voice precedence is UNCHANGED: MiniMax (creds) > piper > mock.
+- **Model:** `speech-2.8-turbo` (DEFAULT_MODEL) supports cloned voice_ids (confirmed vs
+  live docs 2026-06) — the latency pick; `speech-2.8-hd` is the higher-fidelity sibling.
+- **Clone CLI:** `src/tts/voice-clone.ts` (`npm run clone-voice -- <audio> <voice_id>`).
+  Two REST calls against the INTERNATIONAL host `api.minimax.io` (NOT minimaxi.com):
+  `POST /v1/files/upload` (multipart `file`+`purpose=voice_clone`, Bearer auth,
+  **GroupId in query**) → `file.file_id`; then `POST /v1/voice_clone?GroupId=…` JSON
+  `{file_id, voice_id}` → echoes `voice_id`. **Never sends the optional `text`/`model`
+  preview fields** — a preview synthesizes audio and burns credits. `voice_id` rule:
+  starts with a letter, ≥8 chars, letters+digits only (`VOICE_ID_RE`). Reusable pure fns
+  (`uploadReferenceAudio`/`registerVoiceClone`/`cloneVoice`) take a DI `fetchImpl`+`baseUrl`.
+- **The REAL clone is a CAPTAIN-run step** (record → clone-voice → set `MINIMAX_VOICE_ID`).
+  Agents MUST NOT create a clone with throwaway audio — it spends credits + pollutes the
+  account. Recording guide + read-aloud script: `docs/voice-clone.md`.
+- **Mock REST server:** `startMockMinimaxRest()` in `src/tts/mock-server.ts` speaks the
+  upload + voice_clone endpoints (records auth/GroupId/purpose/file/JSON body, can
+  `failWith` a 1004) so `npm run validate` asserts the clone plumbing with NO creds/credits.
+  The WS mock now also records `voice_setting.voice_id` (`observed.voiceId`) to prove the
+  cloned voice reaches `task_start`.
+- **Tests:** `npm run validate` legs `voice clone — upload + register …`, `… voice_id rules
+  + base_resp error surfaced`, `… MINIMAX_VOICE_ID flows into the synth voice_setting`.
+  `npm run validate:live` adds `live — MiniMax REST auth probe (get_voice, no credits)`:
+  read-only `POST /v1/get_voice` confirms key+GroupId pairing WITHOUT spending credits;
+  `base_resp 1004 "token not match group"` = key/GroupId belong to different accounts
+  (a captain-side fix in the MiniMax console). PENDING (never red) when unpaired.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.
