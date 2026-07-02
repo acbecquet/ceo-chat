@@ -341,7 +341,8 @@ streaming TTS. Decision-ready plan:
   auto-answered. A wedged rating prompt swallowing the next message was the captain's
   "nothing after refresh" dead-end. Surfaced to the client as a `notice` frame (→ toast +
   diagnostics). The normal `⏵⏵ bypass permissions` FOOTER is not a modal — don't match it.
-- **Refresh/reconnect robustness (Bug B2).** `app.ts` keeps `lastTurnState`; a freshly
+- **Refresh/reconnect robustness (Bug B2).** `app.ts` keeps the last-turn replay state
+  (since Phase 9 it lives in the shared `TurnRunner`'s bounded history); a freshly
   connected client (page refresh) is REPLAYED reply+narration+audio+turn-done with
   `replay:true` (client SHOWS them + arms Replay but does NOT auto-play). A turn is NOT
   cancelled when the initiating socket drops — a refresh mid-turn re-joins the broadcast and

@@ -6,11 +6,14 @@ view to glance at when stopped. firstmate is tmux-based; ceo-chat brokers voice 
 terminal view over one connection, reusing firstmate's own text injection for
 voice-in and a clean transcript tap for voice-out.
 
-This repo ships the **end-to-end core** plus a **mobile-first browser web app**: a
-runnable broker that wires the whole pipeline, a single-page phone-call UI (auto-spoken
-replies, hands-free mic, a glanceable terminal), and a comprehensive validation harness
-that proves every leg — green with **no credentials**, including a **REAL generated-audio
-round-trip** (offline neural TTS → STT).
+This repo ships the **end-to-end core**, an **iPhone-first browser web app**, and
+**Call Mode** - first mate as a **real Twilio phone call**
+([`docs/call-mode.md`](./docs/call-mode.md)): a runnable broker that wires the whole
+pipeline, a single-page in-call companion UI (the live 1:1 **verbatim transcript**,
+auto-spoken replies, hands-free mic, a tappable answer card), and a comprehensive
+validation harness that proves every leg — green with **no credentials**, including a
+**REAL generated-audio round-trip** (offline neural TTS → STT) and a **mock Twilio
+Media Streams client** for the phone leg.
 
 **It speaks real words with no cloud key.** A local, offline neural voice
 ([piper](https://github.com/rhasspy/piper)) is the default TTS, and a local transcriber
@@ -49,6 +52,9 @@ so a per-block summary doesn't drift (drop a topic, misname the recommended opti
 CLI and in-memory test drivers use the aggregate `runPipeline`. The tap is **prompt-anchored**
 (it follows the transcript file that recorded *our* injected line), so an attached first
 mate sharing a project dir with other concurrent Claude sessions is read correctly.
+Call Mode rides the SAME pipeline: the Twilio phone leg only transcodes at the transport
+seam (8 kHz mu-law ↔ PCM) and drives the identical turn engine - nothing below
+`Broker.send` changed.
 
 ## Quick start
 
@@ -110,25 +116,33 @@ and tear it down on exit — the self-contained demo path.
 
 ## Web app — `npm run serve`
 
-A single-page browser front-end to the same pipeline ([`src/server/`](./src/server/)).
-Open the printed URL and you get:
+An **iPhone-first** single-page front-end to the same pipeline
+([`src/server/`](./src/server/)) - an installable PWA (standalone, dark, safe-area
+insets, ≥44px targets). Open the printed URL and you get:
 
-- a **live terminal view** of the target agent pane — your real first mate in attach
-  mode, else the dedicated `ceo-chat` session (xterm.js, fed colour-preserving
-  `capture-pane` snapshots over the WebSocket);
-- a **text input** that sends your message to firstmate (via the same `fm-send`
-  verified submit);
-- the **speakability narration** as it is produced, and the **raw agent reply**;
-- **auto-spoken replies** — tap **Start call** once and every reply is read aloud
+- the **live 1:1 verbatim transcript** as the centerpiece - the EXACT reply text
+  streamed from the session transcript while the turn runs (speaker separation,
+  timestamps, auto-follow + a "jump to latest" pill), ending in a **byte-exact** final
+  read; fenced code renders losslessly in internally-scrollable blocks;
+- a **sticky tappable answer card** when first mate asks a question - numbered options
+  become buttons that submit the number, yes/no is detected; tap or speak, both work;
+- a **composer** that sends your typed line to firstmate (via the same `fm-send`
+  verified submit), plus one-thumb bottom controls: **Call me** (ring your phone - see
+  Call Mode below), **Voice**, push-to-talk mic;
+- **auto-spoken replies** — tap **Voice** once and every reply is read aloud
   automatically, **topic-block-by-block as it streams** (gapless, ordered; Web Audio
   decodes raw PCM). The local piper voice speaks real words with no key; MiniMax streams
   the same way once paired; the mock tone is for tests. **Replay** re-speaks the whole
-  last turn; **hang up** (or a barge-in) cancels the in-flight turn server-side;
+  last turn; **End** (or a barge-in) cancels the in-flight turn server-side;
 - **status indicators** — listening / thinking / speaking / awaiting-confirmation —
   driven off real pipeline stages;
 - **hands-free voice input** — robust `webkitSpeechRecognition` (re-armed for iOS),
   with a **server-side whisper STT fallback** when the browser path is unavailable;
-  the text input is always there too.
+  the composer is always there too;
+- a **tools sheet** (⋯) holding the **live terminal view** of the target agent pane —
+  your real first mate in attach mode, else the dedicated `ceo-chat` session (xterm.js,
+  fed colour-preserving `capture-pane` snapshots over the WebSocket), plus the
+  diagnostics panel and the "Screen-off feel" overlay toggle.
 
 ### Mobile / hands-free (iOS Safari first)
 
@@ -139,9 +153,13 @@ The web app is built to feel like a **phone call** from the car:
   turn — and summarizing a whole block at once (with the reply-so-far as context) keeps
   the spoken summary on the right topic and recommendation instead of drifting on a
   fragment. A page refresh mid-call **rejoins** the turn (it gets the remaining chunks) and
-  is replayed the last turn's text/audio (shown, not auto-played) instead of going blank.
+  is replayed the **full turn history** (deduped by turn number client-side; audio for the
+  newest turn only, shown not auto-played) instead of going blank - dead zones and
+  app-switching never lose the conversation. Reconnect is **single-flight** (one
+  cancellable backoff timer, plus a `visibilitychange` re-connect), so it can never stack
+  sockets and double-play audio.
 - **Audio unlocks on the first tap.** Mobile browsers suspend audio until a user
-  gesture — the **Start call** button resumes the AudioContext (and holds a **Wake
+  gesture — the **Voice** button resumes the AudioContext (and holds a **Wake
   Lock**), after which replies auto-play with no further taps. Replies that arrive
   before the tap are buffered, not lost. iOS Safari also auto-*re*-suspends the context
   when idle, so a reply arriving seconds later would otherwise be silent: a near-silent
@@ -154,8 +172,8 @@ The web app is built to feel like a **phone call** from the car:
   so older iOS still streams PCM; the server always returns a transcript frame — even an
   empty one carrying the reason and bytes-received — so "mic on, no words" shows up on
   screen ("Heard nothing — …") instead of being dropped.
-- **On-screen Diagnostics panel:** collapsible, off by default, **auto-opens on the
-  first audio/mic error**. Shows live AudioContext state / keep-alive / mic chips, each
+- **On-screen Diagnostics panel:** in the tools sheet, off by default, **auto-opens on
+  the first audio/mic error**. Shows live AudioContext state / keep-alive / mic chips, each
   reply's play path (Web Audio vs HTMLAudio fallback vs buffered) and play errors, and
   mic getUserMedia / worklet-vs-scriptprocessor / bytes-streamed / server transcript —
   with a one-tap **Copy diagnostics** button, so a device test can be sighted by pasting
@@ -168,11 +186,13 @@ The web app is built to feel like a **phone call** from the car:
   consequential action (merge/push/deploy/delete…), a *spoken* reply must be a clear
   "confirm" or "cancel" — a misheard "yeah" is held and re-prompted, never
   auto-approved. Typed input is always explicit.
-- **Call mode:** a toggle (and an iOS raise-to-ear heuristic via DeviceMotion) shows a
-  cheek-proof black overlay while audio keeps running. **Web limitation:** Safari
-  can't power the backlight off or read the proximity sensor — the backlight stays on;
-  true screen-off needs a native wrapper (the code leaves a clean seam for one).
-- **Terminal** is a collapsible, touch-scrollable glance — secondary to the voice loop.
+- **Screen-off feel:** a tools-sheet toggle (and an iOS raise-to-ear heuristic via
+  DeviceMotion) shows a cheek-proof black overlay while audio keeps running. **Web
+  limitation:** Safari can't power the backlight off or read the proximity sensor — the
+  backlight stays on; true screen-off needs a native wrapper (the code leaves a clean
+  seam for one). For a REAL native-call experience use Call Mode (below).
+- **Terminal** is a collapsible, touch-scrollable glance in the tools sheet — secondary
+  to the voice loop.
 
 > **Real-device note:** the dev box has no mic and isn't an iPhone, so Web Speech
 > reliability, the raise-to-ear thresholds, and audible read-aloud through the tunnel
@@ -200,6 +220,43 @@ tunnel. firstmate wires `cloudflared` separately once the domain is active — t
 app just needs to be running on the bound port (the tunnel's `service:` target,
 e.g. `http://127.0.0.1:8420`).
 
+## Call Mode - first mate as a real phone call
+
+With a Twilio number paired, first mate becomes a **real phone call**: iOS treats it as
+a native call (lock screen, over other apps, OS-provided background mic and ducking),
+you hear the summarized narration in the captain's cloned MiniMax voice (or piper), and
+the web app is the **in-call companion** showing the exact reply text.
+
+- **Transport shell only.** [`src/server/phone.ts`](./src/server/phone.ts) answers the
+  Twilio voice webhook (`POST /phone/twiml`) with `<Connect><Stream>` and bridges the
+  raw bidirectional **Media Streams** WS at `/phone` (8 kHz mu-law; `clear` for
+  barge-in) into the SAME pipeline - raw Media Streams (not ConversationRelay)
+  preserves the cloned voice, and the only new audio work is the pure transcode seam
+  ([`src/server/phone-audio.ts`](./src/server/phone-audio.ts)). Both endpoints mount
+  on the web app's port, so one Cloudflare tunnel fronts the browser and the phone.
+- **One turn engine.** The phone and the web share a single serialized `TurnRunner`
+  ([`src/server/turns.ts`](./src/server/turns.ts)) - a turn started on the call streams
+  its verbatim text into every connected browser, and vice versa.
+- **Outbound is primary:** tap **Call me** in the web app and first mate rings your
+  phone (Twilio REST). Inbound (calling the number) is the gated secondary.
+- **Layered security** (the broker fronts a shell-capable agent): caller-ID allowlist
+  at the webhook, `X-Twilio-Signature` validation, a single-use short-TTL stream token
+  required in the WS `start` frame (a direct WS hit is closed; anonymous sockets never
+  hold the call slot), a **keypad-only PIN before anything is injected** on every call
+  (speech before the PIN passes is ignored entirely; three failures end the call), and
+  the §3.5 spoken-confirmation guard.
+- **Safe interactive prompts:** an unclear or absent spoken answer to a consequential
+  question is re-asked once, then times out to a default that takes **no consequential
+  action** - silence can never approve anything (`PromptPolicy` in `phone.ts`).
+
+Call Mode mounts only when `CEOCHAT_ALLOWED_CALLER` + `CEOCHAT_PHONE_PIN` are in
+`~/.config/ceo-chat/secrets.env`; outbound "Call me" also needs the
+`TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_PHONE_NUMBER` trio. The captain
+setup checklist, usage, security model, and per-minute cost live in
+[`docs/call-mode.md`](./docs/call-mode.md). Everything is proven against a **mock Media
+Streams client** with no Twilio account (see the harness below); the end-to-end call
+over a real number is the remaining captain-gated live test.
+
 ## Validation harness — `npm run validate`
 
 The centerpiece. One command exercises the complete pipeline and prints a readable
@@ -221,6 +278,7 @@ It covers:
 | **Speakability drift** | root cause (sentence fragments lose context, topic blocks keep it) · `runStreamingPipeline` summarizes blocks with the reply-so-far as context · mock-contract summaries cover every topic, name the recommended option, strip paths/URLs/PIDs (real reply-shape fixtures); `validate:live` adds a real-Gemini quality report (PENDING, never red) |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
+| **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -289,6 +347,9 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    GEMINI_API_KEY=...
    # optional — switches speakability to the Anthropic Messages API:
    ANTHROPIC_API_KEY=...
+   # optional - Call Mode (the Twilio phone leg) adds TWILIO_ACCOUNT_SID /
+   # TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER + CEOCHAT_ALLOWED_CALLER +
+   # CEOCHAT_PHONE_PIN - see docs/call-mode.md
    ```
 2. `npm run validate:live` — the live MiniMax leg flips from PENDING to PASS and
    prints the real time-to-first-audio.
@@ -334,12 +395,19 @@ src/
   cli/dev.ts               the CLI driver entrypoint
   server/protocol.ts       the browser <-> broker WS message contract
   server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
+  server/turns.ts          ONE turn engine shared by web + phone (busy lock, history, verbatim tap)
+  server/verbatim.ts       the live 1:1 verbatim transcript source (byte-exact tap)
   server/app.ts            HTTP + WS transport (static UI, status, terminal, STT seam)
+  server/phone.ts          Call Mode transport shell (Twilio webhook + Media Streams WS bridge)
+  server/phone-audio.ts    pure G.711 mu-law codec + 8k↔16k resample + utterance VAD
+  server/twilio.ts         pure Twilio surface: TwiML, signature validation, Call-me REST
   server/stt.ts            LOCAL whisper.cpp transcriber (server STT + the e2e gate)
   server/serve.ts          the web server entrypoint (npm run serve)
-  server/public/           the single-page UI (index.html, app.js [ESM], styles.css)
+  server/public/           the single-page UI (index.html, app.js [ESM], styles.css,
+                           PWA manifest + icons)
   web/                     PURE browser modules served at /lib + asserted by validate:
-                           pcm · audio-player · speech · confirm · capture-worklet · diagnostics
+                           pcm · audio-player · speech · confirm · prompt-card ·
+                           capture-worklet · diagnostics
 test/
   validate.ts              the validation harness (npm run validate)
   harness/                 reporter + transcript/turn fixtures
@@ -358,7 +426,7 @@ phase0/                    the original de-risking spikes (preserved)
 | `npm run voice` | install the LOCAL offline voice (piper TTS + whisper STT) outside the repo |
 | `npm run clone-voice -- <audio> <voice_id>` | register the captain's OWN cloned MiniMax voice (see `docs/voice-clone.md`) |
 | `npm run firstmate` | launch a first mate in tmux to attach to (prints `CEOCHAT_TARGET`) |
-| `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker) |
+| `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker; mounts Call Mode when its secrets are paired) |
 | `npm run dev` | run the CLI driver (interactive or one-shot) |
 | `npm run typecheck` / `build` / `lint` | `tsc --noEmit` (we run `.ts` directly on Node ≥22) |
 | `npm test` | alias for `npm run validate` |
@@ -366,6 +434,9 @@ phase0/                    the original de-risking spikes (preserved)
 ## More
 
 - **Durable architecture & gotchas:** [`AGENTS.md`](./AGENTS.md).
+- **Call Mode setup (Twilio), security model & cost:**
+  [`docs/call-mode.md`](./docs/call-mode.md); build plan:
+  `/home/acbecquet/firstmate/data/ceochat-callmode-cx/report.md`.
 - **Full plan:** `/home/acbecquet/firstmate/data/ceochat-plan-q7/report.md`
   (§2 session model, §6 MiniMax, §7 speakability, §10 phasing).
 - **Phase 0 spikes + findings:** [`phase0/`](./phase0/),
