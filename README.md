@@ -12,7 +12,7 @@ This repo ships the **end-to-end core**, an **iPhone-first browser web app**,
 mate on the same number ([`docs/text-mode.md`](./docs/text-mode.md)): a runnable
 broker that wires the whole pipeline, a single-page in-call companion UI (the live
 1:1 **verbatim transcript**, auto-spoken replies, hands-free mic, a tappable answer
-card), and a comprehensive validation harness that proves every leg — green with
+card), and a comprehensive validation harness that proves every leg - green with
 **no credentials**, including a **REAL generated-audio round-trip** (offline neural
 TTS → STT) and **mock Twilio clients** for the phone and text legs.
 
