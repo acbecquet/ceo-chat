@@ -337,7 +337,8 @@ import { splitFencedSegments, extractPrompt } from '/lib/prompt-card.js';
     el.className = 'msg you';
     var who = document.createElement('div');
     who.className = 'who';
-    who.textContent = msg.source === 'phone' ? '📞 you (on the call)' : 'you';
+    who.textContent = msg.source === 'phone' ? '📞 you (on the call)'
+      : msg.source === 'sms' ? '💬 you (by text)' : 'you';
     var ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = fmtTime(msg.ts);
     who.appendChild(ts);
     var body = document.createElement('div'); body.className = 'vb'; body.textContent = msg.text;

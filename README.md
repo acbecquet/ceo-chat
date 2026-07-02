@@ -6,14 +6,15 @@ view to glance at when stopped. firstmate is tmux-based; ceo-chat brokers voice 
 terminal view over one connection, reusing firstmate's own text injection for
 voice-in and a clean transcript tap for voice-out.
 
-This repo ships the **end-to-end core**, an **iPhone-first browser web app**, and
+This repo ships the **end-to-end core**, an **iPhone-first browser web app**,
 **Call Mode** - first mate as a **real Twilio phone call**
-([`docs/call-mode.md`](./docs/call-mode.md)): a runnable broker that wires the whole
-pipeline, a single-page in-call companion UI (the live 1:1 **verbatim transcript**,
-auto-spoken replies, hands-free mic, a tappable answer card), and a comprehensive
-validation harness that proves every leg — green with **no credentials**, including a
-**REAL generated-audio round-trip** (offline neural TTS → STT) and a **mock Twilio
-Media Streams client** for the phone leg.
+([`docs/call-mode.md`](./docs/call-mode.md)) - and **Text Mode** - SMS/MMS to first
+mate on the same number ([`docs/text-mode.md`](./docs/text-mode.md)): a runnable
+broker that wires the whole pipeline, a single-page in-call companion UI (the live
+1:1 **verbatim transcript**, auto-spoken replies, hands-free mic, a tappable answer
+card), and a comprehensive validation harness that proves every leg — green with
+**no credentials**, including a **REAL generated-audio round-trip** (offline neural
+TTS → STT) and **mock Twilio clients** for the phone and text legs.
 
 **It speaks real words with no cloud key.** A local, offline neural voice
 ([piper](https://github.com/rhasspy/piper)) is the default TTS, and a local transcriber
@@ -55,6 +56,8 @@ mate sharing a project dir with other concurrent Claude sessions is read correct
 Call Mode rides the SAME pipeline: the Twilio phone leg only transcodes at the transport
 seam (8 kHz mu-law ↔ PCM) and drives the identical turn engine - nothing below
 `Broker.send` changed.
+Text Mode rides it too: an inbound SMS injects through the same turn engine and the
+reply goes back as an SMS carrying the same concise narration the voice legs speak.
 
 ## Quick start
 
@@ -257,6 +260,43 @@ setup checklist, usage, security model, and per-minute cost live in
 Streams client** with no Twilio account (see the harness below); the end-to-end call
 over a real number is the remaining captain-gated live test.
 
+## Text Mode - SMS/MMS to first mate on the same number
+
+When the captain cannot talk, **text the Call Mode number** instead
+([`docs/text-mode.md`](./docs/text-mode.md)):
+
+- **Text in, SMS back.** [`src/server/text.ts`](./src/server/text.ts) answers the
+  Twilio Messaging webhook (`POST /text/webhook`) and injects the Body through the
+  SAME serialized `TurnRunner` as speech - nothing below the Driver seam changed.
+  The reply rides Twilio REST after the turn (turns outlive the ~15s webhook window):
+  the concise spoken-style summary within Twilio's 1600-char Body cap, plus a
+  `Full reply:` link to the web transcript whenever the verbatim reply holds more
+  detail (the link always survives truncation). SMS turns broadcast to every
+  connected browser too, labeled "you (by text)".
+- **MMS attachments land in `inbox/`.** Photos/files are fetched (https-only,
+  Basic auth attached only for Twilio hosts, capped at 10 items / 10 MB each) into
+  the gitignored `inbox/` dir and referenced by absolute path in the injected line,
+  so first mate opens and inspects exactly what you sent.
+- **Proactive texts.** `npm run text-captain -- "PR is green"` POSTs `/text/notify`
+  on the running server, which texts `CEOCHAT_ALLOWED_CALLER` - the captain's own
+  number and nobody else's. Gated by `CEOCHAT_TEXT_NOTIFY` (default ON) plus a
+  derived `x-ceochat-notify: sha256(TWILIO_AUTH_TOKEN)` header token, so the raw
+  Twilio token never rides an HTTP header.
+- **Layered security:** `X-Twilio-Signature` validation is MANDATORY (Text Mode
+  does not mount without `TWILIO_AUTH_TOKEN`), and a non-allowlisted sender is
+  SILENTLY dropped - empty TwiML, nothing injected, no reply, nothing revealed.
+- **A2P 10DLC gates outbound only:** texting IN (including MMS) works the moment the
+  messaging webhook is set; SMS replies and notifications unlock when the (cheap)
+  Sole Proprietor registration is approved. The cited walkthrough and cost table
+  live in [`docs/text-mode.md`](./docs/text-mode.md) and the interactive
+  [`docs/setup-guide.html`](./docs/setup-guide.html) (open the file directly in a
+  browser - it is deliberately not served by the web app).
+
+Text Mode reuses the Call Mode secrets: inbound needs `TWILIO_AUTH_TOKEN` +
+`CEOCHAT_ALLOWED_CALLER`; replies and proactive texts also need `TWILIO_ACCOUNT_SID`
++ `TWILIO_PHONE_NUMBER`. Everything is proven by mock legs with no Twilio account
+(see the harness below); live texting is captain-gated on the A2P registration.
+
 ## Validation harness — `npm run validate`
 
 The centerpiece. One command exercises the complete pipeline and prints a readable
@@ -279,6 +319,7 @@ It covers:
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
 | **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
+| **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary; one-line inject; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only) · notify gates (bad token 403, config-off 404, REST framing) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -350,6 +391,8 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    # optional - Call Mode (the Twilio phone leg) adds TWILIO_ACCOUNT_SID /
    # TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER + CEOCHAT_ALLOWED_CALLER +
    # CEOCHAT_PHONE_PIN - see docs/call-mode.md
+   # Text Mode (SMS/MMS on the same number) reuses those Twilio keys; optional
+   # CEOCHAT_TEXT_NOTIFY=0 disables proactive texts - see docs/text-mode.md
    ```
 2. `npm run validate:live` — the live MiniMax leg flips from PENDING to PASS and
    prints the real time-to-first-audio.
@@ -380,6 +423,7 @@ read-aloud script: [`docs/voice-clone.md`](./docs/voice-clone.md).
 bin/
   launch-firstmate.sh      launch a first mate in tmux to attach to (npm run firstmate)
   setup-local-voice.sh     download/build the offline voice stack (npm run voice)
+  text-captain.sh          proactively text the captain via /text/notify (npm run text-captain)
 src/
   config/secrets.ts        secrets loader (outside-repo, gitignored)
   session/session.ts       attach to a target session OR spawn a throwaway; fm-send + pane mirror + benign-modal dismiss
@@ -395,12 +439,13 @@ src/
   cli/dev.ts               the CLI driver entrypoint
   server/protocol.ts       the browser <-> broker WS message contract
   server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
-  server/turns.ts          ONE turn engine shared by web + phone (busy lock, history, verbatim tap)
+  server/turns.ts          ONE turn engine shared by web + phone + SMS (busy lock, history, verbatim tap)
   server/verbatim.ts       the live 1:1 verbatim transcript source (byte-exact tap)
   server/app.ts            HTTP + WS transport (static UI, status, terminal, STT seam)
   server/phone.ts          Call Mode transport shell (Twilio webhook + Media Streams WS bridge)
   server/phone-audio.ts    pure G.711 mu-law codec + 8k↔16k resample + utterance VAD
-  server/twilio.ts         pure Twilio surface: TwiML, signature validation, Call-me REST
+  server/text.ts           Text Mode transport shell (messaging webhook + MMS intake + /text/notify)
+  server/twilio.ts         pure Twilio surface: TwiML, signature validation, Call-me + SMS REST
   server/stt.ts            LOCAL whisper.cpp transcriber (server STT + the e2e gate)
   server/serve.ts          the web server entrypoint (npm run serve)
   server/public/           the single-page UI (index.html, app.js [ESM], styles.css,
@@ -426,7 +471,8 @@ phase0/                    the original de-risking spikes (preserved)
 | `npm run voice` | install the LOCAL offline voice (piper TTS + whisper STT) outside the repo |
 | `npm run clone-voice -- <audio> <voice_id>` | register the captain's OWN cloned MiniMax voice (see `docs/voice-clone.md`) |
 | `npm run firstmate` | launch a first mate in tmux to attach to (prints `CEOCHAT_TARGET`) |
-| `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker; mounts Call Mode when its secrets are paired) |
+| `npm run serve` / `npm start` | run the **web app** (browser UI + WS broker; mounts Call Mode + Text Mode when their secrets are paired) |
+| `npm run text-captain -- "message"` | proactively text the captain through the running server (`/text/notify`) |
 | `npm run dev` | run the CLI driver (interactive or one-shot) |
 | `npm run typecheck` / `build` / `lint` | `tsc --noEmit` (we run `.ts` directly on Node ≥22) |
 | `npm test` | alias for `npm run validate` |
@@ -437,6 +483,10 @@ phase0/                    the original de-risking spikes (preserved)
 - **Call Mode setup (Twilio), security model & cost:**
   [`docs/call-mode.md`](./docs/call-mode.md); build plan:
   `/home/acbecquet/firstmate/data/ceochat-callmode-cx/report.md`.
+- **Text Mode (SMS/MMS), security model & A2P 10DLC cost:**
+  [`docs/text-mode.md`](./docs/text-mode.md); interactive go-live guide for calling
+  + texting: [`docs/setup-guide.html`](./docs/setup-guide.html) (open the file
+  directly - not served by the web app).
 - **Full plan:** `/home/acbecquet/firstmate/data/ceochat-plan-q7/report.md`
   (§2 session model, §6 MiniMax, §7 speakability, §10 phasing).
 - **Phase 0 spikes + findings:** [`phase0/`](./phase0/),
