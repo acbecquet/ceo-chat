@@ -80,8 +80,8 @@ import {
   twimlConnectStream, twilioSignature, validateTwilioSignature, sameNumber, placeCall,
 } from '../src/server/twilio.ts';
 import {
-  createPhoneApp, digitsFromSpoken, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
-  PHONE_WS_PATH, PHONE_TWIML_PATH, type PhoneTimers,
+  createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
+  PHONE_WS_PATH, PHONE_TWIML_PATH, MAX_PENDING_SOCKETS, type PhoneTimers,
 } from '../src/server/phone.ts';
 import { TurnRunner } from '../src/server/turns.ts';
 import { makeTranscriptVerbatim } from '../src/server/verbatim.ts';
@@ -1771,10 +1771,6 @@ await reporter.leg('phone - mu-law codec + 8 kHz transcode (Twilio wire format)'
   t.eq(barges, 1, 'sustained speech DURING playback fires barge-in (once per playback)');
   t.eq(utterances.length, 1, 'barge-in speech is not ALSO collected as an utterance while playing');
 
-  // spoken PIN digits
-  t.eq(digitsFromSpoken('four three two one'), '4321', 'word digits parse ("four three two one")');
-  t.eq(digitsFromSpoken('4 3, 2 1.'), '4321', 'numeric digits parse with punctuation');
-  t.eq(digitsFromSpoken('please merge it'), '', 'non-digit speech yields no digits');
   t.ok(sameNumber('+1 555-000-1111', '+15550001111') && !sameNumber('+15550001111', '+15550002222'), 'phone-number compare ignores formatting');
   const caps = phoneCapabilities(PHONE_TEST_SECRETS);
   t.ok(caps.inbound && caps.outbound, 'full secrets -> inbound + outbound capable');
@@ -1867,13 +1863,14 @@ await reporter.leg('phone - TwiML webhook: allowlist + signature + stream bridge
 });
 
 // P3 - the Media Streams bridge end-to-end over the REAL phone WS: the stream
-// token, the PIN gate (NOTHING reaches the driver until it passes), spoken-PIN,
-// STT -> TurnRunner.run, and onChunk -> media+mark framing whose payload decodes
-// back to the pipeline audio at 8 kHz.
+// token, the keypad-only PIN gate (NOTHING reaches the driver until it passes;
+// pre-auth speech is never even transcribed), STT -> TurnRunner.run, and
+// onChunk -> media+mark framing whose payload decodes back to the pipeline
+// audio at 8 kHz.
 await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; media+mark framing', async (t) => {
   const sends: string[] = [];
   const spoken: string[] = [];
-  const heard = ['four three two one', 'run the checks'];
+  const heard = ['run the checks'];
   const CHUNK_SAMPLES = 2205; // 100ms @ 22050
   const chunkPcm = Buffer.alloc(CHUNK_SAMPLES * 2);
   for (let i = 0; i < CHUNK_SAMPLES; i++) chunkPcm.writeInt16LE(Math.round(Math.sin(i / 9) * 9000), i * 2);
@@ -1923,15 +1920,21 @@ await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; medi
     call.send({ event: 'start', start: { streamSid: 'MZtest1', callSid: 'CAtest1', customParameters: { token } } });
     t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinPrompt)), 'the call is greeted with the PIN prompt (before any injection)');
 
+    // pre-auth speech is ignored ENTIRELY: never transcribed, no attempt burned
+    call.speakUtterance();
+    await realSleep(120);
+    t.eq(heardAudio.length, 0, 'REGRESSION GUARD: pre-auth speech is never transcribed (keypad-only PIN)');
+    t.ok(!spoken.includes(DEFAULT_PHRASES.pinRetry), 'pre-auth speech never burns a PIN attempt');
+
     // wrong DTMF PIN -> retry prompt, still NO injection
     for (const d of '9999') call.send({ event: 'dtmf', dtmf: { digit: d } });
     t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinRetry)), 'a wrong DTMF PIN is refused (retry prompt)');
     t.eq(sends.length, 0, 'REGRESSION GUARD: no Broker.send before a valid PIN');
 
-    // spoken PIN ("four three two one") -> authenticated
-    call.speakUtterance();
-    t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the SPOKEN pin ("four three two one") authenticates the call');
-    t.eq(sends.length, 0, 'the PIN utterance itself is never injected');
+    // the correct keypad PIN -> authenticated
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the keypad (DTMF) PIN authenticates the call');
+    t.eq(sends.length, 0, 'PIN entry itself is never injected');
 
     // now a real command: utterance -> whisper stub -> TurnRunner -> driver.send
     await realSleep(100); // let the greeting's mark echo settle half-duplex
@@ -1943,7 +1946,7 @@ await reporter.leg('phone - media WS: PIN gate blocks injection; STT->send; medi
     // REGRESSION GUARD (double mu-law decode): whisper must receive the captain's
     // REAL audio - 16 kHz, the sine's sane amplitude and energy. A second mu-law
     // decode of already-decoded PCM turns it into near-full-scale garbage.
-    t.ok(heardAudio.length >= 2, 'the transcribe stub saw the PIN and command utterances', `${heardAudio.length}`);
+    t.ok(heardAudio.length >= 1, 'the transcribe stub saw the command utterance', `${heardAudio.length}`);
     for (const [i, a] of heardAudio.entries()) {
       t.eq(a.sampleRate, 16000, `utterance ${i}: handed to whisper at 16 kHz`);
       t.ok(a.bytes > 0 && a.bytes % 2 === 0, `utterance ${i}: whole s16le samples`, `${a.bytes} bytes`);
@@ -2004,7 +2007,7 @@ await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the tur
     terminalSnapshot: () => 'ceo-chat',
     stop: async () => {},
   };
-  const heard = ['4321', 'start the deploy build', '4321', 'summarize the logs'];
+  const heard = ['start the deploy build', 'summarize the logs'];
   const runner = new TurnRunner({ driver });
   const phone = createPhoneApp({
     runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
@@ -2019,7 +2022,7 @@ await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the tur
     const twiml1 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
     const call1 = await connectPhoneClient(app.port, { echoMarks: false });
     call1.send({ event: 'start', start: { streamSid: 'MZbarge', customParameters: { token: tokenFromTwiml(twiml1.body) } } });
-    call1.speakUtterance(); // spoken PIN "4321"
+    for (const d of PHONE_TEST_SECRETS.pin!) call1.send({ event: 'dtmf', dtmf: { digit: d } });
     call1.speakUtterance(); // the command -> long turn starts
     t.ok(await until(() => sends.length === 1), 'the command started a turn');
     t.ok(await until(() => call1.out.some((m) => m.event === 'mark')), 'reply audio is on the wire (unacked mark = still playing)');
@@ -2035,8 +2038,7 @@ await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the tur
     const twiml2 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
     const call2 = await connectPhoneClient(app.port);
     call2.send({ event: 'start', start: { streamSid: 'MZhang', customParameters: { token: tokenFromTwiml(twiml2.body) } } });
-    call2.speakUtterance(); // PIN
-    await until(() => heard.length === 1);
+    for (const d of PHONE_TEST_SECRETS.pin!) call2.send({ event: 'dtmf', dtmf: { digit: d } });
     call2.speakUtterance(); // command -> long turn
     t.ok(await until(() => sends.length === 2), 'the second call started its own turn');
     call2.send({ event: 'stop' });
@@ -2047,11 +2049,12 @@ await reporter.leg('phone - barge-in sends clear + aborts; hangup aborts the tur
   }
 });
 
-// P4b - unauthenticated-WS hardening on the tunnel-exposed /phone path: a
-// connection that never presents a webhook-minted token is closed at the
-// handshake deadline (it can NOT hold the single call slot), and an anonymous
-// connect/refused-token disconnect NEVER cancels the captain's in-flight turn.
-await reporter.leg('phone - unauth WS: handshake deadline frees the slot; anonymous disconnect never cancels a turn', async (t) => {
+// P4b - unauthenticated-WS hardening on the tunnel-exposed /phone path: the call
+// slot is claimed ONLY by a token-authorized `start` frame, so anonymous/pre-start
+// sockets never make a legitimate call see busy; they stay bounded (handshake
+// deadline + pre-start cap), a forged-token stream is still refused, and anonymous
+// churn NEVER cancels the captain's in-flight turn.
+await reporter.leg('phone - unauth WS: anonymous sockets never hold the slot; tokened start claims it; deadline + cap bound them', async (t) => {
   const HANDSHAKE_MS = 7777;
   const pending: Array<{ fn: () => void; ms: number }> = [];
   const manualTimers: PhoneTimers = {
@@ -2082,23 +2085,43 @@ await reporter.leg('phone - unauth WS: handshake deadline frees the slot; anonym
   });
   const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
   try {
-    // an anonymous connection (never sends `start`) grabs the single call slot...
+    // an idle anonymous connection (never sends `start`) does NOT hold the slot
     const idle = await connectPhoneClient(app.port);
-    t.ok(await until(() => phone.activeCall), 'an idle anonymous connection holds the call slot');
-    const shutOut = await connectPhoneClient(app.port);
-    t.ok(await until(() => shutOut.closed), 'a real call arriving meanwhile is refused (busy)');
-    // ...until the handshake deadline fires and frees it
-    const armed = pending.find((p) => p.ms === HANDSHAKE_MS);
-    t.ok(!!armed, 'a handshake deadline was armed for the fresh connection');
-    armed!.fn();
-    t.ok(await until(() => idle.closed), 'the never-started connection is CLOSED at the deadline');
-    t.ok(await until(() => !phone.activeCall), 'the call slot is freed for real calls');
+    await realSleep(120);
+    t.ok(!phone.activeCall, 'an idle anonymous connection does NOT hold the call slot');
+
+    // the captain's real tokened call connects fine while the anonymous socket sits there
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZreal', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    t.ok(await until(() => phone.activeCall), 'a webhook-tokened start CLAIMS the slot while anonymous sockets sit there');
+    t.ok(!idle.closed, 'the pre-start socket neither blocked the real call nor was bumped by it');
+
+    // a forged-token stream is still refused, live call or not
+    const forged = await connectPhoneClient(app.port);
+    forged.send({ event: 'start', start: { streamSid: 'MZevil', customParameters: { token: 'ff'.repeat(16) } } });
+    t.ok(await until(() => forged.closed), 'the forged-token stream is refused');
+    t.ok(phone.activeCall, 'the captain call stays up through the forged attempt');
+
+    // a second VALID token cannot steal the slot mid-call (single-call semantics)
+    const twiml2 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const second = await connectPhoneClient(app.port);
+    second.send({ event: 'start', start: { streamSid: 'MZsecond', customParameters: { token: tokenFromTwiml(twiml2.body) } } });
+    t.ok(await until(() => second.closed), 'a second tokened stream during a live call is refused (busy)');
+    t.ok(phone.activeCall, 'the live call is untouched');
+
+    call.send({ event: 'stop' });
+    t.ok(await until(() => !phone.activeCall), 'hangup frees the slot');
+
+    // the handshake deadline still closes never-started sockets
+    for (const p of pending.filter((x) => x.ms === HANDSHAKE_MS)) p.fn();
+    t.ok(await until(() => idle.closed), 'the never-started connection is CLOSED at the handshake deadline');
 
     // an in-flight turn survives anonymous churn on /phone
     const turnDone = runner.run('long job', 'web');
     t.ok(await until(() => runner.busy), 'a (web-initiated) turn is in flight');
     const intruder = await connectPhoneClient(app.port);
-    intruder.send({ event: 'start', start: { streamSid: 'MZevil', customParameters: { token: 'ff'.repeat(16) } } });
+    intruder.send({ event: 'start', start: { streamSid: 'MZevil2', customParameters: { token: 'ff'.repeat(16) } } });
     t.ok(await until(() => intruder.closed), 'the forged-token stream is refused');
     const ghost = await connectPhoneClient(app.port);
     ghost.close();
@@ -2108,38 +2131,45 @@ await reporter.leg('phone - unauth WS: handshake deadline frees the slot; anonym
     finishTurn = true;
     await turnDone;
     t.ok(!runner.busy, 'the turn completed normally');
+
+    // pre-start sockets are capped so they cannot pile up
+    const anons: PhoneWsClient[] = [];
+    for (let i = 0; i < MAX_PENDING_SOCKETS; i++) anons.push(await connectPhoneClient(app.port));
+    const overflow = await connectPhoneClient(app.port);
+    t.ok(await until(() => overflow.closed), 'a pre-start socket beyond the cap is refused');
+    t.ok(anons.every((a) => !a.closed), 'sockets within the cap stay in their handshake window');
+    t.ok(!phone.activeCall, 'a full pre-start pool still holds no call slot');
   } finally {
     await app.close();
   }
 });
 
-// P4c - spoken-PIN robustness: pre-auth stray speech whose homophones extract
-// FEWER digits than the PIN ("go for it" -> "4") is ignored entirely - it can
-// never burn the 3-attempt lockout - while a wrong FULL-LENGTH spoken PIN still
-// counts; and a hangup while an utterance is mid-transcription never re-subscribes
-// the torn-down call to the shared TurnRunner (the listener-leak race).
-await reporter.leg('phone - spoken PIN: stray speech never burns the lockout; hangup mid-transcription leaks no listener', async (t) => {
-  const driver: Driver = {
+// P4c - keypad-only PIN: pre-auth speech is ignored ENTIRELY (never transcribed,
+// never a failed attempt, never injected - no STT gremlins can burn the lockout);
+// and a hangup while an utterance is mid-transcription never re-subscribes the
+// torn-down call to the shared TurnRunner nor injects the late text.
+await reporter.leg('phone - keypad-only PIN: pre-auth speech is ignored entirely; hangup mid-transcription leaks nothing', async (t) => {
+  const makeDriver = (sends: string[]): Driver => ({
     meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
     start: async () => {},
-    send: async () => ({ reply: 'ok', narration: 'Ok.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }),
+    send: async (text) => {
+      sends.push(text);
+      return { reply: 'ok', narration: 'Ok.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
     terminalSnapshot: () => 'ceo-chat',
     stop: async () => {},
-  };
+  });
 
-  // ---- rig A: homophone-laden stray speech in the pre-auth window
+  // ---- rig A: stray speech in the pre-auth window
   {
+    const sends: string[] = [];
     const spoken: string[] = [];
-    const heard = [
-      'go for it', // -> "4": 1 digit, below the PIN length
-      'i ate way too much oh well', // -> "820": still below the PIN length
-      'nine nine nine nine', // -> "9999": a wrong FULL-LENGTH attempt
-      'four three two one', // -> the correct PIN
-    ];
+    let transcribeCalls = 0;
+    const driver = makeDriver(sends);
     const runner = new TurnRunner({ driver });
     const phone = createPhoneApp({
       runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
-      transcribe: async () => heard.shift() ?? '',
+      transcribe: async () => { transcribeCalls++; return 'go for it'; },
       synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
       log: () => {},
     });
@@ -2148,22 +2178,22 @@ await reporter.leg('phone - spoken PIN: stray speech never burns the lockout; ha
       const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
       const call = await connectPhoneClient(app.port);
       call.send({ event: 'start', start: { streamSid: 'MZstray', customParameters: { token: tokenFromTwiml(twiml.body) } } });
-      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinPrompt)), 'the call is greeted with the PIN prompt');
+      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinPrompt)), 'the call is greeted with the keypad PIN prompt');
 
       const retries = (): number => spoken.filter((s) => s === DEFAULT_PHRASES.pinRetry).length;
-      call.speakUtterance(); // "go for it"
-      t.ok(await until(() => heard.length === 3), 'stray utterance 1 was transcribed');
-      call.speakUtterance(); // "i ate way too much oh well"
-      t.ok(await until(() => heard.length === 2), 'stray utterance 2 was transcribed');
-      await realSleep(120);
-      t.eq(retries(), 0, 'sub-PIN-length digit extractions are IGNORED: no failed attempt, no retry prompt');
+      call.speakUtterance();
+      call.speakUtterance();
+      await realSleep(150);
+      t.eq(transcribeCalls, 0, 'pre-auth speech is NEVER transcribed (keypad-only PIN)');
+      t.eq(retries(), 0, 'pre-auth speech burns no attempt: no retry prompt');
+      t.eq(sends.length, 0, 'pre-auth speech injects nothing');
       t.ok(!call.closed, 'stray speech never progresses the lockout');
 
-      call.speakUtterance(); // "nine nine nine nine"
-      t.ok(await until(() => retries() === 1), 'a wrong FULL-LENGTH spoken PIN still burns an attempt');
+      for (const d of '9999') call.send({ event: 'dtmf', dtmf: { digit: d } });
+      t.ok(await until(() => retries() === 1), 'a wrong keypad PIN still burns an attempt');
 
-      call.speakUtterance(); // the correct PIN
-      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the correct PIN still authenticates - the strays cost nothing');
+      for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the correct keypad PIN authenticates - the strays cost nothing');
       t.ok(!spoken.includes(DEFAULT_PHRASES.pinLocked), 'the lockout was never reached');
       call.close();
     } finally {
@@ -2171,14 +2201,16 @@ await reporter.leg('phone - spoken PIN: stray speech never burns the lockout; ha
     }
   }
 
-  // ---- rig B: hangup while the spoken PIN is mid-transcription
+  // ---- rig B: hangup while an authenticated utterance is mid-transcription
   {
-    let releasePin: ((text: string) => void) | null = null;
+    const sends: string[] = [];
+    let releaseUtterance: ((text: string) => void) | null = null;
+    const driver = makeDriver(sends);
     const runner = new TurnRunner({ driver });
     const listenerCount = (): number => (runner as unknown as { listeners: Set<unknown> }).listeners.size;
     const phone = createPhoneApp({
       runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
-      transcribe: () => new Promise<string>((res) => { releasePin = res; }),
+      transcribe: () => new Promise<string>((res) => { releaseUtterance = res; }),
       synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
       log: () => {},
     });
@@ -2188,13 +2220,16 @@ await reporter.leg('phone - spoken PIN: stray speech never burns the lockout; ha
       const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
       const call = await connectPhoneClient(app.port);
       call.send({ event: 'start', start: { streamSid: 'MZrace', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+      for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+      t.ok(await until(() => listenerCount() === baseline + 1), 'the authenticated call subscribed to the shared runner');
       call.speakUtterance();
-      t.ok(await until(() => releasePin !== null), 'the spoken PIN reached whisper (transcription pending)');
+      t.ok(await until(() => releaseUtterance !== null), 'the utterance reached whisper (transcription pending)');
       call.send({ event: 'stop' }); // hangup while whisper is still working
       t.ok(await until(() => !phone.activeCall), 'the call tears down on hangup');
-      releasePin!('four three two one'); // whisper resolves AFTER teardown
+      releaseUtterance!('run the checks'); // whisper resolves AFTER teardown
       await realSleep(150);
-      t.eq(listenerCount(), baseline, 'REGRESSION GUARD: the late PIN never re-subscribes the dead call to the shared runner');
+      t.eq(listenerCount(), baseline, 'REGRESSION GUARD: the late transcription never re-subscribes the dead call to the shared runner');
+      t.eq(sends.length, 0, 'the late transcription is never injected');
       call.close();
     } finally {
       await app.close();

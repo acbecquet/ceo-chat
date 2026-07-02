@@ -499,10 +499,14 @@ streaming TTS. Decision-ready plan:
 - **Phone security (layered, all mock-asserted):** caller-ID allowlist at the webhook
   (`From`/`To` vs `CEOCHAT_ALLOWED_CALLER` -> `<Reject/>`); `X-Twilio-Signature`
   HMAC validation; a SINGLE-USE short-TTL stream token minted by the webhook and
-  required in the WS `start` frame (a direct WS hit is closed); a DTMF-or-spoken PIN
-  (`CEOCHAT_PHONE_PIN`) before the FIRST injection on every call (3 failures end it;
-  a spoken utterance counts as an attempt ONLY when its extracted digits reach the
-  PIN length - stray homophones like "go for it" -> "4" never burn the lockout);
+  required in the WS `start` frame (a direct WS hit is closed). The single call
+  slot is claimed ONLY by a token-authorized `start` - anonymous/pre-start sockets
+  never hold it (so they can never make the captain's call see busy) and are
+  bounded by the handshake deadline + a pre-start socket cap (`MAX_PENDING_SOCKETS`);
+  frames other than `start`/`stop` are inert until an authorized start. A
+  KEYPAD-ONLY (DTMF) PIN (`CEOCHAT_PHONE_PIN`) before the FIRST injection on every
+  call (3 failures end it and hard-stop further attempts; pre-auth speech is
+  ignored entirely - never transcribed, never an attempt, no STT gremlins);
   `guardUtterance` on the voice leg. Outbound "Call me" (web button -> `call-me`
   frame -> Twilio REST `Calls.json`) is the primary flow.
 - **Interactive-prompt fallback (captain-approved):** unclear/absent answer to a
@@ -519,6 +523,9 @@ streaming TTS. Decision-ready plan:
   resume: server replays the FULL turn history (`sent`/`reply`/`verbatim` with
   `replay:true`, audio for the newest turn only); the client dedupes by turn number
   and reconnects on visibilitychange - dead zones/app-switching never lose history.
+  Reconnect is SINGLE-FLIGHT (one cancellable backoff timer; `connect()` refuses to
+  stack a socket while one is CONNECTING/OPEN; stale-socket handlers are inert), so
+  the visibility handler + the timer can never double-connect and double-play audio.
 - **Protocol additions:** client `call-me`; server `sent` (echo of every accepted
   captain line, with `source: 'web'|'phone'` + `ts`), `verbatim`, `phone` (call
   state); `hello.phone` advertises Call-me availability.
@@ -528,13 +535,16 @@ streaming TTS. Decision-ready plan:
   when allowlist+PIN exist; outbound needs the TWILIO_* trio too.
 - **Validation:** mock Media Streams client legs in `npm run validate` (no Twilio
   creds): mu-law transcode + VAD, webhook allowlist/signature/token + Call-me REST
-  shape, PIN gate (NOTHING injected until it passes), spoken-PIN stray-speech
-  ignore + hangup-mid-transcription listener-leak guard, STT->send, media+mark
-  framing round-trip, barge-in `clear`+abort, hangup abort, re-ask/safe-default policy
-  (incl. the 'send-cancel' config flip), byte-exact verbatim (pure tap + over the
-  WS), lossless segments/answer card/PWA assets/reconnect resume. GOTCHA for tests:
-  `asMediaFrame` returns the ENCODED wire string - send it with `ws.send(...)`, not
-  through a JSON-stringifying helper (double-encoding made frames invisible).
+  shape, keypad-only PIN gate (NOTHING injected until it passes; pre-auth speech
+  never transcribed and never burns an attempt) + hangup-mid-transcription
+  listener-leak guard, anonymous-socket hardening (pre-start sockets never hold
+  the call slot, tokened start claims it, deadline + cap bound them), STT->send,
+  media+mark framing round-trip, barge-in `clear`+abort, hangup abort,
+  re-ask/safe-default policy (incl. the 'send-cancel' config flip), byte-exact
+  verbatim (pure tap + over the WS), lossless segments/answer card/PWA assets/
+  reconnect resume. GOTCHA for tests: `asMediaFrame` returns the ENCODED wire
+  string - send it with `ws.send(...)`, not through a JSON-stringifying helper
+  (double-encoding made frames invisible).
 - **Live e2e over a real number is captain-gated:** needs the captain's Twilio
   account + secrets (checklist in docs/call-mode.md). Never fabricate Twilio creds.
 

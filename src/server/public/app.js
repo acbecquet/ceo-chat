@@ -177,27 +177,38 @@ import { splitFencedSegments, extractPrompt } from '/lib/prompt-card.js';
   var webSpeechOk = !!SR;
 
   // ---- websocket (reconnect + liveness, cellular-friendly) ----
-  var ws = null, sampleRate = 22050, pingTimer = null, reconnectDelay = 800;
+  // Reconnect is SINGLE-FLIGHT: one cancellable timer, and connect() refuses to
+  // stack a second socket while one is CONNECTING/OPEN - the visibilitychange
+  // handler and the backoff timer can never create two live sockets (which would
+  // double-play every broadcast audio frame).
+  var ws = null, sampleRate = 22050, pingTimer = null, reconnectDelay = 800, reconnectTimer = null;
   function wsUrl() { return (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws'; }
   function connect() {
-    ws = new WebSocket(wsUrl());
-    ws.onopen = function () {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+    var socket = new WebSocket(wsUrl());
+    ws = socket;
+    socket.onopen = function () {
+      if (ws !== socket) { try { socket.close(); } catch (e) {} return; }
       els.connDot.classList.add('up');
       setControls(true);
       reconnectDelay = 800;
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(function () { sendJson({ type: 'ping' }); }, 25000);
     };
-    ws.onclose = function () {
+    socket.onclose = function () {
+      if (ws !== socket) return; // a stale socket closing must not touch live state
       els.connDot.classList.remove('up');
       setControls(false);
       serverState = 'idle'; refreshStatus();
       if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      setTimeout(connect, reconnectDelay);
-      reconnectDelay = Math.min(8000, reconnectDelay * 1.7);
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(8000, reconnectDelay * 1.7);
+      }
     };
-    ws.onerror = function () { try { ws.close(); } catch (e) {} };
-    ws.onmessage = function (ev) { var m; try { m = JSON.parse(ev.data); } catch (e) { return; } handle(m); };
+    socket.onerror = function () { try { socket.close(); } catch (e) {} };
+    socket.onmessage = function (ev) { if (ws !== socket) return; var m; try { m = JSON.parse(ev.data); } catch (e) { return; } handle(m); };
   }
   function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }
   // Coming back from the app switcher / screen lock: reconnect immediately.

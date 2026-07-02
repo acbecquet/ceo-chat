@@ -49,8 +49,9 @@ MiniMax cloned voice, Gemini, and whisper are already configured - unchanged by 
 - **Outbound (primary):** tap **"Call me"** in the web app.
   first mate rings `CEOCHAT_ALLOWED_CALLER` from your Twilio number.
 - **Inbound (gated secondary):** call your Twilio number from the allowlisted phone.
-- Either way the call starts with a **PIN prompt**: enter `CEOCHAT_PHONE_PIN` on the keypad (or speak the digits).
-  Three failures end the call.
+- Either way the call starts with a **PIN prompt**: enter `CEOCHAT_PHONE_PIN` on the keypad.
+  PIN entry is keypad-only; anything you say before the PIN passes is ignored entirely (never transcribed, never counted as an attempt).
+  Three keypad failures end the call.
   Nothing is ever injected into the session before the PIN passes.
 - Talk normally; pause and first mate answers.
   **Speak over it to interrupt** (barge-in flushes the audio and cancels the turn).
@@ -73,7 +74,8 @@ The spoken phrases are right next to it.
 - **Caller-ID allowlist** - the webhook rejects any call where neither `From` nor `To` is `CEOCHAT_ALLOWED_CALLER` (`<Reject/>`, the call never connects).
 - **Webhook authentication** - `X-Twilio-Signature` (HMAC-SHA1, keyed by the auth token) is validated on `/phone/twiml`, so a forged POST cannot mint a stream.
 - **Single-use stream token** - the TwiML embeds a short-TTL token that must come back in the Media Streams `start` frame; a direct WS hit on the tunnel-exposed `/phone` path is closed immediately.
-- **PIN before the first injection** - on every call, inbound or outbound (caller ID is spoofable; the PIN is not).
+  The call slot is claimed only by a token-authorized `start`, so anonymous sockets can never make your call see busy (they are bounded by a handshake deadline and a pre-start cap).
+- **Keypad PIN before the first injection** - on every call, inbound or outbound (caller ID is spoofable; the PIN is not). Speech before the PIN passes is ignored entirely.
 - **Confirmation guard** - consequential actions still require a clear spoken confirm/cancel (`guardUtterance`), and the timeout default above never approves.
 - **One turn at a time** - the phone and the web share a single serialized turn engine.
 
@@ -87,7 +89,7 @@ The spoken phrases are right next to it.
 ## Validation
 
 `npm run validate` includes mock Call Mode legs (no Twilio account, no network):
-the mu-law wire transcode, the webhook allowlist + signature + token, the PIN gate (nothing injected until it passes), STT -> send, media+mark framing, barge-in `clear` + turn abort, hangup abort, the interactive-prompt re-ask/safe-default policy, and the byte-exact verbatim web transcript.
+the mu-law wire transcode, the webhook allowlist + signature + token, the keypad-only PIN gate (nothing injected until it passes; pre-auth speech ignored entirely), anonymous-socket hardening (pre-start sockets never hold the call slot; handshake deadline + cap), STT -> send, media+mark framing, barge-in `clear` + turn abort, hangup abort, the interactive-prompt re-ask/safe-default policy, and the byte-exact verbatim web transcript.
 
 ## Remaining live test (captain-gated)
 

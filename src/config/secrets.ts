@@ -12,8 +12,8 @@
 //   TWILIO_PHONE_NUMBER   - the purchased US local number calls come from.
 //   CEOCHAT_ALLOWED_CALLER - the captain's mobile (caller-ID allowlist; also the
 //                            number the outbound "Call me" button rings).
-//   CEOCHAT_PHONE_PIN     - 4-6 digit PIN required (DTMF or spoken) before the
-//                            first injection on ANY call, inbound or outbound.
+//   CEOCHAT_PHONE_PIN     - 4-6 digit PIN required (keypad/DTMF entry only) before
+//                            the first injection on ANY call, inbound or outbound.
 //
 // A blank/absent key does NOT throw — callers decide whether to run the real
 // credentialed call or gracefully fall back to the mock path. This is what lets

@@ -18,8 +18,12 @@
 //   3. A SINGLE-USE, short-TTL stream token minted by the webhook and carried into
 //      the WS `start` frame as a <Parameter> - a direct WS connection to the
 //      tunnel-exposed /phone path without a fresh token is closed immediately.
-//   4. A DTMF-or-spoken PIN (CEOCHAT_PHONE_PIN) BEFORE the first injection - on
-//      EVERY call, inbound or outbound. Three failures end the call.
+//      The single call slot is claimed only by a token-authorized `start`:
+//      anonymous/pre-start sockets never occupy the line (they are bounded by the
+//      handshake deadline and a pre-start socket cap).
+//   4. A keypad-only (DTMF) PIN (CEOCHAT_PHONE_PIN) BEFORE the first injection - on
+//      EVERY call, inbound or outbound. Three failures end the call. Speech before
+//      the PIN passes is ignored entirely (never transcribed, never an attempt).
 //   5. guardUtterance (§3.5) on the voice leg: a consequential confirmation needs a
 //      CLEAR spoken confirm/cancel; anything ambiguous is re-asked, never sent.
 //   6. Turns stay serialized (the shared TurnRunner busy lock).
@@ -58,9 +62,11 @@ const MEDIA_MESSAGE_BYTES = 4000;
 const PIN_MAX_ATTEMPTS = 3;
 const TOKEN_TTL_MS = 5 * 60 * 1000;
 // A connection must present a valid webhook-minted token in its `start` frame
-// within this window, or it is closed - an anonymous WS hit on the tunnel-exposed
-// /phone path can never hold the single call slot.
+// within this window, or it is closed. Pre-start sockets never hold the call slot
+// (only an authorized `start` claims it); the deadline plus the cap below keep
+// anonymous hits on the tunnel-exposed /phone path from piling up.
 const HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+export const MAX_PENDING_SOCKETS = 8;
 
 /** Drop expired stream tokens so unconsumed mints never accumulate. Pure. */
 export function pruneExpiredTokens(tokens: Map<string, number>, now: number): void {
@@ -106,29 +112,13 @@ export interface PhonePhrases {
 }
 
 export const DEFAULT_PHRASES: PhonePhrases = {
-  pinPrompt: 'First mate here. Enter your PIN to continue.',
+  pinPrompt: 'First mate here. Enter your PIN on the keypad to continue.',
   pinRetry: 'That PIN did not match. Try again.',
   pinLocked: 'Too many failed attempts. Goodbye.',
   greeting: 'You are connected. Go ahead, captain.',
   sttUnavailable:
     'I cannot transcribe speech on this call right now. Use the app to type instead.',
 };
-
-// Spoken-PIN helper: "one two three four" / "1 2 3 4" -> "1234". Pure + asserted.
-const WORD_DIGITS: Record<string, string> = {
-  zero: '0', oh: '0', o: '0', one: '1', won: '1', two: '2', to: '2', too: '2',
-  three: '3', four: '4', for: '4', five: '5', six: '6', seven: '7',
-  eight: '8', ate: '8', nine: '9',
-};
-export function digitsFromSpoken(text: string): string {
-  let out = '';
-  for (const tok of String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ')) {
-    if (!tok) continue;
-    if (/^\d+$/.test(tok)) out += tok;
-    else if (WORD_DIGITS[tok]) out += WORD_DIGITS[tok];
-  }
-  return out;
-}
 
 // ── the transport ──────────────────────────────────────────────────────────────
 
@@ -139,7 +129,7 @@ export interface PhoneTimers {
 
 export interface PhoneAppOptions {
   runner: TurnRunner;
-  /** whisper STT (absent -> DTMF-only PIN, spoken commands unavailable). */
+  /** whisper STT (absent -> spoken commands unavailable; the PIN is keypad-only). */
   transcribe?: (pcm: Buffer, sampleRate: number) => Promise<string>;
   /** TTS for canned phrases (PIN prompt / greeting / re-asks). Absent -> silent. */
   synthPrompt?: (text: string) => Promise<{ pcm: Buffer; sampleRate: number }>;
@@ -222,7 +212,12 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
   };
 
   // ── one live call ────────────────────────────────────────────────────────────
+  // `session` is the single ACTIVE call - claimed only when a stream presents a
+  // valid webhook-minted token in its `start` frame. Sockets that have not started
+  // yet wait in `pending` (bounded by MAX_PENDING_SOCKETS + the handshake deadline)
+  // and can never make a legitimate call see "busy".
   let session: CallSession | null = null;
+  const pending = new Set<CallSession>();
 
   class CallSession {
     private readonly ws: WebSocket;
@@ -271,13 +266,20 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         case 'connected':
           break;
         case 'start': {
-          this.streamSid = msg.start?.streamSid || msg.streamSid || '';
           const token = msg.start?.customParameters?.token;
           if (!consumeToken(token)) {
             log('phone: stream start REFUSED - missing/expired token (direct WS hit?)');
             this.ws.close(1008, 'unauthorized');
             return;
           }
+          if (session) {
+            log('phone: a call is already active - refusing a second stream');
+            this.ws.close(1013, 'busy');
+            return;
+          }
+          session = this;
+          pending.delete(this);
+          this.streamSid = msg.start?.streamSid || msg.streamSid || '';
           this.started = true;
           if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
           emitState('in-call', msg.start?.callSid);
@@ -286,7 +288,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
           break;
         }
         case 'media': {
-          if (!this.streamSid) return; // no audio before an authorized start
+          if (!this.started) return; // no audio before an authorized start
           const payload = msg.media?.payload || '';
           if (!payload) return;
           const pcm8k = mulawToPcmS16le(Buffer.from(payload, 'base64'));
@@ -294,14 +296,16 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
           break;
         }
         case 'dtmf': {
+          if (!this.started) return; // no PIN attempts before an authorized start
           const digit = (msg.dtmf?.digit || '').trim();
-          if (!this.authed && /^[0-9]$/.test(digit)) {
+          if (!this.authed && this.pinAttempts < PIN_MAX_ATTEMPTS && /^[0-9]$/.test(digit)) {
             this.pinBuffer += digit;
             this.checkPinBuffer();
           }
           break;
         }
         case 'mark': {
+          if (!this.started) return;
           if (this.outstandingMarks > 0) this.outstandingMarks--;
           if (this.outstandingMarks === 0) {
             this.detector.playing = false;
@@ -349,9 +353,12 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
 
     // ---- captain speech ----
     private async onUtterance(pcm8k: Uint8Array): Promise<void> {
-      if (!this.streamSid || this.closed) return;
+      if (!this.started || this.closed) return;
+      // The PIN is keypad-only: speech before it passes is ignored entirely -
+      // never transcribed, never counted as an attempt, never injected.
+      if (!this.authed) return;
       if (!opts.transcribe) {
-        if (this.authed && !this.sttWarned) { this.sttWarned = true; this.speak(phrases.sttUnavailable); }
+        if (!this.sttWarned) { this.sttWarned = true; this.speak(phrases.sttUnavailable); }
         return;
       }
       const { pcm, sampleRate } = phonePcmToWhisperPcm(pcm8k);
@@ -364,12 +371,6 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       }
       if (this.closed) return;
       if (!text) return;
-      if (!this.authed) {
-        const digits = digitsFromSpoken(text);
-        const pin = secrets.pin || '';
-        if (pin && digits.length >= pin.length) this.tryPin(digits.slice(-pin.length));
-        return;
-      }
       this.handleCommand(text);
     }
 
@@ -529,8 +530,11 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       // dropping must never abort the captain's live turn.
       if (this.authed) runner.cancel('phone hangup (' + reason + ')');
       try { this.ws.close(); } catch { /* ignore */ }
+      pending.delete(this);
       if (session === this) session = null;
-      emitState('ended', reason);
+      // Only a stream that actually started is a call the UI should see end -
+      // anonymous/pre-start churn never flips the phone pill.
+      if (this.started) emitState('ended', reason);
       log('phone: call torn down - ' + reason);
     }
   }
@@ -585,12 +589,12 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       const path = (req.url || '/').split('?')[0]!;
       if (path !== PHONE_WS_PATH) return false;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        if (session) {
-          log('phone: a call is already active - refusing a second stream');
+        if (pending.size >= MAX_PENDING_SOCKETS) {
+          log('phone: too many pre-start connections - refusing');
           ws.close(1013, 'busy');
           return;
         }
-        session = new CallSession(ws);
+        pending.add(new CallSession(ws));
       });
       return true;
     },
@@ -626,6 +630,8 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
 
     close(): void {
       try { wss.close(); } catch { /* ignore */ }
+      for (const p of [...pending]) p.end('server shutdown');
+      pending.clear();
       if (session) {
         session.end('server shutdown');
         session = null;
