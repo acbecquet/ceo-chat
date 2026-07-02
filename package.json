@@ -19,7 +19,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit",
-    "test": "node test/validate.ts"
+    "test": "node test/validate.ts",
+    "text-captain": "bash bin/text-captain.sh"
   },
   "dependencies": {
     "@xterm/xterm": "^6.0.0",

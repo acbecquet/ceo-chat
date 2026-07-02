@@ -25,6 +25,10 @@ Nothing below `Broker.send` changed.
 
 ## Captain setup checklist
 
+**The interactive setup guide covers this end to end.**
+Open `docs/setup-guide.html` directly in a browser (it is a single self-contained file, not served by the web app): it walks the Twilio console for calling AND texting, the A2P 10DLC registration with the cited cost table, the exact secrets.env block generated from your own numbers, and the live-test scripts, with persistent checkboxes so you can pick up where you left off.
+The list below stays as the quick reference for the voice leg alone.
+
 1. **Create a Twilio account** (pay-as-you-go, no plan commitment).
 2. **Buy one US local phone number** in the Twilio console (about $1.15/mo).
 3. **Point the number's Voice webhook** (configure > Voice > "A call comes in") at:

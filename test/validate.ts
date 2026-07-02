@@ -13,7 +13,7 @@
 // and measures true time-to-first-audio; an unpaired-credential 1004/1008 is
 // reported as PENDING (expected), never a crash.
 
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, realpathSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, realpathSync, utimesSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -79,6 +79,13 @@ import {
 import {
   twimlConnectStream, twilioSignature, validateTwilioSignature, sameNumber, placeCall,
 } from '../src/server/twilio.ts';
+// Text Mode (SMS/MMS on the same Twilio number).
+import {
+  createTextApp, formatSmsReply, buildInjectedText, mediaExtension, notifyToken,
+  ordinalName, describeMediaFailures,
+  TEXT_WEBHOOK_PATH, TEXT_NOTIFY_PATH, SMS_BODY_LIMIT,
+} from '../src/server/text.ts';
+import { textCapabilities, textNotifyEnabled } from '../src/config/secrets.ts';
 import {
   createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
   PHONE_WS_PATH, PHONE_TWIML_PATH, MAX_PENDING_SOCKETS, type PhoneTimers,
@@ -2516,6 +2523,388 @@ await reporter.leg('web - iPhone UI: lossless segments, answer card, PWA assets,
   } finally {
     await app.close();
     await mock.close();
+  }
+});
+
+// ═══════════════ TEXT MODE (SMS/MMS on the same Twilio number) ═══════════════
+// The text transport is proven with faked Twilio HTTP - no account, no network.
+// Signed webhook POSTs hit the REAL /text/webhook endpoint mounted by
+// createWebApp against the in-memory driver; outbound REST (replies + notify)
+// and MMS media fetches go through an injected fetch that records everything.
+
+const TEXT_WEBHOOK_URL = PHONE_PUBLIC_URL + TEXT_WEBHOOK_PATH;
+
+// POST the Twilio messaging webhook (optionally with a valid signature).
+async function postText(baseUrl: string, params: Record<string, string>, sign = true): Promise<{ status: number; body: string }> {
+  const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
+  if (sign) headers['x-twilio-signature'] = twilioSignature(PHONE_TEST_SECRETS.authToken!, TEXT_WEBHOOK_URL, params);
+  const res = await fetch(baseUrl.replace(/\/$/, '') + TEXT_WEBHOOK_PATH, {
+    method: 'POST', headers, body: new URLSearchParams(params).toString(),
+  });
+  return { status: res.status, body: await res.text() };
+}
+
+interface RecordedSms { url: string; auth: string; params: URLSearchParams; }
+interface RecordedMediaHit { url: string; auth: string; }
+
+// One injected fetch for a text leg: records Messages.json POSTs (replies +
+// notifications) and serves MMS media GETs by URL suffix.
+function makeTextFetch(media: Record<string, { bytes: Buffer; contentType: string }>): {
+  fetchImpl: typeof fetch; smsSent: RecordedSms[]; mediaHits: RecordedMediaHit[];
+} {
+  const smsSent: RecordedSms[] = [];
+  const mediaHits: RecordedMediaHit[] = [];
+  const fetchImpl = (async (url: string | URL, init?: { headers?: Record<string, string>; body?: string }) => {
+    const u = String(url);
+    const auth = init?.headers?.Authorization || '';
+    if (u.includes('/Messages.json')) {
+      smsSent.push({ url: u, auth, params: new URLSearchParams(init?.body || '') });
+      return { ok: true, status: 201, json: async () => ({ sid: 'SMfake' + smsSent.length }) };
+    }
+    mediaHits.push({ url: u, auth });
+    const hit = Object.entries(media).find(([suffix]) => u.endsWith(suffix));
+    if (!hit) return { ok: false, status: 404, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) };
+    const { bytes, contentType } = hit[1];
+    return {
+      ok: true, status: 200,
+      headers: { get: (k: string) => (k.toLowerCase() === 'content-type' ? contentType : null) },
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    };
+  }) as unknown as typeof fetch;
+  return { fetchImpl, smsSent, mediaHits };
+}
+
+// A driver whose narration is a summary of a LONGER verbatim reply - the SMS
+// reply must carry the narration and append the transcript link for the detail.
+const TEXT_NARRATION = 'The deploy is green. Want me to merge it?';
+const TEXT_REPLY =
+  'Deploy pipeline finished.\n\n' +
+  '```\nnpm run deploy -- --stage prod\n```\n\n' +
+  'All 214 checks passed on src/server/deploy.ts. Want me to merge it?';
+function makeTextDriver(): { driver: Driver; sends: string[] } {
+  const sends: string[] = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 22050 }),
+    start: async () => {},
+    send: async (text) => {
+      sends.push(text);
+      return {
+        reply: TEXT_REPLY, narration: TEXT_NARRATION, speakBackend: 'mock',
+        audio: { pcm: Buffer.alloc(0), sampleRate: 22050, ttfbMs: 3, bytes: 0 },
+      };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  return { driver, sends };
+}
+
+// T1 - the pure pieces: reply framing within Twilio's 1600-char Body limit, the
+// transcript link for verbatim detail, the single-line injected text, media
+// extensions, the notify token, and the capability gates.
+await reporter.leg('text - SMS reply framing: 1600 limit + transcript link + injected line (pure)', (t) => {
+  const URL_ = 'https://ceo-chat.acb-apps.com';
+  const LINK = '\n\nFull reply: ' + URL_;
+
+  // narration == verbatim -> nothing was compressed away, no link needed
+  t.eq(formatSmsReply('Done.', 'Done.', URL_), 'Done.', 'no link when the verbatim reply adds nothing');
+  t.eq(formatSmsReply('Done.', ' Done. ', URL_), 'Done.', 'whitespace-only differences do not trigger the link');
+
+  // the verbatim reply holds more detail -> the web transcript link is appended
+  const linked = formatSmsReply(TEXT_NARRATION, TEXT_REPLY, URL_);
+  t.ok(linked.startsWith(TEXT_NARRATION), 'the SMS body leads with the concise narration');
+  t.ok(linked.endsWith(LINK), 'the verbatim detail appends the transcript link');
+  t.ok(linked.length <= SMS_BODY_LIMIT, 'within the limit');
+
+  // empty narration falls back to the verbatim text (self-identical -> no link)
+  t.eq(formatSmsReply('', 'Short reply.', URL_), 'Short reply.', 'no narration -> the verbatim text IS the body');
+
+  // the 1600 boundary: exactly at the limit is untouched...
+  const exact = 'a'.repeat(SMS_BODY_LIMIT);
+  t.eq(formatSmsReply(exact, exact, URL_).length, SMS_BODY_LIMIT, 'exactly 1600 chars passes untruncated');
+  t.notIncludes(formatSmsReply(exact, exact, URL_), '…', 'no truncation marker at the boundary');
+  // ...one char past (with the link) truncates the narration, never the link
+  const fitting = 'b'.repeat(SMS_BODY_LIMIT - LINK.length);
+  const atLimit = formatSmsReply(fitting, TEXT_REPLY, URL_);
+  t.eq(atLimit.length, SMS_BODY_LIMIT, 'narration + link that exactly fits is untruncated', );
+  t.notIncludes(atLimit, '…', 'no marker when it fits');
+  const over = formatSmsReply(fitting + 'bb', TEXT_REPLY, URL_);
+  t.ok(over.length <= SMS_BODY_LIMIT, 'one char over -> truncated back within the limit', `${over.length}`);
+  t.ok(over.endsWith(LINK), 'the transcript link SURVIVES truncation');
+  t.includes(over, '…', 'the truncation is marked');
+  const huge = formatSmsReply('c'.repeat(5000), TEXT_REPLY, URL_);
+  t.ok(huge.length <= SMS_BODY_LIMIT && huge.endsWith(LINK), 'a 5000-char narration still yields limit-safe body + link');
+  // truncation FORCES the link even when narration == verbatim (content was cut,
+  // so the captain always gets the pointer to the full transcript)
+  const longSame = 'd'.repeat(2000);
+  const forced = formatSmsReply(longSame, longSame, URL_);
+  t.ok(forced.length <= SMS_BODY_LIMIT, 'narration==verbatim over the limit is truncated');
+  t.ok(forced.endsWith(LINK), 'ANY truncation forces the transcript link, regardless of narration mode');
+  t.includes(forced, '…', 'and is marked as truncated');
+
+  // the injected line: ONE line (fm-send submits on newline), body + references
+  const files = [
+    { path: '/repo/inbox/2026-07-02_10-00-00-SM1-0.jpg', contentType: 'image/jpeg', bytes: 8 },
+    { path: '/repo/inbox/2026-07-02_10-00-00-SM1-1.pdf', contentType: 'application/pdf', bytes: 9 },
+  ];
+  const injected = buildInjectedText('look at this ticket', files);
+  t.notIncludes(injected, '\n', 'the injected text is a SINGLE line');
+  t.ok(injected.startsWith('look at this ticket'), 'the captain\'s words lead');
+  t.includes(injected, 'attachment 1/2 from the captain: /repo/inbox/2026-07-02_10-00-00-SM1-0.jpg (image/jpeg)', 'each attachment injects its inbox path + type');
+  t.includes(injected, 'open and inspect it', 'first mate is told to open the file');
+  const noBody = buildInjectedText('', [files[0]!]);
+  t.includes(noBody, 'The captain texted 1 attachment (no message text).', 'a media-only MMS still injects a meaningful line');
+  t.eq(buildInjectedText('  ', []), '', 'no body + no media -> nothing to inject');
+  t.eq(buildInjectedText('two\n lines here', []), 'two lines here', 'embedded newlines in the SMS body are flattened');
+
+  // partial MMS failure is NAMED in the injected line - first mate must never
+  // mistake a partial MMS for the whole one
+  t.eq(ordinalName(1) + ordinalName(2) + ordinalName(3) + ordinalName(11), '1st2nd3rd11th', 'ordinal naming');
+  t.eq(describeMediaFailures([2], 3), '1 of 3 attachments (the 2nd) failed to download', 'a single failure is named by position');
+  t.eq(describeMediaFailures([1, 3], 3), '2 of 3 attachments (the 1st and 3rd) failed to download', 'multiple failures list every position');
+  const partial = buildInjectedText('see photos', [files[0]!], [2]);
+  t.includes(partial, 'WARNING: MMS 1 of 2 attachments (the 2nd) failed to download - you did NOT receive it.', 'the injected line warns first mate about the dropped attachment');
+  t.notIncludes(partial, '\n', 'the warning keeps the injection single-line');
+  t.eq(buildInjectedText('', [], [1]), '', 'all-failed with no body still injects nothing (the reply carries the failure)');
+
+  // media extensions
+  t.eq(mediaExtension('image/jpeg'), 'jpg', 'image/jpeg -> .jpg');
+  t.eq(mediaExtension('image/png; charset=binary'), 'png', 'content-type parameters are ignored');
+  t.eq(mediaExtension('application/x-unknown'), 'bin', 'unknown types fall back to .bin');
+
+  // the notify token: sha256(auth token) hex - EXACTLY what bin/text-captain.sh
+  // derives with `printf '%s' "$TWILIO_AUTH_TOKEN" | sha256sum`.
+  t.eq(notifyToken('test-auth-token'), 'f35cd067d05752edf483ea62c03582e9a2a87f40336d3b72fbb5899ec9c9aefb', 'notifyToken == sha256sum of the token (script parity)');
+
+  // capability + config gates
+  const caps = textCapabilities(PHONE_TEST_SECRETS);
+  t.ok(caps.inbound && caps.outbound, 'full secrets -> inbound + replies capable');
+  t.ok(!textCapabilities({ ...PHONE_TEST_SECRETS, authToken: undefined }).inbound, 'no auth token -> NO inbound (signature validation is mandatory)');
+  t.ok(!textCapabilities({ ...PHONE_TEST_SECRETS, accountSid: undefined }).outbound, 'no account SID -> no outbound replies');
+  t.ok(textNotifyEnabled({}), 'proactive notify defaults ON');
+  t.ok(!textNotifyEnabled({ CEOCHAT_TEXT_NOTIFY: '0' }) && !textNotifyEnabled({ CEOCHAT_TEXT_NOTIFY: 'off' }), 'CEOCHAT_TEXT_NOTIFY=0/off disables it');
+  t.ok(textNotifyEnabled({ CEOCHAT_TEXT_NOTIFY: '1' }), 'an explicit 1 keeps it on');
+});
+
+// T2 - the webhook end-to-end over the REAL HTTP endpoint: the MANDATORY
+// signature gate, the sender allowlist, Body -> TurnRunner injection (the same
+// seam as a spoken utterance), and the REST reply framing.
+await reporter.leg('text - SMS webhook: signature gate + allowlist + Body->send + REST reply', async (t) => {
+  const { driver, sends } = makeTextDriver();
+  const { fetchImpl, smsSent } = makeTextFetch({});
+  const inbox = mkdtempSync(join(tmpdir(), 'ceochat-inbox-'));
+  const runner = new TurnRunner({ driver });
+  const text = createTextApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    inboxDir: inbox, fetchImpl, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, text, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+
+  // a web client watches: SMS turns must broadcast to the browser transcript too
+  const webFrames: Array<Record<string, unknown>> = [];
+  const watcher = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+  watcher.on('message', (raw: Buffer) => { try { webFrames.push(JSON.parse(raw.toString()) as Record<string, unknown>); } catch { /* ignore */ } });
+  await new Promise<void>((resolve, reject) => { watcher.on('open', () => resolve()); watcher.on('error', reject); });
+
+  try {
+    // 1. a forged POST (no signature) NEVER reaches the agent
+    const forged = await postText(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, Body: 'rm -rf /' }, false);
+    t.eq(forged.status, 403, 'missing/invalid X-Twilio-Signature -> 403 (webhook authenticated, MANDATORY)');
+    // 2. a signed message from a STRANGER is silently dropped
+    const stranger = await postText(app.url, { From: '+15667770000', To: PHONE_TEST_SECRETS.phoneNumber!, Body: 'hello?' });
+    t.eq(stranger.status, 200, 'non-allowlisted sender is answered 200 (nothing revealed)');
+    t.includes(stranger.body, '<Response/>', 'empty TwiML - no auto-reply to strangers');
+    await realSleep(150);
+    t.eq(sends.length, 0, 'NOTHING was injected for the forged or stranger messages');
+    t.eq(smsSent.length, 0, 'and no reply SMS went out for them');
+
+    // 3. the captain texts: Body is injected through the SAME TurnRunner seam
+    const ok = await postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: 'status of the deploy?', NumMedia: '0', MessageSid: 'SMtest1',
+    });
+    t.eq(ok.status, 200, 'allowlisted + signed -> 200');
+    t.includes(ok.body, '<Response/>', 'webhook answers immediately (reply rides REST after the turn)');
+    t.ok(await until(() => sends.length === 1), 'the text was injected as a turn');
+    t.eq(sends[0], 'status of the deploy?', 'the injected text is the SMS Body, unchanged');
+
+    // 4. the reply: concise narration + transcript link, within the limit
+    t.ok(await until(() => smsSent.length === 1), 'a reply SMS goes out via Twilio REST');
+    const reply = smsSent[0]!;
+    t.includes(reply.url, `/2010-04-01/Accounts/${PHONE_TEST_SECRETS.accountSid}/Messages.json`, 'POSTs the documented Messages.json endpoint');
+    t.includes(reply.auth, 'Basic ', 'HTTP Basic auth (sid:token)');
+    t.eq(reply.params.get('To'), PHONE_TEST_SECRETS.allowedCaller!, 'replies to the captain');
+    t.eq(reply.params.get('From'), PHONE_TEST_SECRETS.phoneNumber!, 'from our Twilio number');
+    const body = reply.params.get('Body') || '';
+    t.ok(body.startsWith(TEXT_NARRATION), 'the reply leads with the speakable summary');
+    t.includes(body, 'Full reply: ' + PHONE_PUBLIC_URL, 'the verbatim detail appends the web transcript link');
+    t.ok(body.length <= SMS_BODY_LIMIT, 'the reply stays within the 1600-char limit');
+
+    // 5. the SMS turn reached the browser transcript with its source
+    t.ok(await until(() => webFrames.some((m) => m.type === 'sent' && m.source === 'sms')), 'the web client sees the SMS turn (source: "sms")');
+    const sent = webFrames.find((m) => m.type === 'sent' && m.source === 'sms') as { text?: string };
+    t.eq(sent?.text, 'status of the deploy?', 'with the captain\'s exact words');
+  } finally {
+    try { watcher.close(); } catch { /* ignore */ }
+    await app.close();
+    rmSync(inbox, { recursive: true, force: true });
+  }
+});
+
+// T3 - MMS intake: MediaUrl0..N fetched with Twilio-scoped Basic auth, stored in
+// the gitignored inbox, and referenced in the injected line so first mate can
+// open exactly what the captain sent.
+await reporter.leg('text - MMS intake: authenticated fetch -> gitignored inbox -> injected reference', async (t) => {
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+  const PDF = Buffer.from('%PDF-1.4 fake');
+  const { driver, sends } = makeTextDriver();
+  const { fetchImpl, smsSent, mediaHits } = makeTextFetch({
+    '/Media/ME0': { bytes: JPEG, contentType: 'image/jpeg' },
+    '/Media/ME1': { bytes: PDF, contentType: 'application/pdf' },
+    '/off-twilio-media': { bytes: JPEG, contentType: 'image/jpeg' },
+  });
+  const inbox = mkdtempSync(join(tmpdir(), 'ceochat-inbox-'));
+  const runner = new TurnRunner({ driver });
+  const text = createTextApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    inboxDir: inbox, fetchImpl, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, text, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const mediaBase = `https://api.twilio.com/2010-04-01/Accounts/${PHONE_TEST_SECRETS.accountSid}/Messages/MMtest/Media`;
+    await postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: 'here is the sketch', NumMedia: '3', MessageSid: 'MMtest',
+      MediaUrl0: `${mediaBase}/ME0`, MediaContentType0: 'image/jpeg',
+      MediaUrl1: `${mediaBase}/ME1`, MediaContentType1: 'application/pdf',
+      MediaUrl2: 'https://evil.example/off-twilio-media', MediaContentType2: 'image/jpeg',
+    });
+    t.ok(await until(() => sends.length === 1), 'the MMS was injected as a turn');
+
+    const injected = sends[0]!;
+    t.ok(injected.startsWith('here is the sketch'), 'the captain\'s words lead the injected line');
+    t.includes(injected, inbox, 'attachment references point into the inbox dir');
+    t.includes(injected, '.jpg (image/jpeg)', 'the image reference carries extension + type');
+    t.includes(injected, '.pdf (application/pdf)', 'the PDF reference carries extension + type');
+    t.includes(injected, 'open and inspect it', 'first mate is told to open the files');
+    t.notIncludes(injected, '\n', 'still a single injected line');
+
+    const saved = readdirSync(inbox).sort();
+    t.eq(saved.length, 3, 'all three media files landed in the inbox');
+    const jpg = saved.find((f) => f.endsWith('-0.jpg'));
+    t.ok(!!jpg && readFileSync(join(inbox, jpg!)).equals(JPEG), 'the stored image is byte-exact');
+    const pdf = saved.find((f) => f.endsWith('-1.pdf'));
+    t.ok(!!pdf && readFileSync(join(inbox, pdf!)).equals(PDF), 'the stored PDF is byte-exact');
+    t.ok(saved.every((f) => /MMtest/.test(f)), 'filenames carry the (sanitized) message SID');
+
+    const twilioHits = mediaHits.filter((h) => h.url.includes('api.twilio.com'));
+    t.ok(twilioHits.length === 2 && twilioHits.every((h) => h.auth.startsWith('Basic ')), 'Twilio media fetches carry the account Basic auth');
+    const offTwilio = mediaHits.find((h) => h.url.includes('evil.example'));
+    t.ok(!!offTwilio && offTwilio.auth === '', 'credentials are NEVER sent to a non-Twilio media host');
+
+    t.ok(await until(() => smsSent.length === 1), 'the MMS turn still gets its SMS reply');
+
+    // an http:// (non-https) media URL is refused outright - the text still
+    // lands, and BOTH sides are told the attachment was not seen
+    await postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: 'insecure media test', NumMedia: '1', MessageSid: 'MMtest2',
+      MediaUrl0: 'http://api.twilio.com/insecure', MediaContentType0: 'image/jpeg',
+    });
+    t.ok(await until(() => sends.length === 2), 'the message body still injected');
+    t.ok(sends[1]!.startsWith('insecure media test'), 'the captain\'s words still lead');
+    t.includes(sends[1]!, 'WARNING: MMS 1 of 1 attachment (the 1st) failed to download', 'the injected line tells first mate the attachment never arrived');
+    t.notIncludes(sends[1]!, 'open and inspect', 'no attachment reference for the refused http URL');
+    t.ok(!mediaHits.some((h) => h.url.startsWith('http://')), 'the http URL was never fetched');
+    t.ok(await until(() => smsSent.length === 2), 'the partial-failure turn still gets its SMS reply');
+    const failReply = smsSent[1]!.params.get('Body') || '';
+    t.ok(failReply.startsWith('Note: 1 of 1 attachment (the 1st) failed to download - first mate did NOT see it.'), 'the SMS reply LEADS with the failure note naming the unseen attachment');
+    t.includes(failReply, TEXT_NARRATION, 'and still carries the turn reply');
+    t.ok(failReply.length <= SMS_BODY_LIMIT, 'note + reply stay within the limit');
+  } finally {
+    await app.close();
+    rmSync(inbox, { recursive: true, force: true });
+  }
+});
+
+// T4 - proactive outbound texts: the /text/notify trigger (bin/text-captain.sh)
+// with its token + config gates, and the REST framing to the captain's number.
+await reporter.leg('text - proactive notify: config + token gates + REST framing', async (t) => {
+  const { driver } = makeTextDriver();
+  const { fetchImpl, smsSent } = makeTextFetch({});
+  const runner = new TurnRunner({ driver });
+  const text = createTextApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    inboxDir: mkdtempSync(join(tmpdir(), 'ceochat-inbox-')), fetchImpl, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, text, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  const notifyUrl = app.url.replace(/\/$/, '') + TEXT_NOTIFY_PATH;
+  const token = notifyToken(PHONE_TEST_SECRETS.authToken!);
+  try {
+    // token gate
+    const noToken = await fetch(notifyUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'text=hi' });
+    t.eq(noToken.status, 403, 'no x-ceochat-notify token -> 403');
+    const badToken = await fetch(notifyUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-ceochat-notify': 'wrong' }, body: 'text=hi' });
+    t.eq(badToken.status, 403, 'a wrong token -> 403');
+    t.eq(smsSent.length, 0, 'nothing was texted for refused requests');
+
+    // the trigger: form-encoded (exactly what bin/text-captain.sh sends)
+    const okRes = await fetch(notifyUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-ceochat-notify': token },
+      body: new URLSearchParams({ text: 'PR is green' }).toString(),
+    });
+    t.eq(okRes.status, 200, 'a tokened notify succeeds');
+    t.eq(((await okRes.json()) as { ok?: boolean }).ok, true, 'and reports ok');
+    t.eq(smsSent.length, 1, 'exactly one SMS went out');
+    t.eq(smsSent[0]!.params.get('Body'), 'PR is green', 'with the notification text');
+    t.eq(smsSent[0]!.params.get('To'), PHONE_TEST_SECRETS.allowedCaller!, 'to the captain - the only possible recipient');
+    t.eq(smsSent[0]!.params.get('From'), PHONE_TEST_SECRETS.phoneNumber!, 'from our Twilio number');
+
+    // JSON body works too (programmatic callers)
+    const jsonRes = await fetch(notifyUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-ceochat-notify': token },
+      body: JSON.stringify({ text: 'CI is red' }),
+    });
+    t.eq(jsonRes.status, 200, 'JSON notify body is accepted');
+    t.eq(smsSent[1]?.params.get('Body'), 'CI is red', 'and lands as the SMS body');
+
+    // empty text is a 400, and GET is a 404 (webhook + notify are POST-only)
+    const empty = await fetch(notifyUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-ceochat-notify': token }, body: 'text=' });
+    t.eq(empty.status, 400, 'empty text -> 400');
+    t.eq((await fetch(notifyUrl)).status, 404, 'GET /text/notify -> 404');
+    t.eq((await fetch(app.url.replace(/\/$/, '') + TEXT_WEBHOOK_PATH)).status, 404, 'GET /text/webhook -> 404');
+
+    // config gate: CEOCHAT_TEXT_NOTIFY=0 -> the trigger is off even with a token
+    const offApp = createTextApp({
+      runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+      notifyEnabled: false, fetchImpl, log: () => {},
+    });
+    t.eq(offApp.notifyEnabled, false, 'the config gate is surfaced');
+    const before = smsSent.length;
+    // mount check via the same server would need a second app; assert the handler directly
+    const fakeRes = {
+      code: 0, body: '',
+      writeHead(c: number) { this.code = c; return this; },
+      end(b?: string) { this.body = b || ''; },
+    };
+    const fakeReq = Object.assign(
+      new (await import('node:stream')).Readable({ read() { this.push('text=hi'); this.push(null); } }),
+      { url: TEXT_NOTIFY_PATH, method: 'POST', headers: { 'x-ceochat-notify': token, 'content-type': 'application/x-www-form-urlencoded' } },
+    );
+    offApp.handleHttp(fakeReq as unknown as Parameters<typeof offApp.handleHttp>[0], fakeRes as unknown as Parameters<typeof offApp.handleHttp>[1]);
+    t.ok(await until(() => fakeRes.code === 404), 'CEOCHAT_TEXT_NOTIFY=0 -> notify answers 404 (disabled)');
+    t.eq(smsSent.length, before, 'and nothing is texted');
+
+    // programmatic notify without REST creds degrades with a clear reason
+    const noCreds = createTextApp({
+      runner, secrets: { ...PHONE_TEST_SECRETS, accountSid: undefined }, publicUrl: PHONE_PUBLIC_URL, log: () => {},
+    });
+    const failed = await noCreds.notify('hello');
+    t.ok(!failed.ok && failed.detail.includes('not configured'), 'notify without outbound creds fails with a clear reason');
+  } finally {
+    await app.close();
   }
 });
 

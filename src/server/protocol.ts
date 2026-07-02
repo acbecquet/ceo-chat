@@ -30,9 +30,10 @@ export type TtsMode = 'minimax' | 'local' | 'mock';
 // Sample rate the SERVER-SIDE STT path expects the browser to send mic PCM at.
 export const STT_SAMPLE_RATE = 16000;
 
-// Where a turn was initiated from. Phone turns broadcast to the web clients too -
-// the web app is the in-call companion screen showing the verbatim transcript.
-export type TurnSource = 'web' | 'phone';
+// Where a turn was initiated from. Phone and SMS turns broadcast to the web
+// clients too - the web app is the companion screen showing the verbatim
+// transcript whichever transport the captain used.
+export type TurnSource = 'web' | 'phone' | 'sms';
 
 // Twilio call state surfaced to the browser (the "Call me" flow + on-call status).
 export type PhoneState = 'unavailable' | 'idle' | 'dialing' | 'in-call' | 'ended' | 'failed';
@@ -82,9 +83,10 @@ export type ServerMessage =
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.
   | { type: 'terminal'; data: string }
-  // Echo of an ACCEPTED captain line (typed, spoken, or over the phone) so every
-  // connected client renders the same conversation - including turns the captain
-  // started from the phone call. `ts` = epoch ms for the transcript timestamps.
+  // Echo of an ACCEPTED captain line (typed, spoken, over the phone, or by SMS) so
+  // every connected client renders the same conversation - including turns the
+  // captain started from the phone call or by text. `ts` = epoch ms for the
+  // transcript timestamps.
   | { type: 'sent'; turn: number; text: string; source: TurnSource; ts: number; replay?: boolean }
   // The 1:1 VERBATIM transcript of first mate's ACTUAL reply - the exact assistant
   // text from the session transcript, streamed live as the turn runs (each frame is

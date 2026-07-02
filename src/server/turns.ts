@@ -1,4 +1,4 @@
-// turns.ts - ONE turn engine shared by every transport (web WS + Twilio phone).
+// turns.ts - ONE turn engine shared by every transport (web WS + Twilio phone + SMS).
 //
 // Before Call Mode the busy lock, turn counter and last-turn replay state lived
 // inside app.ts, so only the web transport could run turns. A phone call is a

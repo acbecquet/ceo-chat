@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ceo-chat setup">
+<meta name="theme-color" content="#0b0f14">
+<title>ceo-chat - go-live setup guide (calling + texting)</title>
+<style>
+  /* Matches the ceo-chat app design system (src/server/public/styles.css):
+     dark, iPhone-first, safe-area aware, >=44px targets, zero horizontal overflow. */
+  :root {
+    --bg: #0b0f14;
+    --bg-raised: #121821;
+    --bg-card: #161e29;
+    --line: #232d3b;
+    --text: #dbe4ee;
+    --text-dim: #8595a8;
+    --accent: #5eead4;
+    --accent-dim: #2d6e69;
+    --danger: #f87171;
+    --warn: #fbbf24;
+    --ok: #34d399;
+    --radius: 14px;
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sat: env(safe-area-inset-top, 0px);
+    --sal: env(safe-area-inset-left, 0px);
+    --sar: env(safe-area-inset-right, 0px);
+  }
+  * { box-sizing: border-box; min-width: 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    padding: calc(10px + var(--sat)) calc(14px + var(--sar)) calc(28px + var(--sab)) calc(14px + var(--sal));
+    overflow-x: hidden;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+
+  header.top {
+    position: sticky; top: 0; z-index: 10;
+    margin: -10px -14px 14px; padding: calc(10px + var(--sat)) 14px 10px;
+    background: rgba(11, 15, 20, .92);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .top-inner { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: .2px; }
+  .sub { color: var(--text-dim); font-size: 14px; margin: 0 0 10px; }
+  .progress-row { display: flex; align-items: center; gap: 10px; }
+  .bar { flex: 1 1 auto; height: 8px; border-radius: 999px; background: var(--bg-card); border: 1px solid var(--line); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width .25s ease; }
+  #progress-label { font-size: 13px; font-weight: 600; color: var(--text-dim); white-space: nowrap; }
+  #progress-label.done { color: var(--ok); }
+
+  h2 {
+    font-size: 17px; margin: 26px 0 4px;
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  }
+  h2 .phase-count { font-size: 13px; font-weight: 600; color: var(--text-dim); }
+  .phase-sub { color: var(--text-dim); font-size: 14px; margin: 0 0 12px; }
+
+  .step {
+    background: var(--bg-card); border: 1px solid var(--line); border-radius: var(--radius);
+    margin: 0 0 10px; overflow: hidden;
+  }
+  .step.checked { border-color: var(--accent-dim); }
+  .step-head {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px 14px; min-height: 44px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .tickbox {
+    flex: none; width: 26px; height: 26px; margin-top: 1px;
+    border-radius: 8px; border: 2px solid var(--text-dim);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; color: transparent; transition: all .15s ease;
+  }
+  .step.checked .tickbox { background: var(--accent); border-color: var(--accent); color: #06251f; }
+  .step-title { font-weight: 650; font-size: 16px; }
+  .step.checked .step-title { color: var(--text-dim); text-decoration: line-through; text-decoration-color: var(--accent-dim); }
+  .step-body { padding: 0 14px 13px 52px; font-size: 15px; color: var(--text); }
+  .step-body p { margin: 0 0 10px; }
+  .step-body p:last-child, .step-body details:last-child, .step-body .snippet:last-child { margin-bottom: 0; }
+  .dim { color: var(--text-dim); }
+  a { color: var(--accent); text-decoration: none; word-break: break-word; }
+  a:active { opacity: .7; }
+
+  details {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--bg-raised); margin: 0 0 10px;
+  }
+  summary {
+    list-style: none; cursor: pointer; min-height: 44px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; font-size: 14px; font-weight: 600; color: var(--text-dim);
+    -webkit-tap-highlight-color: transparent;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "›"; color: var(--accent); transition: transform .15s ease; }
+  details[open] summary::before { transform: rotate(90deg); }
+  details > .d-body { padding: 0 12px 12px; font-size: 14px; color: var(--text); }
+  details > .d-body p { margin: 0 0 8px; }
+  details > .d-body p:last-child { margin-bottom: 0; }
+
+  /* The Copy button sits ABOVE the block (never overlapping code): long lines
+     scroll inside the pre and stay fully readable. */
+  .snippet { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; margin: 0 0 10px; }
+  .snippet pre {
+    order: 2; width: 100%; margin: 0; padding: 11px 12px;
+    background: #0d1319; border: 1px solid var(--line); border-radius: 10px;
+    font: 13px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    white-space: pre; color: #c7d5e4;
+  }
+  .copy-btn {
+    order: 1;
+    min-height: 44px; min-width: 72px; padding: 4px 14px;
+    border-radius: 8px; border: 1px solid var(--accent-dim);
+    background: var(--bg-card); color: var(--accent);
+    font: 600 13px/1 -apple-system, BlinkMacSystemFont, sans-serif;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  .copy-btn:active { background: var(--accent-dim); color: var(--text); }
+  .copy-btn.ok { border-color: var(--ok); color: var(--ok); }
+
+  .field { margin: 0 0 10px; }
+  .field label { display: block; font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 4px; }
+  .field input {
+    width: 100%; min-height: 44px; padding: 8px 12px;
+    border-radius: 10px; border: 1px solid var(--line);
+    background: var(--bg-raised); color: var(--text);
+    font: 16px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .field input:focus { outline: none; border-color: var(--accent-dim); }
+  .field .hint { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+
+  .callout {
+    border-left: 3px solid var(--warn); background: var(--bg-raised);
+    border-radius: 0 10px 10px 0; padding: 9px 12px; font-size: 14px; margin: 0 0 10px;
+  }
+  .callout.good { border-left-color: var(--ok); }
+  .callout.bad { border-left-color: var(--danger); }
+
+  .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--line); border-radius: 10px; margin: 0 0 10px; }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; background: var(--bg-raised); }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  sup a { color: var(--accent); font-weight: 600; }
+
+  ol.cites { padding-left: 22px; font-size: 13px; color: var(--text-dim); }
+  ol.cites li { margin-bottom: 7px; overflow-wrap: break-word; }
+
+  footer { margin-top: 30px; font-size: 13px; color: var(--text-dim); text-align: center; }
+  .reset-btn {
+    display: inline-block; margin-top: 8px; min-height: 44px; padding: 11px 18px;
+    border-radius: 10px; border: 1px solid var(--line); background: var(--bg-card);
+    color: var(--text-dim); font: 600 14px/1 -apple-system, sans-serif; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-inner">
+    <h1>ceo-chat go-live guide</h1>
+    <p class="sub">Everything to put first mate on a real phone number: calling AND texting.</p>
+    <div class="progress-row">
+      <div class="bar"><i id="progress-fill"></i></div>
+      <span id="progress-label">0 / 0 done</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<p class="dim" style="font-size:14px; margin:0 0 6px;">
+  Checkboxes persist on this device (localStorage), so you can stop anywhere and pick up later.
+  Tap a step to check it off; open the › sections when you want the why.
+  Fill in <a href="#gen">your numbers</a> once and every command, URL, and config block below renders ready to copy.
+  Nothing you type leaves this page.
+</p>
+
+<!-- ═══════════════ Phase 1: Twilio console ═══════════════ -->
+<h2>1. Twilio console <span class="phase-count" data-phase-count="twilio"></span></h2>
+<p class="phase-sub">One account, one number, two webhooks. About 15 minutes.</p>
+
+<section class="step" data-step="tw-account">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Create a Twilio account and upgrade it (pay-as-you-go)</span></div>
+  <div class="step-body">
+    <p>Sign up at <a href="https://www.twilio.com/try-twilio" target="_blank" rel="noopener">twilio.com/try-twilio</a>, then add a payment method to upgrade out of trial mode (Console &gt; Billing).</p>
+    <details><summary>Why upgrade immediately</summary><div class="d-body">
+      <p>A trial account can only call or message numbers you have verified, prefixes every message with a trial notice, and cannot complete A2P registration.
+      Upgrading is still pay-as-you-go: there is no plan or commitment, you only pay the per-use rates in the cost table below.</p>
+    </div></details>
+  </div>
+</section>
+
+<section class="step" data-step="tw-number">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Buy one US local number with Voice + SMS + MMS</span></div>
+  <div class="step-body">
+    <p>Console &gt; Phone Numbers &gt; <a href="https://console.twilio.com/us1/develop/phone-numbers/manage/search" target="_blank" rel="noopener">Buy a number</a>. Filter capabilities to Voice, SMS, and MMS, pick a local number you like, and buy it ($1.15/mo<sup><a href="#cite-5">[5]</a></sup>).</p>
+    <p class="dim">Paste it into <a href="#gen">the generator</a> below once you have it.</p>
+    <details><summary>Why a local (10DLC) number and not a toll-free one</summary><div class="d-body">
+      <p>Call Mode already runs on a local number, and Text Mode shares the SAME number so you save one contact card and one monthly lease.
+      Local numbers need A2P 10DLC registration for outbound SMS (phase 2); toll-free numbers use a different verification path and read as business robocalls when they ring you.</p>
+    </div></details>
+  </div>
+</section>
+
+<section class="step" data-step="tw-voice-hook">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Point the Voice webhook at ceo-chat</span></div>
+  <div class="step-body">
+    <p>Console &gt; Phone Numbers &gt; Manage &gt; Active numbers &gt; your number &gt; Configure &gt; Voice.
+    Under "A call comes in", choose Webhook, method <b>HTTP POST</b>, URL:</p>
+    <div class="snippet"><pre data-tpl="{{ORIGIN}}/phone/twiml"></pre><button class="copy-btn" type="button">Copy</button></div>
+  </div>
+</section>
+
+<section class="step" data-step="tw-msg-hook">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Point the Messaging webhook at ceo-chat</span></div>
+  <div class="step-body">
+    <p>Same page, Configure &gt; Messaging. Under "A message comes in", choose Webhook, method <b>HTTP POST</b>, URL:</p>
+    <div class="snippet"><pre data-tpl="{{ORIGIN}}/text/webhook"></pre><button class="copy-btn" type="button">Copy</button></div>
+    <details><summary>What answers these URLs</summary><div class="d-body">
+      <p>Both webhooks land on the same ceo-chat server through the Cloudflare tunnel.
+      Every POST is authenticated with X-Twilio-Signature and checked against your allowlisted number before anything reaches first mate; strangers are rejected or silently dropped.</p>
+    </div></details>
+  </div>
+</section>
+
+<!-- ═══════════════ Phase 2: A2P 10DLC ═══════════════ -->
+<h2>2. A2P 10DLC registration <span class="phase-count" data-phase-count="a2p"></span></h2>
+<p class="phase-sub">US carriers require this before your number may SEND texts. Inbound already works.</p>
+
+<section class="step" data-step="a2p-understand">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Know what A2P gates (and what already works)</span></div>
+  <div class="step-body">
+    <div class="callout good">Texting IN works the moment the messaging webhook is set: your texts and MMS photos reach first mate immediately, and the web transcript shows the replies.</div>
+    <div class="callout bad">Texting OUT (SMS replies + proactive notifications) is blocked by carriers until registration completes. Unregistered outbound US SMS has been fully blocked since Sept 1, 2023 and fails with Twilio error 30034<sup><a href="#cite-7">[7]</a> <a href="#cite-8">[8]</a></sup>.</div>
+    <details><summary>Why carriers require this</summary><div class="d-body">
+      <p>A2P 10DLC is the US carriers' registry for application-to-person traffic on local numbers.
+      Registration ties your number to a verified sender (the brand) and a declared purpose (the campaign), which is what keeps legitimate low-volume senders out of the spam filters.
+      Registration only gates outbound; inbound and Canada-bound traffic are unaffected<sup><a href="#cite-8">[8]</a></sup>.</p>
+    </div></details>
+  </div>
+</section>
+
+<section class="step" data-step="a2p-profile">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Create the Customer Profile</span></div>
+  <div class="step-body">
+    <p>Console &gt; Messaging &gt; <a href="https://console.twilio.com/us1/develop/sms/regulatory-compliance/onboarding" target="_blank" rel="noopener">Regulatory Compliance &gt; Onboarding</a>. Start the US A2P onboarding and create the profile: your name, a real email, a contact phone, and your US street address<sup><a href="#cite-1">[1]</a></sup>.</p>
+    <details><summary>Reuse limits to know about</summary><div class="d-body">
+      <p>The email address and street address can each be used at most 10 times across all A2P brand registrations with the campaign registry, so use your own, stable ones<sup><a href="#cite-1">[1]</a></sup>.</p>
+    </div></details>
+  </div>
+</section>
+
+<section class="step" data-step="a2p-brand">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Register the Sole Proprietor brand (~$4.50 one-time)</span></div>
+  <div class="step-body">
+    <p>Choose the <b>Sole Proprietor</b> brand type: it is exactly for individuals without a business tax ID (EIN)<sup><a href="#cite-1">[1]</a></sup>.
+    You verify with a one-time SMS code sent to a personal mobile number.</p>
+    <div class="callout">The OTP mobile number must NOT be a Twilio (or any CPaaS) number, can be used at most 3 times across all sole proprietor registrations, and the code must be answered within 24 hours<sup><a href="#cite-1">[1]</a></sup>. Use your own phone.</div>
+    <p class="dim">Fee: about $4.50 one-time<sup><a href="#cite-3">[3]</a> <a href="#cite-4">[4]</a></sup>. Approval typically lands within minutes of the OTP<sup><a href="#cite-2">[2]</a></sup>.</p>
+  </div>
+</section>
+
+<section class="step" data-step="a2p-campaign">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Register the campaign ($15 one-time vetting, $2/mo)</span></div>
+  <div class="step-body">
+    <p>Register one campaign with the Sole Proprietor use case. It asks for a description, sample messages, and how recipients opt in. Honest, specific answers pass vetting; here is a truthful set for this exact system:</p>
+    <div class="snippet"><pre>Campaign description:
+Personal single-user assistant notifications. My own
+self-hosted AI coding assistant texts me (the account
+owner, the only recipient) status updates about my own
+software projects, and replies when I text it first.</pre><button class="copy-btn" type="button">Copy</button></div>
+    <div class="snippet"><pre>Sample message 1:
+The deploy finished and all checks are green. Want me
+to merge it? Full reply: {{ORIGIN}}
+
+Sample message 2:
+PR 42 is green - ready for your review.</pre><button class="copy-btn" type="button">Copy</button></div>
+    <div class="snippet"><pre>Opt-in description:
+I am the sole sender and sole recipient. The service
+texts only my own verified mobile number, which I
+configured myself in the server allowlist. Replying
+STOP halts all messages.</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">Fees: $15 one-time vetting (charged again if you resubmit after a denial) + $2.00/mo per campaign<sup><a href="#cite-2">[2]</a> <a href="#cite-3">[3]</a></sup>. Vetting is manual: plan for about 1-3 weeks<sup><a href="#cite-2">[2]</a></sup>.</p>
+  </div>
+</section>
+
+<section class="step" data-step="a2p-attach">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Attach your number to the campaign</span></div>
+  <div class="step-body">
+    <p>When the campaign is approved, add your purchased number to the campaign's Messaging Service. A Sole Proprietor campaign can hold exactly one 10DLC number<sup><a href="#cite-1">[1]</a></sup> - this one.</p>
+    <details><summary>Throughput you get (plenty)</summary><div class="d-body">
+      <p>Sole proprietor throughput is fixed at 1 message per second, with carrier caps of 1000 messages/day toward T-Mobile and 15 messages/minute toward AT&amp;T<sup><a href="#cite-6">[6]</a></sup>.
+      A personal notification stream uses a fraction of that.</p>
+    </div></details>
+  </div>
+</section>
+
+<!-- ═══════════════ Phase 3: secrets.env ═══════════════ -->
+<h2>3. Secrets <span class="phase-count" data-phase-count="secrets"></span></h2>
+<p class="phase-sub">One gitignored file outside the repo. Never committed, never pasted into chats.</p>
+
+<section class="step" data-step="sec-gen" id="gen">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Fill in your values (stays on this device)</span></div>
+  <div class="step-body">
+    <div class="field">
+      <label for="in-origin">Public origin (the tunnel)</label>
+      <input id="in-origin" data-store="origin" type="url" autocomplete="off" spellcheck="false" placeholder="https://ceo-chat.acb-apps.com">
+    </div>
+    <div class="field">
+      <label for="in-sid">Twilio Account SID</label>
+      <input id="in-sid" data-store="sid" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+      <div class="hint">Console dashboard &gt; Account Info. Starts with AC.</div>
+    </div>
+    <div class="field">
+      <label for="in-twnum">Your Twilio number</label>
+      <input id="in-twnum" data-store="twnum" type="tel" autocomplete="off" placeholder="+15551230000">
+      <div class="hint">E.164 format: +1 then the 10 digits.</div>
+    </div>
+    <div class="field">
+      <label for="in-mynum">Your mobile (the allowlist)</label>
+      <input id="in-mynum" data-store="mynum" type="tel" autocomplete="off" placeholder="+15559876543">
+      <div class="hint">The ONLY phone allowed to call or text first mate, and the one it calls and texts back.</div>
+    </div>
+    <div class="field">
+      <label for="in-pin">Call PIN (4-6 digits, keypad entry on every call)</label>
+      <input id="in-pin" data-store="" type="text" inputmode="numeric" autocomplete="off" placeholder="4321">
+      <div class="hint">Not saved by this page. The auth token is never asked for here either - paste it straight from the console into the file.</div>
+    </div>
+  </div>
+</section>
+
+<section class="step" data-step="sec-write">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Write ~/.config/ceo-chat/secrets.env</span></div>
+  <div class="step-body">
+    <p>On the hub, make sure the directory exists and open the file:</p>
+    <div class="snippet"><pre>mkdir -p ~/.config/ceo-chat &amp;&amp; nano ~/.config/ceo-chat/secrets.env</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p>Keep the existing MINIMAX_* / GEMINI_* lines and add (rendered from your values above):</p>
+    <div class="snippet"><pre data-tpl="# Twilio - Call Mode + Text Mode (docs/call-mode.md, docs/text-mode.md)
+TWILIO_ACCOUNT_SID={{SID}}
+TWILIO_AUTH_TOKEN=&lt;paste from Console &gt; Account Info&gt;
+TWILIO_PHONE_NUMBER={{TWNUM}}
+CEOCHAT_ALLOWED_CALLER={{MYNUM}}
+CEOCHAT_PHONE_PIN={{PIN}}
+# Optional: set to 0 to turn off proactive notification texts
+# CEOCHAT_TEXT_NOTIFY=1"></pre><button class="copy-btn" type="button">Copy</button></div>
+    <details><summary>Why the auth token placeholder stays a placeholder</summary><div class="d-body">
+      <p>The auth token is the key to your whole Twilio account, so this page never asks for it: copy the block with the placeholder, then replace that one line by pasting the token directly in the editor.
+      The whole file lives outside the repo and is gitignored belt-and-suspenders; nothing in it is ever committed.</p>
+    </div></details>
+  </div>
+</section>
+
+<!-- ═══════════════ Phase 4: restart ═══════════════ -->
+<h2>4. Restart the server <span class="phase-count" data-phase-count="deploy"></span></h2>
+<p class="phase-sub">The server reads secrets at boot, so restart it to mount the phone + text webhooks.</p>
+
+<section class="step" data-step="dep-restart">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">Restart npm run serve and read the banner</span></div>
+  <div class="step-body">
+    <p>Stop the running server (Ctrl-C detaches; your first mate keeps running) and start it again:</p>
+    <div class="snippet"><pre>cd ~/firstmate/projects/ceo-chat &amp;&amp; npm run serve</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p>The startup banner must show both transports mounted:</p>
+    <div class="snippet"><pre data-tpl='call mode: inbound + outbound ("Call me") - webhook {{ORIGIN}}/phone/twiml
+text mode: inbound + replies + notify - webhook {{ORIGIN}}/text/webhook'></pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">"OFF" on either line means a secret is missing - recheck phase 3.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ Phase 5: live tests ═══════════════ -->
+<h2>5. First live tests <span class="phase-count" data-phase-count="livetest"></span></h2>
+<p class="phase-sub">One call, one text, one photo, one notification. Scripts below.</p>
+
+<section class="step" data-step="test-call">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">First call</span></div>
+  <div class="step-body">
+    <p>Open <a data-href-tpl="{{ORIGIN}}" href="https://ceo-chat.acb-apps.com" target="_blank" rel="noopener" data-tpl-text="{{ORIGIN}}">https://ceo-chat.acb-apps.com</a> on your iPhone and tap <b>Call me</b>. Your phone rings from your Twilio number.</p>
+    <p>Answer, enter your PIN on the keypad, wait for "You are connected", then say:</p>
+    <div class="snippet"><pre>What is the status of the repo?</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">Expect: the spoken summary in your cloned voice, the exact reply streaming in the web transcript, and barge-in (speak over it) cutting the audio.</p>
+  </div>
+</section>
+
+<section class="step" data-step="test-text-in">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">First text (works before A2P approval)</span></div>
+  <div class="step-body">
+    <p>Text your Twilio number from your phone:</p>
+    <div class="snippet"><pre>status?</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">Expect: the web transcript shows the turn labeled "you (by text)" and first mate's reply.
+    Before campaign approval no SMS comes back (outbound is carrier-blocked; that is the A2P gate, not a bug) - read the reply on the web.
+    After approval, the same text also gets an SMS reply: the concise summary, plus a "Full reply" link when the full response holds more detail.</p>
+  </div>
+</section>
+
+<section class="step" data-step="test-mms">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">First photo (MMS)</span></div>
+  <div class="step-body">
+    <p>Text a screenshot or photo with the message:</p>
+    <div class="snippet"><pre>what does this error mean?</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">Expect: the image lands in the repo's gitignored inbox/ dir and first mate opens and inspects it as part of its answer.</p>
+  </div>
+</section>
+
+<section class="step" data-step="test-notify">
+  <div class="step-head"><span class="tickbox">✓</span><span class="step-title">First proactive notification (needs A2P approval)</span></div>
+  <div class="step-body">
+    <p>On the hub, with the server running:</p>
+    <div class="snippet"><pre>cd ~/firstmate/projects/ceo-chat &amp;&amp; npm run text-captain -- "hello captain"</pre><button class="copy-btn" type="button">Copy</button></div>
+    <p class="dim">Expect: "sent: hello captain" in the terminal and the SMS on your phone.
+    This is the trigger first mate sessions use for "PR is green"-style pings; CEOCHAT_TEXT_NOTIFY=0 in secrets.env turns it off.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ Costs ═══════════════ -->
+<h2 id="costs">What it costs</h2>
+<p class="phase-sub">Researched 2026-07-02 from the official Twilio pages; bracketed numbers cite the sources below. Prices can change - the pricing page is authoritative.</p>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Item</th><th>Cost</th><th>When</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>US local number lease</td><td class="num">$1.15 /mo</td><td>monthly</td><td><sup><a href="#cite-5">[5]</a></sup></td></tr>
+    <tr><td>Sole Proprietor brand registration</td><td class="num">~$4.50</td><td>one-time</td><td><sup><a href="#cite-3">[3]</a> <a href="#cite-4">[4]</a></sup></td></tr>
+    <tr><td>Campaign vetting</td><td class="num">$15.00</td><td>one-time (again on resubmit)</td><td><sup><a href="#cite-2">[2]</a> <a href="#cite-3">[3]</a></sup></td></tr>
+    <tr><td>Sole Proprietor campaign</td><td class="num">$2.00 /mo</td><td>monthly</td><td><sup><a href="#cite-3">[3]</a></sup></td></tr>
+    <tr><td>SMS outbound (base + carrier fee)</td><td class="num">$0.0083 + $0.0035-0.005 ≈ $0.012-0.013 /segment</td><td>per message segment</td><td><sup><a href="#cite-5">[5]</a></sup></td></tr>
+    <tr><td>SMS inbound</td><td class="num">$0.0083 /segment</td><td>per message segment</td><td><sup><a href="#cite-5">[5]</a></sup></td></tr>
+    <tr><td>MMS outbound (base + carrier fee)</td><td class="num">$0.022 + up to $0.01 ≈ $0.03</td><td>per message</td><td><sup><a href="#cite-5">[5]</a></sup></td></tr>
+    <tr><td>MMS inbound</td><td class="num">$0.0165</td><td>per message</td><td><sup><a href="#cite-5">[5]</a></sup></td></tr>
+    <tr><td>Voice inbound (incl. Media Streams)</td><td class="num">$0.0125 /min (~$0.75/hr)</td><td>per minute</td><td><sup><a href="#cite-9">[9]</a></sup></td></tr>
+    <tr><td>Voice outbound "Call me" (incl. Media Streams)</td><td class="num">$0.0180 /min (~$1.08/hr)</td><td>per minute</td><td><sup><a href="#cite-9">[9]</a></sup></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout good">
+  Bottom line: about <b>$19.50 once</b> (brand + vetting), <b>$3.15/mo fixed</b> (number + campaign), and roughly <b>1.3 cents per SMS / 3 cents per MMS</b> sent.
+  A month of daily texting (say 100 SMS + 10 MMS out) adds about $1.60 on top of the fixed $3.15.
+</div>
+
+<details><summary>Carrier fee detail (per outbound message, on top of the base rate)</summary><div class="d-body">
+  <p>AT&amp;T $0.0035 SMS / $0.009 MMS; T-Mobile $0.0045 SMS / $0.01 MMS; Verizon $0.0045 SMS; US Cellular $0.005 SMS / $0.01 MMS.
+  Some carriers also charge small inbound fees (e.g. T-Mobile $0.0025 per inbound SMS).
+  All from the live official pricing page<sup><a href="#cite-5">[5]</a></sup>, 2026-07-02; third-party summaries from 2025 list older, lower fees - the official page supersedes them.</p>
+</div></details>
+
+<h2 id="citations">Citations</h2>
+<ol class="cites">
+  <li id="cite-1"><a href="https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/direct-sole-proprietor-registration-overview" target="_blank" rel="noopener">Twilio Docs: Direct Sole Proprietor Registration Overview</a> - eligibility (no EIN), OTP mobile rules (max 3 uses, 24h), email/address 10-use limits, one number per campaign.</li>
+  <li id="cite-2"><a href="https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/direct-sole-proprietor-registration-overview-new%20experience" target="_blank" rel="noopener">Twilio Docs: New Direct Sole Proprietor Registration Overview</a> - $15 campaign verification fee, brand approval "within a few minutes", vetting timeline.</li>
+  <li id="cite-3"><a href="https://www.twilio.com/en-us/phone-numbers/a2p-10dlc" target="_blank" rel="noopener">Twilio: 10DLC product page</a> - $4 sole proprietor brand registration, $15 vetting, $2/mo sole proprietor campaign.</li>
+  <li id="cite-4"><a href="https://help.twilio.com/articles/9550596959643-New-Changes-to-A2P-10DLC-Starter-Brands-FAQ" target="_blank" rel="noopener">Twilio Help: A2P 10DLC Sole Proprietor Brands FAQ</a> - $4.50 brand fee figure, OTP verification rules.</li>
+  <li id="cite-5"><a href="https://www.twilio.com/en-us/sms/pricing/us" target="_blank" rel="noopener">Twilio: SMS Pricing, United States</a> - $0.0083 SMS out/in, $0.022 MMS out, $0.0165 MMS in, $1.15/mo local number, per-carrier fee table (accessed 2026-07-02).</li>
+  <li id="cite-6"><a href="https://help.twilio.com/articles/1260803225669-Message-throughput-MPS-and-Trust-Scores-for-A2P-10DLC-in-the-US" target="_blank" rel="noopener">Twilio Help: Message throughput (MPS) and Trust Scores for A2P 10DLC</a> - sole proprietor 1 MPS, T-Mobile 1000/day, AT&amp;T 15/min.</li>
+  <li id="cite-7"><a href="https://www.twilio.com/docs/api/errors/30034" target="_blank" rel="noopener">Twilio Docs: Error 30034 - Message from an Unregistered Number</a> - unregistered 10DLC outbound is blocked.</li>
+  <li id="cite-8"><a href="https://support.twilio.com/hc/en-us/articles/14910496447771-Shutdown-of-Unregistered-10DLC-Messaging-FAQ" target="_blank" rel="noopener">Twilio Support: Shutdown of Unregistered 10DLC Messaging FAQ</a> - full blocking since 2023-09-01; inbound and internal traffic unaffected.</li>
+  <li id="cite-9"><a href="https://www.twilio.com/en-us/voice/pricing/us" target="_blank" rel="noopener">Twilio: Voice Pricing, United States</a> - $0.0085/min inbound, $0.0140/min outbound, + $0.004/min bidirectional Media Streams (figures as cited in the Call Mode plan, 2026-07-01).</li>
+</ol>
+
+<footer>
+  <p>ceo-chat setup guide - lives at docs/setup-guide.html in the repo. Open it directly in a browser; it is fully self-contained.</p>
+  <button class="reset-btn" id="reset-btn" type="button">Reset checklist + saved values</button>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var LS_KEY = 'ceochat-setup-guide-v1';
+
+  function load() {
+    try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function save(state) {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) { /* private mode */ }
+  }
+  var state = load();
+  state.steps = state.steps || {};
+  state.values = state.values || {};
+
+  // ---- values -> rendered templates -------------------------------------------
+  var inputs = {
+    origin: document.getElementById('in-origin'),
+    sid: document.getElementById('in-sid'),
+    twnum: document.getElementById('in-twnum'),
+    mynum: document.getElementById('in-mynum'),
+    pin: document.getElementById('in-pin')
+  };
+
+  function val(key, fallback) {
+    var el = inputs[key];
+    var v = el && el.value ? el.value.trim() : '';
+    return v || fallback;
+  }
+  function render() {
+    var map = {
+      '{{ORIGIN}}': val('origin', 'https://ceo-chat.acb-apps.com').replace(/\/+$/, ''),
+      '{{SID}}': val('sid', 'ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'),
+      '{{TWNUM}}': val('twnum', '+1XXXXXXXXXX'),
+      '{{MYNUM}}': val('mynum', '+1YYYYYYYYYY'),
+      '{{PIN}}': val('pin', '<pick 4-6 digits>')
+    };
+    var fill = function (tpl) {
+      return tpl.replace(/\{\{(ORIGIN|SID|TWNUM|MYNUM|PIN)\}\}/g, function (m) { return map[m]; });
+    };
+    var nodes = document.querySelectorAll('[data-tpl]');
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].textContent = fill(nodes[i].getAttribute('data-tpl'));
+    }
+    var links = document.querySelectorAll('[data-href-tpl]');
+    for (var j = 0; j < links.length; j++) {
+      links[j].setAttribute('href', fill(links[j].getAttribute('data-href-tpl')));
+    }
+  }
+
+  Object.keys(inputs).forEach(function (key) {
+    var el = inputs[key];
+    if (!el) return;
+    var storeKey = el.getAttribute('data-store');
+    if (storeKey && state.values[storeKey]) el.value = state.values[storeKey];
+    el.addEventListener('input', function () {
+      if (storeKey) { state.values[storeKey] = el.value.trim(); save(state); }
+      render();
+    });
+  });
+
+  // ---- checklist + progress ----------------------------------------------------
+  var steps = Array.prototype.slice.call(document.querySelectorAll('.step[data-step]'));
+  var fillEl = document.getElementById('progress-fill');
+  var labelEl = document.getElementById('progress-label');
+
+  function refresh() {
+    var done = 0;
+    steps.forEach(function (s) {
+      var on = !!state.steps[s.getAttribute('data-step')];
+      s.classList.toggle('checked', on);
+      if (on) done++;
+    });
+    var pct = steps.length ? Math.round((done / steps.length) * 100) : 0;
+    fillEl.style.width = pct + '%';
+    labelEl.textContent = done + ' / ' + steps.length + ' done';
+    labelEl.classList.toggle('done', done === steps.length);
+    // per-phase counters (steps between one H2 and the next)
+    var counters = document.querySelectorAll('[data-phase-count]');
+    for (var i = 0; i < counters.length; i++) {
+      var h2 = counters[i].closest('h2');
+      var n = 0, k = 0, el = h2 ? h2.nextElementSibling : null;
+      while (el && el.tagName !== 'H2') {
+        if (el.classList && el.classList.contains('step')) {
+          n++;
+          if (state.steps[el.getAttribute('data-step')]) k++;
+        }
+        el = el.nextElementSibling;
+      }
+      counters[i].textContent = k + '/' + n;
+    }
+  }
+
+  steps.forEach(function (s) {
+    var head = s.querySelector('.step-head');
+    head.addEventListener('click', function () {
+      var id = s.getAttribute('data-step');
+      state.steps[id] = !state.steps[id];
+      save(state);
+      refresh();
+    });
+  });
+
+  // ---- copy buttons --------------------------------------------------------------
+  function copyText(text, btn) {
+    var mark = function (ok) {
+      btn.textContent = ok ? 'Copied' : 'Failed';
+      btn.classList.toggle('ok', ok);
+      setTimeout(function () { btn.textContent = 'Copy'; btn.classList.remove('ok'); }, 1400);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { mark(true); }, function () { legacy(); });
+    } else { legacy(); }
+    function legacy() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      mark(ok);
+    }
+  }
+  var copies = document.querySelectorAll('.copy-btn');
+  for (var i = 0; i < copies.length; i++) {
+    (function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var pre = btn.parentElement.querySelector('pre');
+        if (pre) copyText(pre.textContent, btn);
+      });
+    })(copies[i]);
+  }
+
+  // ---- reset ---------------------------------------------------------------------
+  document.getElementById('reset-btn').addEventListener('click', function () {
+    if (!window.confirm('Clear all checkboxes and saved values on this device?')) return;
+    state = { steps: {}, values: {} };
+    save(state);
+    Object.keys(inputs).forEach(function (k) { if (inputs[k]) inputs[k].value = ''; });
+    render();
+    refresh();
+  });
+
+  render();
+  refresh();
+})();
+</script>
+</body>
+</html>

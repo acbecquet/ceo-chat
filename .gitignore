@@ -11,6 +11,9 @@ out/
 *.wav
 *.pcm
 
+# Inbound MMS media the captain texted (Text Mode intake - local only, never committed)
+inbox/
+
 # Node
 node_modules/
 npm-debug.log*

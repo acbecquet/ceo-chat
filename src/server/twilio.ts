@@ -1,13 +1,15 @@
-// twilio.ts - the small, pure Twilio surface the phone transport needs.
+// twilio.ts - the small, pure Twilio surface the phone + text transports need.
 //
-// Three things, all injectable/testable with NO Twilio account:
+// Four things, all injectable/testable with NO Twilio account:
 //   1. TwiML generation - the /phone/twiml webhook answer that bridges the call
 //      into our Media Streams WS (`<Connect><Stream url="wss://…/phone">`).
 //   2. Webhook authentication - X-Twilio-Signature validation (HMAC-SHA1 over the
 //      exact webhook URL + sorted POST params, keyed by the auth token), so a
-//      forged POST can't mint a stream token.
+//      forged POST can't mint a stream token (voice) or inject text (SMS).
 //   3. Outbound "Call me" - one REST POST to /2010-04-01/Accounts/<sid>/Calls.json
 //      (Basic auth), pointing the call at the same TwiML webhook.
+//   4. Outbound SMS - one REST POST to /2010-04-01/Accounts/<sid>/Messages.json
+//      (Basic auth): the Text Mode reply leg + proactive notifications.
 //
 // Secrets (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER /
 // CEOCHAT_ALLOWED_CALLER / CEOCHAT_PHONE_PIN) come from the gitignored
@@ -56,6 +58,13 @@ export function twilioSignature(authToken: string, url: string, params: Record<s
   return createHmac('sha1', authToken).update(Buffer.from(data, 'utf8')).digest('base64');
 }
 
+/** Constant-time string equality - for webhook signatures and derived tokens. */
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
 /** Constant-time check of a webhook's X-Twilio-Signature header. */
 export function validateTwilioSignature(
   authToken: string,
@@ -63,9 +72,7 @@ export function validateTwilioSignature(
   params: Record<string, string>,
   signature: string,
 ): boolean {
-  const expected = Buffer.from(twilioSignature(authToken, url, params));
-  const given = Buffer.from(signature || '');
-  return expected.length === given.length && timingSafeEqual(expected, given);
+  return timingSafeEqualStr(twilioSignature(authToken, url, params), signature || '');
 }
 
 /** Loose phone-number equality: compare digits (with a leading +) only. */
@@ -118,6 +125,53 @@ export async function placeCall(opts: PlaceCallOptions): Promise<PlaceCallResult
     });
     const data = (await res.json().catch(() => ({}))) as { sid?: string; message?: string };
     if (!res.ok) return { ok: false, detail: `Twilio ${res.status}: ${data.message || 'call failed'}` };
+    return { ok: true, detail: data.sid || 'queued' };
+  } catch (e) {
+    return { ok: false, detail: 'Twilio unreachable: ' + (e as Error).message };
+  }
+}
+
+export interface SendSmsOptions {
+  accountSid: string;
+  authToken: string;
+  /** The Twilio number the message comes FROM. */
+  from: string;
+  /** The captain's number to text. */
+  to: string;
+  /** Message body (the caller keeps it within Twilio's 1600-char limit). */
+  body: string;
+  fetchImpl?: typeof fetch;
+  apiBase?: string;
+}
+
+export interface SendSmsResult {
+  ok: boolean;
+  /** Twilio Message SID on success; error text on failure. */
+  detail: string;
+}
+
+/** Outbound SMS: one REST POST to Messages.json (Text Mode replies + notifications). */
+export async function sendSms(opts: SendSmsOptions): Promise<SendSmsResult> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const base = opts.apiBase ?? TWILIO_API_BASE;
+  const url = `${base}/2010-04-01/Accounts/${encodeURIComponent(opts.accountSid)}/Messages.json`;
+  const body = new URLSearchParams({
+    To: opts.to,
+    From: opts.from,
+    Body: opts.body,
+  });
+  const auth = Buffer.from(`${opts.accountSid}:${opts.authToken}`).toString('base64');
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString(),
+    });
+    const data = (await res.json().catch(() => ({}))) as { sid?: string; message?: string };
+    if (!res.ok) return { ok: false, detail: `Twilio ${res.status}: ${data.message || 'send failed'}` };
     return { ok: true, detail: data.sid || 'queued' };
   } catch (e) {
     return { ok: false, detail: 'Twilio unreachable: ' + (e as Error).message };
