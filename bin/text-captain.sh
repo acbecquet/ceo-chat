@@ -29,9 +29,11 @@ if [ ! -f "$SECRETS" ]; then
   exit 1
 fi
 
-# Pull TWILIO_AUTH_TOKEN out of the dotenv file without exporting anything else.
+# Pull TWILIO_AUTH_TOKEN out of the dotenv file without exporting anything else,
+# with loadSecrets parity: last matching line wins, the value is whitespace-trimmed,
+# then ONE layer of surrounding quotes (double or single) is stripped.
 AUTH_TOKEN="$(sed -n 's/^[[:space:]]*TWILIO_AUTH_TOKEN[[:space:]]*=[[:space:]]*//p' "$SECRETS" \
-  | head -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")"
+  | tail -n1 | sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e 't' -e "s/^'\(.*\)'$/\1/")"
 if [ -z "$AUTH_TOKEN" ]; then
   echo "error: TWILIO_AUTH_TOKEN is not set in $SECRETS - Text Mode is not configured." >&2
   exit 1

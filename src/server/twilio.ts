@@ -58,6 +58,13 @@ export function twilioSignature(authToken: string, url: string, params: Record<s
   return createHmac('sha1', authToken).update(Buffer.from(data, 'utf8')).digest('base64');
 }
 
+/** Constant-time string equality - for webhook signatures and derived tokens. */
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
 /** Constant-time check of a webhook's X-Twilio-Signature header. */
 export function validateTwilioSignature(
   authToken: string,
@@ -65,9 +72,7 @@ export function validateTwilioSignature(
   params: Record<string, string>,
   signature: string,
 ): boolean {
-  const expected = Buffer.from(twilioSignature(authToken, url, params));
-  const given = Buffer.from(signature || '');
-  return expected.length === given.length && timingSafeEqual(expected, given);
+  return timingSafeEqualStr(twilioSignature(authToken, url, params), signature || '');
 }
 
 /** Loose phone-number equality: compare digits (with a leading +) only. */

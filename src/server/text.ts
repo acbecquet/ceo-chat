@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import type { PhoneSecrets } from '../config/secrets.ts';
 import { textCapabilities } from '../config/secrets.ts';
 import type { TurnRunner } from './turns.ts';
-import { parseFormBody, validateTwilioSignature, sameNumber, sendSms } from './twilio.ts';
+import { parseFormBody, validateTwilioSignature, sameNumber, sendSms, timingSafeEqualStr } from './twilio.ts';
 
 export const TEXT_WEBHOOK_PATH = '/text/webhook';
 export const TEXT_NOTIFY_PATH = '/text/notify';
@@ -231,6 +231,11 @@ export function createTextApp(opts: TextAppOptions): TextApp {
     }
     const res = await fetchImpl(url, { headers });
     if (!res.ok) throw new Error(`media fetch failed: HTTP ${res.status}`);
+    const declared = Number(res.headers.get('content-length') || 0);
+    if (declared > MAX_MEDIA_BYTES) {
+      void res.body?.cancel().catch(() => {});
+      throw new Error(`media too large (${declared} bytes declared)`);
+    }
     const bytes = Buffer.from(await res.arrayBuffer());
     if (bytes.length > MAX_MEDIA_BYTES) throw new Error(`media too large (${bytes.length} bytes)`);
     const contentType =
@@ -329,6 +334,11 @@ export function createTextApp(opts: TextAppOptions): TextApp {
       // webhook window and the real reply goes out via REST when it finishes.
       emptyTwiml(res);
       void handleInbound(params).catch((e) => log('text: inbound flow failed - ' + (e as Error).message));
+    }).catch((e) => {
+      log('text: webhook handling failed - ' + (e as Error).message);
+      try {
+        if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' }).end('error');
+      } catch { /* ignore */ }
     });
   }
 
@@ -339,7 +349,7 @@ export function createTextApp(opts: TextAppOptions): TextApp {
         return;
       }
       const given = String(req.headers['x-ceochat-notify'] || '');
-      if (!secrets.authToken || given !== notifyToken(secrets.authToken)) {
+      if (!secrets.authToken || !timingSafeEqualStr(given, notifyToken(secrets.authToken))) {
         log('text: notify REFUSED - bad x-ceochat-notify token');
         json(res, 403, { ok: false, detail: 'forbidden' });
         return;
@@ -357,6 +367,11 @@ export function createTextApp(opts: TextAppOptions): TextApp {
       }
       const result = await app.notify(text);
       json(res, result.ok ? 200 : 502, result);
+    }).catch((e) => {
+      log('text: notify handling failed - ' + (e as Error).message);
+      try {
+        if (!res.headersSent) json(res, 500, { ok: false, detail: 'internal error' });
+      } catch { /* ignore */ }
     });
   }
 
