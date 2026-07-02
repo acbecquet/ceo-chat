@@ -11,9 +11,11 @@
 // Call Mode: when a PhoneApp (src/server/phone.ts) is wired in, this server ALSO
 // answers the Twilio voice webhook (POST /phone/twiml) and the Media Streams WS
 // upgrade (/phone) on the SAME port, so one Cloudflare tunnel fronts both the
-// browser UI and the phone bridge. Turns started from the phone stream into every
-// connected browser (the web app is the in-call companion transcript) because both
-// transports share ONE TurnRunner.
+// browser UI and the phone bridge. Text Mode rides it the same way: a wired-in
+// TextApp (src/server/text.ts) answers the Twilio messaging webhook
+// (POST /text/webhook) and the /text/notify trigger here too. Turns started from
+// the phone or an SMS stream into every connected browser (the web app is the
+// companion transcript) because all transports share ONE TurnRunner.
 //
 // Tunnel-ready: plain HTTP on localhost (Cloudflare terminates TLS at the named
 // tunnel), and the browser upgrades to a RELATIVE same-origin ws(s):// - so the same

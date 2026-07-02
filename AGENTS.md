@@ -24,7 +24,8 @@ streaming TTS. Decision-ready plan:
   cloned voice — see Phase 8), `GEMINI_API_KEY` and `ANTHROPIC_API_KEY`).
   Never hardcode or
   commit. `.gitignore` covers `*.env`, `phase0/out/`, `out/` (broker WAV/narration),
-  `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts (`dist/`, `*.tsbuildinfo`).
+  `inbox/` (inbound MMS media), `*.wav`/`*.pcm`, `node_modules/`, and TS artifacts
+  (`dist/`, `*.tsbuildinfo`).
 
 ## MiniMax integration gotchas (CONFIRMED live, 2026-06-27)
 - International platform only: `wss://api.minimax.io/ws/v1/t2a_v2` (NOT `minimaxi.com`).

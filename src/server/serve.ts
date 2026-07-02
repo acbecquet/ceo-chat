@@ -17,6 +17,11 @@
 // into the same pipeline - first mate as a real phone call, with the browser as
 // the in-call verbatim transcript. The "Call me" button rings the captain.
 //
+// TEXT MODE (docs/text-mode.md): with the auth token + allowlist paired, the same
+// server also answers the Twilio Messaging webhook (POST /text/webhook) - SMS/MMS
+// to first mate on the SAME number - and the proactive /text/notify trigger
+// (bin/text-captain.sh), replying by Twilio REST after the turn.
+//
 // EXPOSURE: serve plain HTTP on localhost; firstmate fronts it with a Cloudflare
 // NAMED TUNNEL at https://ceo-chat.acb-apps.com (Cloudflare terminates TLS and the
 // page upgrades to a same-origin wss://, so nothing here assumes a public host).

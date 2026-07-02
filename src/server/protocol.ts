@@ -83,9 +83,10 @@ export type ServerMessage =
   | { type: 'status'; state: UiStatus }
   // A full snapshot of the agent terminal pane (ANSI), for xterm.js.
   | { type: 'terminal'; data: string }
-  // Echo of an ACCEPTED captain line (typed, spoken, or over the phone) so every
-  // connected client renders the same conversation - including turns the captain
-  // started from the phone call. `ts` = epoch ms for the transcript timestamps.
+  // Echo of an ACCEPTED captain line (typed, spoken, over the phone, or by SMS) so
+  // every connected client renders the same conversation - including turns the
+  // captain started from the phone call or by text. `ts` = epoch ms for the
+  // transcript timestamps.
   | { type: 'sent'; turn: number; text: string; source: TurnSource; ts: number; replay?: boolean }
   // The 1:1 VERBATIM transcript of first mate's ACTUAL reply - the exact assistant
   // text from the session transcript, streamed live as the turn runs (each frame is
