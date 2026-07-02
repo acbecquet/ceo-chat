@@ -500,7 +500,9 @@ streaming TTS. Decision-ready plan:
   (`From`/`To` vs `CEOCHAT_ALLOWED_CALLER` -> `<Reject/>`); `X-Twilio-Signature`
   HMAC validation; a SINGLE-USE short-TTL stream token minted by the webhook and
   required in the WS `start` frame (a direct WS hit is closed); a DTMF-or-spoken PIN
-  (`CEOCHAT_PHONE_PIN`) before the FIRST injection on every call (3 failures end it);
+  (`CEOCHAT_PHONE_PIN`) before the FIRST injection on every call (3 failures end it;
+  a spoken utterance counts as an attempt ONLY when its extracted digits reach the
+  PIN length - stray homophones like "go for it" -> "4" never burn the lockout);
   `guardUtterance` on the voice leg. Outbound "Call me" (web button -> `call-me`
   frame -> Twilio REST `Calls.json`) is the primary flow.
 - **Interactive-prompt fallback (captain-approved):** unclear/absent answer to a
@@ -526,8 +528,9 @@ streaming TTS. Decision-ready plan:
   when allowlist+PIN exist; outbound needs the TWILIO_* trio too.
 - **Validation:** mock Media Streams client legs in `npm run validate` (no Twilio
   creds): mu-law transcode + VAD, webhook allowlist/signature/token + Call-me REST
-  shape, PIN gate (NOTHING injected until it passes), STT->send, media+mark framing
-  round-trip, barge-in `clear`+abort, hangup abort, re-ask/safe-default policy
+  shape, PIN gate (NOTHING injected until it passes), spoken-PIN stray-speech
+  ignore + hangup-mid-transcription listener-leak guard, STT->send, media+mark
+  framing round-trip, barge-in `clear`+abort, hangup abort, re-ask/safe-default policy
   (incl. the 'send-cancel' config flip), byte-exact verbatim (pure tap + over the
   WS), lossless segments/answer card/PWA assets/reconnect resume. GOTCHA for tests:
   `asMediaFrame` returns the ENCODED wire string - send it with `ws.send(...)`, not

@@ -2113,6 +2113,95 @@ await reporter.leg('phone - unauth WS: handshake deadline frees the slot; anonym
   }
 });
 
+// P4c - spoken-PIN robustness: pre-auth stray speech whose homophones extract
+// FEWER digits than the PIN ("go for it" -> "4") is ignored entirely - it can
+// never burn the 3-attempt lockout - while a wrong FULL-LENGTH spoken PIN still
+// counts; and a hangup while an utterance is mid-transcription never re-subscribes
+// the torn-down call to the shared TurnRunner (the listener-leak race).
+await reporter.leg('phone - spoken PIN: stray speech never burns the lockout; hangup mid-transcription leaks no listener', async (t) => {
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: async () => ({ reply: 'ok', narration: 'Ok.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+
+  // ---- rig A: homophone-laden stray speech in the pre-auth window
+  {
+    const spoken: string[] = [];
+    const heard = [
+      'go for it', // -> "4": 1 digit, below the PIN length
+      'i ate way too much oh well', // -> "820": still below the PIN length
+      'nine nine nine nine', // -> "9999": a wrong FULL-LENGTH attempt
+      'four three two one', // -> the correct PIN
+    ];
+    const runner = new TurnRunner({ driver });
+    const phone = createPhoneApp({
+      runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+      transcribe: async () => heard.shift() ?? '',
+      synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
+      log: () => {},
+    });
+    const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+    try {
+      const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+      const call = await connectPhoneClient(app.port);
+      call.send({ event: 'start', start: { streamSid: 'MZstray', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.pinPrompt)), 'the call is greeted with the PIN prompt');
+
+      const retries = (): number => spoken.filter((s) => s === DEFAULT_PHRASES.pinRetry).length;
+      call.speakUtterance(); // "go for it"
+      t.ok(await until(() => heard.length === 3), 'stray utterance 1 was transcribed');
+      call.speakUtterance(); // "i ate way too much oh well"
+      t.ok(await until(() => heard.length === 2), 'stray utterance 2 was transcribed');
+      await realSleep(120);
+      t.eq(retries(), 0, 'sub-PIN-length digit extractions are IGNORED: no failed attempt, no retry prompt');
+      t.ok(!call.closed, 'stray speech never progresses the lockout');
+
+      call.speakUtterance(); // "nine nine nine nine"
+      t.ok(await until(() => retries() === 1), 'a wrong FULL-LENGTH spoken PIN still burns an attempt');
+
+      call.speakUtterance(); // the correct PIN
+      t.ok(await until(() => spoken.includes(DEFAULT_PHRASES.greeting)), 'the correct PIN still authenticates - the strays cost nothing');
+      t.ok(!spoken.includes(DEFAULT_PHRASES.pinLocked), 'the lockout was never reached');
+      call.close();
+    } finally {
+      await app.close();
+    }
+  }
+
+  // ---- rig B: hangup while the spoken PIN is mid-transcription
+  {
+    let releasePin: ((text: string) => void) | null = null;
+    const runner = new TurnRunner({ driver });
+    const listenerCount = (): number => (runner as unknown as { listeners: Set<unknown> }).listeners.size;
+    const phone = createPhoneApp({
+      runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+      transcribe: () => new Promise<string>((res) => { releasePin = res; }),
+      synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+      log: () => {},
+    });
+    const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+    try {
+      const baseline = listenerCount();
+      const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+      const call = await connectPhoneClient(app.port);
+      call.send({ event: 'start', start: { streamSid: 'MZrace', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+      call.speakUtterance();
+      t.ok(await until(() => releasePin !== null), 'the spoken PIN reached whisper (transcription pending)');
+      call.send({ event: 'stop' }); // hangup while whisper is still working
+      t.ok(await until(() => !phone.activeCall), 'the call tears down on hangup');
+      releasePin!('four three two one'); // whisper resolves AFTER teardown
+      await realSleep(150);
+      t.eq(listenerCount(), baseline, 'REGRESSION GUARD: the late PIN never re-subscribes the dead call to the shared runner');
+      call.close();
+    } finally {
+      await app.close();
+    }
+  }
+});
+
 // P5 - the captain-approved INTERACTIVE-PROMPT FALLBACK: an unclear spoken answer
 // to a consequential prompt is RE-ASKED once; still unclear (or pure silence, via
 // the answer timer) -> a safe default that takes NO consequential action. The

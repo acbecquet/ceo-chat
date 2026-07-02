@@ -362,12 +362,12 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         log('phone: transcription failed: ' + (e as Error).message);
         return;
       }
+      if (this.closed) return;
       if (!text) return;
       if (!this.authed) {
         const digits = digitsFromSpoken(text);
         const pin = secrets.pin || '';
         if (pin && digits.length >= pin.length) this.tryPin(digits.slice(-pin.length));
-        else if (digits) this.pinFailed();
         return;
       }
       this.handleCommand(text);
