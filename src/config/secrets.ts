@@ -15,6 +15,12 @@
 //   CEOCHAT_PHONE_PIN     - 4-6 digit PIN required (keypad/DTMF entry only) before
 //                            the first injection on ANY call, inbound or outbound.
 //
+// Text Mode (SMS/MMS on the SAME number - see docs/text-mode.md) reuses the four
+// Twilio keys above and adds one optional switch:
+//   CEOCHAT_TEXT_NOTIFY   - proactive outbound notification texts ("PR is green").
+//                           Default ON when texting is configured; set 0/false/off
+//                           to disable the /text/notify trigger.
+//
 // A blank/absent key does NOT throw — callers decide whether to run the real
 // credentialed call or gracefully fall back to the mock path. This is what lets
 // `npm run validate` run fully green with no creds and flip to live cleanly.
@@ -106,4 +112,24 @@ export function phoneCapabilities(p: PhoneSecrets): { inbound: boolean; outbound
   const inbound = !!(p.allowedCaller && p.pin);
   const outbound = inbound && !!(p.accountSid && p.authToken && p.phoneNumber);
   return { inbound, outbound };
+}
+
+// ── Text Mode (SMS/MMS on the same Twilio number) ──────────────────────────────
+
+// Text Mode reuses PhoneSecrets. Inbound SMS needs the allowlist AND the auth
+// token - X-Twilio-Signature validation is MANDATORY on the text webhook (the
+// broker fronts a shell-capable agent), so without the token the webhook never
+// mounts. Replies + proactive notifications additionally need the account SID and
+// the purchased number for the REST send.
+export function textCapabilities(p: PhoneSecrets): { inbound: boolean; outbound: boolean } {
+  const inbound = !!(p.allowedCaller && p.authToken);
+  const outbound = inbound && !!(p.accountSid && p.phoneNumber);
+  return { inbound, outbound };
+}
+
+// Proactive outbound notification texts ("PR is green"). Config-gated, DEFAULT ON:
+// only an explicit CEOCHAT_TEXT_NOTIFY=0/false/off in secrets.env disables it.
+export function textNotifyEnabled(secrets: Secrets): boolean {
+  const v = (secrets.CEOCHAT_TEXT_NOTIFY || '').trim().toLowerCase();
+  return !(v === '0' || v === 'false' || v === 'off');
 }

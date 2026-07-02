@@ -549,5 +549,58 @@ streaming TTS. Decision-ready plan:
 - **Live e2e over a real number is captain-gated:** needs the captain's Twilio
   account + secrets (checklist in docs/call-mode.md). Never fabricate Twilio creds.
 
+## Phase 10 - Text Mode (SMS/MMS on the SAME Twilio number) + captain setup guide
+- **`src/server/text.ts` is the transport shell** (phone.ts's mold; docs/text-mode.md).
+  Inbound: Twilio Messaging webhook `POST /text/webhook` -> **X-Twilio-Signature
+  validation MANDATORY, no opt-out** (Text Mode only mounts when `textCapabilities`
+  has authToken+allowlist) -> `From` allowlist (stranger = SILENT drop: empty
+  `<Response/>`, nothing injected, no reply) -> Body + attachment references run
+  through the SAME `TurnRunner.run(text, 'sms')` - pipeline below Driver.send
+  UNCHANGED. The webhook answers empty TwiML IMMEDIATELY (turns outlive Twilio's
+  ~15s webhook window); the reply rides REST `Messages.json` after the turn.
+- **Reply = `formatSmsReply(narration, verbatim, publicUrl)`:** the concise
+  narration leads; when the verbatim reply differs (whitespace-normalized), append
+  `Full reply: <url>`; truncate the NARRATION (never the link) to Twilio's
+  1600-char Body cap (REST error 21617 past it).
+- **Injected text is ONE line** - fm-send submits on newline, so `buildInjectedText`
+  flattens all whitespace and appends `[MMS attachment i/n from the captain:
+  <abs inbox path> (<content-type>) - open and inspect it.]` per file.
+- **MMS intake:** https only; the account Basic auth is attached ONLY for
+  `*.twilio.com` hosts (undici drops it on the cross-origin S3 redirect anyway -
+  belt and suspenders); caps 10 items / 10 MB each; files land in the gitignored
+  `inbox/` (`DEFAULT_INBOX_DIR` = repo root, `inboxDir` injectable).
+- **Proactive texts:** `POST /text/notify`, gated by `CEOCHAT_TEXT_NOTIFY`
+  (default ON; 0/false/off disables) + header `x-ceochat-notify =
+  sha256(TWILIO_AUTH_TOKEN)` (`notifyToken()`; the raw token never rides a
+  header). It can only EVER text `CEOCHAT_ALLOWED_CALLER`. Trigger:
+  `npm run text-captain -- "PR is green"` (`bin/text-captain.sh` - sed-extracts
+  the token from secrets.env; sha256sum parity is leg-asserted).
+- **Busy handling:** `runWhenFree` polls the shared busy lock (250ms, 180s cap).
+  `runner.run` returning `turn === 0` = never started (lost busy race / empty) ->
+  keep waiting; `turn > 0 && !ok` = ran and failed -> text a failure note.
+- **A2P 10DLC gates OUTBOUND only** (researched + cited 2026-07-02 in
+  docs/text-mode.md and the setup guide): inbound SMS/MMS works unregistered;
+  unregistered US outbound is blocked (error 30034) since 2023-09-01. Sole
+  proprietor tier: ~$4.50 brand + $15 vetting one-time, $2/mo campaign +
+  $1.15/mo number, vetting ~1-3 weeks, throughput 1 MPS (plenty). So the captain
+  can text IN immediately; replies/notifications unlock at campaign approval.
+- **`docs/setup-guide.html` is a STANDALONE interactive captain guide** (calling +
+  texting go-live: console webhooks, A2P walkthrough, secrets generator, live-test
+  scripts, cited cost table). localStorage checklist + client-side-only value
+  rendering; iPhone-first dark, 44px targets, zero horizontal overflow (pixel
+  checked at 390px). Deliberately NOT served/linked by the web app (captain wants
+  the app clean) - open the file directly. The PIN and auth token are never
+  persisted/collected by the page. Copy buttons sit ABOVE code blocks - an
+  overlaid button chops horizontally-scrolling code lines.
+- **Protocol addition:** `TurnSource` now includes `'sms'`; the web transcript
+  labels those turns "you (by text)". No other WS changes.
+- **Validation:** 4 mock `text - …` legs in `npm run validate` (no Twilio, no
+  network): pure reply framing (1600 boundary, link survival, single-line inject,
+  notifyToken parity), webhook e2e over the REAL endpoint (403 unsigned, silent
+  stranger drop, Body->send, REST reply framing, `sent` frame source 'sms'),
+  MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only),
+  and notify gates (token 403s, config-off 404, framing). Live texting stays
+  captain-gated on A2P registration.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

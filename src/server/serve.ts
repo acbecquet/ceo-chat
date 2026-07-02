@@ -30,9 +30,11 @@ import { createWebApp, type WebApp } from './app.ts';
 import { makeWhisperTranscriber } from './stt.ts';
 import { TurnRunner } from './turns.ts';
 import { createPhoneApp, type PhoneApp } from './phone.ts';
+import { createTextApp, type TextApp } from './text.ts';
 import { makeTranscriptVerbatim, resolveBrokerProjectDir } from './verbatim.ts';
 import {
   loadSecrets, hasMinimaxCreds, minimaxVoiceId, phoneSecrets, phoneCapabilities,
+  textCapabilities, textNotifyEnabled,
 } from '../config/secrets.ts';
 import { synthStreaming, INTL_WS } from '../tts/minimax.ts';
 import { findPiper, synthLocal } from '../tts/local-tts.ts';
@@ -119,6 +121,20 @@ if (phoneCaps.inbound) {
   });
 }
 
+// Text Mode: SMS/MMS on the SAME number. Mounted only when the mandatory webhook
+// authentication is possible (auth token) AND the sender allowlist is set.
+const textCaps = textCapabilities(phoneCfg);
+let text: TextApp | null = null;
+if (textCaps.inbound) {
+  text = createTextApp({
+    runner,
+    secrets: phoneCfg,
+    publicUrl,
+    notifyEnabled: textNotifyEnabled(secrets),
+    log,
+  });
+}
+
 const ttsLine =
   broker.ttsMode === 'local' ? `LOCAL piper (${broker.ttsVoiceLabel()}) - real offline speech`
   : broker.ttsMode === 'minimax' ? `MINIMAX premium cloud voice - ${broker.ttsVoiceLabel()}`
@@ -132,6 +148,9 @@ console.log(`target: ${broker.targetLabel()}`);
 console.log(phone
   ? `call mode: ${phoneCaps.outbound ? 'inbound + outbound ("Call me")' : 'inbound only (add TWILIO_* secrets for outbound)'} - webhook ${publicUrl}/phone/twiml`
   : 'call mode: OFF (add CEOCHAT_ALLOWED_CALLER + CEOCHAT_PHONE_PIN - see docs/call-mode.md)');
+console.log(text
+  ? `text mode: ${textCaps.outbound ? `inbound + replies${text.notifyEnabled ? ' + notify' : ' (notify OFF)'}` : 'inbound only (add TWILIO_ACCOUNT_SID + TWILIO_PHONE_NUMBER for replies)'} - webhook ${publicUrl}/text/webhook`
+  : 'text mode: OFF (add TWILIO_AUTH_TOKEN + CEOCHAT_ALLOWED_CALLER - see docs/text-mode.md)');
 console.log(attached
   ? 'attaching to your running first mate…'
   : 'spawning dedicated ceo-chat session (this takes a few seconds)…  '
@@ -143,6 +162,7 @@ try {
     driver,
     runner,
     phone: phone ?? undefined,
+    text: text ?? undefined,
     log,
     transcribe: transcriber ? (pcm, sr) => transcriber.transcribe(pcm, sr) : undefined,
     sttLabel: transcriber ? transcriber.label : '',

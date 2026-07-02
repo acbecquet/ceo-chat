@@ -30,9 +30,10 @@ export type TtsMode = 'minimax' | 'local' | 'mock';
 // Sample rate the SERVER-SIDE STT path expects the browser to send mic PCM at.
 export const STT_SAMPLE_RATE = 16000;
 
-// Where a turn was initiated from. Phone turns broadcast to the web clients too -
-// the web app is the in-call companion screen showing the verbatim transcript.
-export type TurnSource = 'web' | 'phone';
+// Where a turn was initiated from. Phone and SMS turns broadcast to the web
+// clients too - the web app is the companion screen showing the verbatim
+// transcript whichever transport the captain used.
+export type TurnSource = 'web' | 'phone' | 'sms';
 
 // Twilio call state surfaced to the browser (the "Call me" flow + on-call status).
 export type PhoneState = 'unavailable' | 'idle' | 'dialing' | 'in-call' | 'ended' | 'failed';

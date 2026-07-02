@@ -30,6 +30,7 @@ import type { Driver } from './driver.ts';
 import { TurnRunner } from './turns.ts';
 import type { VerbatimTap } from './verbatim.ts';
 import type { PhoneApp } from './phone.ts';
+import type { TextApp } from './text.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(HERE, 'public');
@@ -76,6 +77,8 @@ export interface WebAppOptions {
   runner?: TurnRunner;
   /** Call Mode: the Twilio phone transport to mount on this server. Optional. */
   phone?: PhoneApp;
+  /** Text Mode: the Twilio SMS/MMS transport to mount on this server. Optional. */
+  text?: TextApp;
   /** How many finished turns to keep for reconnect replay. */
   historyMax?: number;
   log?: (msg: string) => void;
@@ -134,6 +137,7 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   const transcribe = opts.transcribe;
   const sttLabel = opts.sttLabel ?? '';
   const phone = opts.phone ?? null;
+  const text = opts.text ?? null;
 
   await driver.start();
 
@@ -149,6 +153,8 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   const httpServer = createServer((req, res) => {
     // Call Mode: the Twilio voice webhook rides the same server/tunnel.
     if (phone && phone.handleHttp(req, res)) return;
+    // Text Mode: the Twilio messaging webhook + the notify trigger ride it too.
+    if (text && text.handleHttp(req, res)) return;
     if (req.method !== 'GET') { res.writeHead(405).end('method not allowed'); return; }
     serveStatic(req, res);
   });
