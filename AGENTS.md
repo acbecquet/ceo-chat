@@ -562,14 +562,21 @@ streaming TTS. Decision-ready plan:
 - **Reply = `formatSmsReply(narration, verbatim, publicUrl)`:** the concise
   narration leads; when the verbatim reply differs (whitespace-normalized), append
   `Full reply: <url>`; truncate the NARRATION (never the link) to Twilio's
-  1600-char Body cap (REST error 21617 past it).
+  1600-char Body cap (REST error 21617 past it). ANY truncation FORCES the link,
+  even when narration == verbatim - a cut-off text with no pointer would strand
+  the captain.
 - **Injected text is ONE line** - fm-send submits on newline, so `buildInjectedText`
   flattens all whitespace and appends `[MMS attachment i/n from the captain:
   <abs inbox path> (<content-type>) - open and inspect it.]` per file.
 - **MMS intake:** https only; the account Basic auth is attached ONLY for
   `*.twilio.com` hosts (undici drops it on the cross-origin S3 redirect anyway -
   belt and suspenders); caps 10 items / 10 MB each; files land in the gitignored
-  `inbox/` (`DEFAULT_INBOX_DIR` = repo root, `inboxDir` injectable).
+  `inbox/` (`DEFAULT_INBOX_DIR` = repo root, `inboxDir` injectable). Partial fetch
+  failures are NAMED by 1-based position (`describeMediaFailures`) on BOTH sides:
+  the injected line gets `[WARNING: MMS 1 of 2 attachments (the 2nd) failed to
+  download - you did NOT receive it.]` and the SMS reply LEADS with `Note: ... -
+  first mate did NOT see it.` (the reply budget shrinks around the note) - so
+  neither side ever mistakes a partial MMS for the whole one.
 - **Proactive texts:** `POST /text/notify`, gated by `CEOCHAT_TEXT_NOTIFY`
   (default ON; 0/false/off disables) + header `x-ceochat-notify =
   sha256(TWILIO_AUTH_TOKEN)` (`notifyToken()`; the raw token never rides a
@@ -596,12 +603,17 @@ streaming TTS. Decision-ready plan:
 - **Protocol addition:** `TurnSource` now includes `'sms'`; the web transcript
   labels those turns "you (by text)". No other WS changes.
 - **Validation:** 4 mock `text - …` legs in `npm run validate` (no Twilio, no
-  network): pure reply framing (1600 boundary, link survival, single-line inject,
+  network): pure reply framing (1600 boundary, link survival + forced link on ANY
+  truncation, single-line inject incl. the failure WARNING, ordinal naming,
   notifyToken parity), webhook e2e over the REAL endpoint (403 unsigned, silent
   stranger drop, Body->send, REST reply framing, `sent` frame source 'sms'),
-  MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only),
-  and notify gates (token 403s, config-off 404, framing). Live texting stays
-  captain-gated on A2P registration.
+  MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only,
+  the partial-failure note leading the SMS reply), and notify gates (token 403s,
+  config-off 404, framing). Live texting stays captain-gated on A2P registration.
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.
+- **CI:** `.github/workflows/validate.yml` runs `npm ci` + `npm run typecheck` +
+  `npm run validate` on every pull request and push to `main`. The suite is fully
+  mock (no secrets, no network services); live legs self-skip without creds and
+  tmux/piper/whisper-dependent legs report PENDING when absent, never red.

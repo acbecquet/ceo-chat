@@ -15,7 +15,7 @@ For everything you must do to go live (Twilio console, A2P registration, secrets
                inbox/ -> TurnRunner.run(Body + attachment references, 'sms')
      reply   : Twilio REST Messages.json - the concise speakable summary, within
                the 1600-char limit, plus the web transcript link when the full
-               verbatim reply holds more detail
+               verbatim reply holds more detail (any truncation forces the link)
      proactive: POST /text/notify (bin/text-captain.sh) -> SMS to the captain
 ```
 
@@ -26,7 +26,9 @@ An SMS turn broadcasts to every connected browser too, labeled "you (by text)".
 
 - **Text the number.** The Body is injected exactly like a spoken utterance; the reply comes back as an SMS with the same concise summary the voice legs speak.
 - **Read the detail on the web.** When the full verbatim reply holds more than the summary, the SMS ends with `Full reply: https://ceo-chat.acb-apps.com`.
+  Any reply cut at the 1600-char SMS limit also forces that link - a truncated text always carries the pointer to the full transcript.
 - **Send photos/files by MMS.** Each attachment is fetched with authenticated Twilio requests and stored under the gitignored `inbox/` dir; the injected line references the absolute path so first mate opens and inspects exactly what you sent.
+  An attachment that fails to download is named by position on both sides: the injected line carries `[WARNING: MMS 1 of 2 attachments (the 2nd) failed to download - you did NOT receive it.]` and the SMS reply leads with `Note: ... - first mate did NOT see it.`, so a partial MMS is never mistaken for the whole one.
 - **Get proactive texts.** A first mate session (or any local script) runs:
 
   ```
@@ -68,5 +70,5 @@ So: the captain can text IN (and MMS photos in) the moment the messaging webhook
 
 ## Validation
 
-`npm run validate` includes mock Text Mode legs (no Twilio account, no network): the mandatory signature gate, the sender allowlist (silent drop), Body -> TurnRunner injection through the same seam as speech, the REST reply framing (narration + transcript link, 1600-char boundary behavior), MMS intake (authenticated fetch, inbox storage, injected references, non-Twilio-host credential protection, https-only), and the proactive notify trigger (token gate, config gate, REST framing).
+`npm run validate` includes mock Text Mode legs (no Twilio account, no network): the mandatory signature gate, the sender allowlist (silent drop), Body -> TurnRunner injection through the same seam as speech, the REST reply framing (narration + transcript link, 1600-char boundary behavior, forced link on any truncation), MMS intake (authenticated fetch, inbox storage, injected references, non-Twilio-host credential protection, https-only, partial-failure naming in both the injected line and the SMS reply), and the proactive notify trigger (token gate, config gate, REST framing).
 Live texting stays captain-gated on A2P registration.

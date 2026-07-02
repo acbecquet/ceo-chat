@@ -271,12 +271,16 @@ When the captain cannot talk, **text the Call Mode number** instead
   The reply rides Twilio REST after the turn (turns outlive the ~15s webhook window):
   the concise spoken-style summary within Twilio's 1600-char Body cap, plus a
   `Full reply:` link to the web transcript whenever the verbatim reply holds more
-  detail (the link always survives truncation). SMS turns broadcast to every
-  connected browser too, labeled "you (by text)".
+  detail. Any truncation FORCES that link (a cut-off text always carries the
+  pointer), and the link itself always survives the cut. SMS turns broadcast to
+  every connected browser too, labeled "you (by text)".
 - **MMS attachments land in `inbox/`.** Photos/files are fetched (https-only,
   Basic auth attached only for Twilio hosts, capped at 10 items / 10 MB each) into
   the gitignored `inbox/` dir and referenced by absolute path in the injected line,
-  so first mate opens and inspects exactly what you sent.
+  so first mate opens and inspects exactly what you sent. An attachment that fails
+  to fetch is named by position on BOTH sides - a `WARNING` in the injected line
+  and a leading `Note: ... - first mate did NOT see it.` in the SMS reply - so a
+  partial MMS is never mistaken for the whole one.
 - **Proactive texts.** `npm run text-captain -- "PR is green"` POSTs `/text/notify`
   on the running server, which texts `CEOCHAT_ALLOWED_CALLER` - the captain's own
   number and nobody else's. Gated by `CEOCHAT_TEXT_NOTIFY` (default ON) plus a
@@ -308,6 +312,11 @@ PCM) and returns synthetic sine-wave PCM, so audio-path assertions are real byte
 Speakability runs against a deterministic offline backend that encodes the §7.3
 contract.
 
+**CI runs the same gate** on every pull request and push to `main`
+([`.github/workflows/validate.yml`](./.github/workflows/validate.yml): `npm ci` +
+`npm run typecheck` + `npm run validate`) - no secrets needed; live legs self-skip
+without creds and tmux/piper/whisper-dependent legs report PENDING, never red.
+
 It covers:
 
 | Group | What it asserts |
@@ -319,7 +328,7 @@ It covers:
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
 | **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
-| **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary; one-line inject; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only) · notify gates (bad token 403, config-off 404, REST framing) |
+| **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary and is FORCED by any truncation; one-line inject incl. the partial-MMS `WARNING`; ordinal failure naming; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only, the failure note leads the SMS reply) · notify gates (bad token 403, config-off 404, REST framing) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -420,6 +429,8 @@ read-aloud script: [`docs/voice-clone.md`](./docs/voice-clone.md).
 ## Layout
 
 ```
+.github/workflows/
+  validate.yml             CI: npm ci + typecheck + the mock validation harness on PRs / main
 bin/
   launch-firstmate.sh      launch a first mate in tmux to attach to (npm run firstmate)
   setup-local-voice.sh     download/build the offline voice stack (npm run voice)
