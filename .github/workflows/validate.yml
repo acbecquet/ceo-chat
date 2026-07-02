@@ -1,0 +1,24 @@
+# CI: the validation harness is the repo's gate (see AGENTS.md). It runs fully
+# MOCK - no secrets, no network services - so it needs nothing but Node >= 22.
+# Live legs (MiniMax/Gemini/Twilio) self-skip without creds; hardware-dependent
+# legs (tmux/piper/whisper) report PENDING when absent, never red.
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run validate

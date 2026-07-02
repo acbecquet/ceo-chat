@@ -82,6 +82,7 @@ import {
 // Text Mode (SMS/MMS on the same Twilio number).
 import {
   createTextApp, formatSmsReply, buildInjectedText, mediaExtension, notifyToken,
+  ordinalName, describeMediaFailures,
   TEXT_WEBHOOK_PATH, TEXT_NOTIFY_PATH, SMS_BODY_LIMIT,
 } from '../src/server/text.ts';
 import { textCapabilities, textNotifyEnabled } from '../src/config/secrets.ts';
@@ -2633,6 +2634,13 @@ await reporter.leg('text - SMS reply framing: 1600 limit + transcript link + inj
   t.includes(over, '…', 'the truncation is marked');
   const huge = formatSmsReply('c'.repeat(5000), TEXT_REPLY, URL_);
   t.ok(huge.length <= SMS_BODY_LIMIT && huge.endsWith(LINK), 'a 5000-char narration still yields limit-safe body + link');
+  // truncation FORCES the link even when narration == verbatim (content was cut,
+  // so the captain always gets the pointer to the full transcript)
+  const longSame = 'd'.repeat(2000);
+  const forced = formatSmsReply(longSame, longSame, URL_);
+  t.ok(forced.length <= SMS_BODY_LIMIT, 'narration==verbatim over the limit is truncated');
+  t.ok(forced.endsWith(LINK), 'ANY truncation forces the transcript link, regardless of narration mode');
+  t.includes(forced, '…', 'and is marked as truncated');
 
   // the injected line: ONE line (fm-send submits on newline), body + references
   const files = [
@@ -2648,6 +2656,16 @@ await reporter.leg('text - SMS reply framing: 1600 limit + transcript link + inj
   t.includes(noBody, 'The captain texted 1 attachment (no message text).', 'a media-only MMS still injects a meaningful line');
   t.eq(buildInjectedText('  ', []), '', 'no body + no media -> nothing to inject');
   t.eq(buildInjectedText('two\n lines here', []), 'two lines here', 'embedded newlines in the SMS body are flattened');
+
+  // partial MMS failure is NAMED in the injected line - first mate must never
+  // mistake a partial MMS for the whole one
+  t.eq(ordinalName(1) + ordinalName(2) + ordinalName(3) + ordinalName(11), '1st2nd3rd11th', 'ordinal naming');
+  t.eq(describeMediaFailures([2], 3), '1 of 3 attachments (the 2nd) failed to download', 'a single failure is named by position');
+  t.eq(describeMediaFailures([1, 3], 3), '2 of 3 attachments (the 1st and 3rd) failed to download', 'multiple failures list every position');
+  const partial = buildInjectedText('see photos', [files[0]!], [2]);
+  t.includes(partial, 'WARNING: MMS 1 of 2 attachments (the 2nd) failed to download - you did NOT receive it.', 'the injected line warns first mate about the dropped attachment');
+  t.notIncludes(partial, '\n', 'the warning keeps the injection single-line');
+  t.eq(buildInjectedText('', [], [1]), '', 'all-failed with no body still injects nothing (the reply carries the failure)');
 
   // media extensions
   t.eq(mediaExtension('image/jpeg'), 'jpg', 'image/jpeg -> .jpg');
@@ -2786,15 +2804,23 @@ await reporter.leg('text - MMS intake: authenticated fetch -> gitignored inbox -
 
     t.ok(await until(() => smsSent.length === 1), 'the MMS turn still gets its SMS reply');
 
-    // an http:// (non-https) media URL is refused outright - the text still lands
+    // an http:// (non-https) media URL is refused outright - the text still
+    // lands, and BOTH sides are told the attachment was not seen
     await postText(app.url, {
       From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
       Body: 'insecure media test', NumMedia: '1', MessageSid: 'MMtest2',
       MediaUrl0: 'http://api.twilio.com/insecure', MediaContentType0: 'image/jpeg',
     });
     t.ok(await until(() => sends.length === 2), 'the message body still injected');
-    t.eq(sends[1], 'insecure media test', 'no attachment reference for the refused http URL');
+    t.ok(sends[1]!.startsWith('insecure media test'), 'the captain\'s words still lead');
+    t.includes(sends[1]!, 'WARNING: MMS 1 of 1 attachment (the 1st) failed to download', 'the injected line tells first mate the attachment never arrived');
+    t.notIncludes(sends[1]!, 'open and inspect', 'no attachment reference for the refused http URL');
     t.ok(!mediaHits.some((h) => h.url.startsWith('http://')), 'the http URL was never fetched');
+    t.ok(await until(() => smsSent.length === 2), 'the partial-failure turn still gets its SMS reply');
+    const failReply = smsSent[1]!.params.get('Body') || '';
+    t.ok(failReply.startsWith('Note: 1 of 1 attachment (the 1st) failed to download - first mate did NOT see it.'), 'the SMS reply LEADS with the failure note naming the unseen attachment');
+    t.includes(failReply, TEXT_NARRATION, 'and still carries the turn reply');
+    t.ok(failReply.length <= SMS_BODY_LIMIT, 'note + reply stay within the limit');
   } finally {
     await app.close();
     rmSync(inbox, { recursive: true, force: true });

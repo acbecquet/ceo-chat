@@ -87,13 +87,36 @@ export interface SavedMedia {
   bytes: number;
 }
 
+/** "3" -> "3rd" (1st/2nd/3rd/4th…, 11th-13th handled). Pure. */
+export function ordinalName(n: number): string {
+  const suffix = n % 100 >= 11 && n % 100 <= 13 ? 'th'
+    : n % 10 === 1 ? 'st' : n % 10 === 2 ? 'nd' : n % 10 === 3 ? 'rd' : 'th';
+  return `${n}${suffix}`;
+}
+
+/**
+ * Names the attachments that were NOT fetched, by their 1-based position in the
+ * inbound MMS: "1 of 3 attachments (the 2nd) failed to download". Used verbatim
+ * in BOTH the injected line (so first mate knows what it never saw) and the SMS
+ * reply (so the captain never assumes a dropped photo was seen). Pure.
+ */
+export function describeMediaFailures(failedOrdinals: number[], total: number): string {
+  const names = failedOrdinals.map(ordinalName);
+  const list = names.length === 1
+    ? `the ${names[0]}`
+    : 'the ' + names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+  return `${failedOrdinals.length} of ${total} attachment${total === 1 ? '' : 's'} (${list}) failed to download`;
+}
+
 /**
  * The single line injected into the session for an inbound text. One line only -
  * the real broker path submits via fm-send, where an embedded newline would split
  * the message. Attachment references carry the absolute inbox path so first mate
- * can open and inspect exactly what the captain sent. Pure.
+ * can open and inspect exactly what the captain sent; attachments that failed to
+ * fetch are called out explicitly so first mate never mistakes a partial MMS for
+ * the whole one. Pure.
  */
-export function buildInjectedText(body: string, media: SavedMedia[]): string {
+export function buildInjectedText(body: string, media: SavedMedia[], failedOrdinals: number[] = []): string {
   const parts: string[] = [];
   const text = (body || '').replace(/\s+/g, ' ').trim();
   if (text) parts.push(text);
@@ -103,14 +126,19 @@ export function buildInjectedText(body: string, media: SavedMedia[]): string {
       parts.push(`[MMS attachment ${i + 1}/${media.length} from the captain: ${m.path} (${m.contentType}) - open and inspect it.]`);
     });
   }
+  if (failedOrdinals.length > 0 && parts.length > 0) {
+    const total = media.length + failedOrdinals.length;
+    parts.push(`[WARNING: MMS ${describeMediaFailures(failedOrdinals, total)} - you did NOT receive ${failedOrdinals.length === 1 ? 'it' : 'them'}.]`);
+  }
   return parts.join(' ');
 }
 
 /**
  * The SMS reply body: the concise speakable narration, within Twilio's 1600-char
  * limit. When the full verbatim reply holds more detail than the summary, the web
- * transcript link is appended so the captain can read the exact response. The
- * link always survives truncation. Pure.
+ * transcript link is appended so the captain can read the exact response. Any
+ * truncation ALSO forces the link - a cut-off text with no pointer would strand
+ * the captain - and the link always survives the truncation. Pure.
  */
 export function formatSmsReply(
   narration: string,
@@ -122,8 +150,12 @@ export function formatSmsReply(
   const full = (verbatim || '').trim();
   let base = (narration || '').trim() || full;
   const needLink = !!full && normalize(full) !== normalize(base);
-  const suffix = needLink ? `\n\nFull reply: ${webUrl}` : '';
+  const link = `\n\nFull reply: ${webUrl}`;
+  let suffix = needLink ? link : '';
   if (base.length + suffix.length > limit) {
+    // Truncation loses content, so the transcript pointer is mandatory here -
+    // even when the body was the verbatim text itself.
+    suffix = link;
     base = base.slice(0, Math.max(0, limit - suffix.length - 1)).trimEnd() + '…';
   }
   return (base + suffix).slice(0, limit);
@@ -272,7 +304,7 @@ export function createTextApp(opts: TextAppOptions): TextApp {
       MAX_MEDIA_ITEMS,
     );
     const media: SavedMedia[] = [];
-    let mediaFailures = 0;
+    const failed: number[] = []; // 1-based positions of attachments that never arrived
     for (let i = 0; i < numMedia; i++) {
       const url = params[`MediaUrl${i}`];
       if (!url) continue;
@@ -284,33 +316,41 @@ export function createTextApp(opts: TextAppOptions): TextApp {
           i,
         ));
       } catch (e) {
-        mediaFailures++;
+        failed.push(i + 1);
         log(`text: MMS media ${i} intake FAILED - ${(e as Error).message}`);
       }
     }
 
-    const text = buildInjectedText(body, media);
+    const text = buildInjectedText(body, media, failed);
     if (!text) {
       log('text: inbound message had no usable content - nothing injected');
       await textCaptain(
-        mediaFailures > 0
-          ? 'I could not read that message: the attachment fetch failed and there was no text.'
+        failed.length > 0
+          ? `I could not read that message: ${describeMediaFailures(failed, failed.length)} and there was no text.`
           : 'I received an empty text - nothing to do.',
       );
       return;
     }
 
+    // The captain must never assume a dropped photo was seen: any partial media
+    // failure leads the SMS reply, and the turn reply is budgeted around it.
+    const failNote = failed.length > 0
+      ? `Note: ${describeMediaFailures(failed, media.length + failed.length)} - first mate did NOT see ${failed.length === 1 ? 'it' : 'them'}.\n\n`
+      : '';
+
     const result = await runWhenFree(text);
     if (result.turn === 0) {
-      await textCaptain('first mate is mid-turn and stayed busy - text again in a minute.');
+      await textCaptain(failNote + 'first mate is mid-turn and stayed busy - text again in a minute.');
       return;
     }
     if (!result.ok) {
-      await textCaptain(`That turn failed - check the transcript at ${publicUrl}`);
+      await textCaptain(failNote + `That turn failed - check the transcript at ${publicUrl}`);
       return;
     }
     const rec = runner.history.find((r) => r.turn === result.turn);
-    const replyBody = formatSmsReply(rec?.narration ?? '', rec?.verbatim || rec?.reply || '', publicUrl);
+    const replyBody = (failNote + formatSmsReply(
+      rec?.narration ?? '', rec?.verbatim || rec?.reply || '', publicUrl, SMS_BODY_LIMIT - failNote.length,
+    )).trimEnd();
     if (replyBody) await textCaptain(replyBody);
   }
 
