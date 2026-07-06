@@ -3144,6 +3144,170 @@ await reporter.leg('phone - F3: an utterance in the steer unwind window attaches
   }
 });
 
+// F3 (pending steer + foreign lock-grab) - with a phone steer PENDING (turn A aborted,
+// still unwinding) a foreign SMS/web turn can transiently grab the freed lock. A second
+// phone correction landing then belongs to the PHONE chain: it must merge onto the
+// pending combined prompt via runner.steer, never take fireSteer's foreign fallback
+// (a bare submit racing the pending re-run) - and the foreign turn is never touched.
+await reporter.leg('phone - F3: a correction merges into the pending phone steer even when a foreign turn holds the lock', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  let interrupts = 0;
+  let releaseInterrupt = (): void => {};
+  const releases: Array<() => void> = [];
+  const heard = ['deploy the app', 'to staging', 'actually the blue environment'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    // The FIRST interrupt HOLDS so the unwind window stays open while the foreign turn
+    // grabs the lock; later ones return immediately.
+    interrupt: () => new Promise<void>((resolve) => {
+      interrupts++;
+      if (interrupts === 1) releaseInterrupt = resolve; else resolve();
+    }),
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZpendfor', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle (still idle)
+
+    call.speakUtterance();
+    t.ok(await until(() => runs.length === 1 && runner.busy), 'the base phone turn is in flight');
+
+    // c1 -> coalesce -> steer aborts the turn; the interrupt HOLDS (unwind window open)
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the first correction is buffered for coalescing');
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window for the first correction');
+    t.ok(await until(() => interrupts === 1), 'the steer aborted the turn and is inside the (held) agent interrupt');
+    t.ok(await until(() => !runner.busy), 'the aborted turn cleared busy - the unwind window is OPEN');
+
+    // a FOREIGN turn grabs the freed lock (SMS runWhenFree polling wins the slice)
+    const smsResult = runner.run('sms: also check the inbox backlog', 'sms');
+    t.ok(await until(() => runner.busy && runs.length === 2), 'a foreign SMS turn grabbed the lock during the unwind window');
+
+    // c2 lands now: phone steer pending + foreign turn busy -> it must MERGE, not submit
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the second correction is buffered to attach (steer pending)');
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window for the second correction');
+    await realSleep(40);
+    t.ok(!pending.some((p) => p.ms === 250), 'no submit retry armed - the correction went to the phone steer chain, not the foreign fallback');
+    t.eq(runs.length, 2, 'the correction never ran bare');
+    t.eq(interrupts, 1, 'the foreign turn is never interrupted by the phone correction');
+
+    // the interrupt returns; the merged re-run still QUEUES behind the foreign turn
+    releaseInterrupt();
+    await realSleep(60);
+    t.eq(runs.length, 2, 'the merged re-run waits for the foreign turn - it is never cancelled');
+
+    // the foreign turn completes normally, then exactly one fully-merged re-run fires
+    releases[1]!();
+    const sms = await smsResult;
+    t.ok(sms.ok, 'the foreign SMS turn completed normally (never aborted, no spurious failure)');
+    t.ok(await until(() => runs.length === 3), 'the merged phone re-run fired after the foreign turn freed the lock');
+    t.includes(runs[2]!, 'deploy the app', 'the merged prompt keeps the base');
+    t.includes(runs[2]!, 'to staging', 'the first correction survives the merge');
+    t.includes(runs[2]!, 'actually the blue environment', 'the second correction is merged in - never a bare turn');
+    t.ok(!runs[2]!.includes('inbox backlog'), 'the phone chain never merged onto the foreign prompt');
+    releases[2]!();
+    await until(() => !runner.busy);
+    t.eq(runs.length, 3, 'no extra turn ever ran');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// Barge-in over a FOREIGN turn: sustained captain speech while an SMS/web-initiated
+// turn's audio plays on the call flushes the LOCAL Twilio buffer (clear) but never
+// cancels that turn - it runs to completion and keeps its ok result, so its transport
+// never reports a spurious "turn failed" (text.ts texts failure only on !ok).
+await reporter.leg('phone - barge-in over a foreign-source turn flushes audio only - the turn is never cancelled', async (t) => {
+  let sawAborted = 0;
+  let finishTurn = false;
+  const chunk = speechFramePcm();
+  const runs: string[] = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      hooks.onChunk?.({ index: 0, narration: 'Working on it.', speakBackend: 'mock', pcm: chunk, sampleRate: 8000 });
+      const timer = setInterval(() => {
+        if (hooks.signal?.aborted) sawAborted++;
+        if (finishTurn || hooks.signal?.aborted) {
+          clearInterval(timer);
+          resolve({ reply: 'done', narration: 'Done.', speakBackend: 'mock', audio: { pcm: chunk, sampleRate: 8000, ttfbMs: 1, bytes: chunk.length }, chunks: 1 });
+        }
+      }, 10);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const heard: string[] = [];
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    log: () => {},
+  });
+  // marks never echo -> the foreign turn's broadcast audio stays "playing" on the call
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port, { echoMarks: false });
+    call.send({ event: 'start', start: { streamSid: 'MZforbarge', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle
+
+    // an SMS-initiated turn is in flight; its reply audio streams onto the call
+    const resP = runner.run('sms: summarize the inbox', 'sms');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a foreign SMS turn is in flight');
+    t.ok(await until(() => call.out.some((m) => m.event === 'mark')), 'its reply audio is on the wire (unacked mark = playing)');
+    call.out.length = 0;
+
+    // the captain talks over it: barge-in must flush the audio but spare the turn
+    for (let i = 0; i < 14; i++) call.ws.send(asMediaFrame(speechFramePcm()));
+    t.ok(await until(() => call.out.some((m) => m.event === 'clear')), 'barge-in still flushes the buffered audio (clear)');
+    await realSleep(80);
+    t.eq(sawAborted, 0, 'the foreign turn was NOT cancelled by the phone barge-in');
+    t.ok(runner.busy, 'the foreign turn keeps running');
+
+    finishTurn = true;
+    const res = await resP;
+    t.ok(res.ok, 'the foreign turn completed with ok:true - no "turn failed" text would ever be sent');
+    t.eq(runner.history.length, 1, 'the foreign turn recorded its history (never aborted)');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
 // V1 - the 1:1 VERBATIM transcript, byte-exact. The tap streams the exact assistant
 // text (code fences, odd whitespace and all) while the reply grows, and the final
 // read equals the session transcript text byte-for-byte.

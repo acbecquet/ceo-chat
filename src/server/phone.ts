@@ -505,8 +505,11 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.steerOriginal = null;
       if (!joined) return;
       // A foreign-source turn grabbed the lock while the buffer coalesced (no pin, not a
-      // phone turn): never steer it - queue the utterance to run as its own turn (D5).
-      if (!original && runner.busy && runner.currentSource !== 'phone') {
+      // phone turn, no phone steer pending): never steer it - queue the utterance to run
+      // as its own turn (D5). With a phone steer PENDING the correction belongs to the
+      // phone chain instead: runner.steer merges it onto the pending combined prompt and
+      // queues behind the foreign turn without ever cancelling or interrupting it.
+      if (!original && this.steerPending === 0 && runner.busy && runner.currentSource !== 'phone') {
         this.submit(joined, 0, FOREIGN_BUSY_TRIES);
         return;
       }
@@ -725,8 +728,11 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       log('phone: barge-in - clearing buffered audio; capturing the follow-up to reinterpret');
       // Pin the in-flight prompt: the barge-in aborts the turn, so busy may clear before the
       // captain finishes the correction - the pin keeps the attach target (Feature 3).
-      // Phone-sourced turns ONLY: a foreign (web/SMS) turn is never pinned or steered.
-      if (runner.busy && runner.currentPrompt && runner.currentSource === 'phone') {
+      // Phone-sourced turns ONLY: a foreign (web/SMS) turn is never pinned, steered, or
+      // cancelled - it runs to completion and delivers its own reply (cancelling it would
+      // read as a spurious failure on that transport); only its local audio is flushed.
+      const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
+      if (phoneOwnsTurn && runner.currentPrompt) {
         this.steerOriginal = runner.currentPrompt;
         if (this.steerPinTimer != null) timers.clearTimeout(this.steerPinTimer);
         // Drop a stale pin if no correction actually follows the barge-in.
@@ -738,7 +744,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.send({ event: 'clear', streamSid: this.streamSid });
       this.outstandingMarks = 0;
       this.detector.playing = false; // start collecting the captain's ongoing speech
-      runner.cancel('phone barge-in'); // stop the old reply audio now
+      if (phoneOwnsTurn) runner.cancel('phone barge-in'); // stop the old reply audio now
     }
 
     private send(obj: unknown): void {

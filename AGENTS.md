@@ -671,17 +671,24 @@ Three features that make a phone call feel like a human call (plan+decisions:
   reply - the captain never assumes a dropped photo was seen. Steering is
   SAME-SOURCE only, enforced at BOTH ends: `submitOrSteer` attaches only a same-source
   follow-up, `steer()` never cancels/interrupts a foreign-source in-flight turn (it queues
-  behind it), and the phone leg steers only a phone-sourced turn or a barge-pinned prompt
-  (the pin is itself phone-only) - a spoken line during a web/SMS turn takes the silent
-  submit queue (250ms retries, 180s cap) and runs as its OWN turn right after, so typed
-  work is never rewritten. The phone leg coalesces (`steerCoalesceMs`, default 700) + a
+  behind it), and the phone leg steers only a phone-sourced turn, a barge-pinned prompt
+  (the pin is itself phone-only), or an ALREADY-PENDING phone steer chain - a spoken line
+  during a web/SMS turn takes the silent submit queue (250ms retries, 180s cap) and runs
+  as its OWN turn right after, so typed work is never rewritten. Barge-in cancels ONLY a
+  phone-sourced turn; over a foreign turn it flushes the local Twilio audio (`clear`) and
+  lets the turn complete, so its transport never texts a spurious "turn failed". The
+  phone leg coalesces (`steerCoalesceMs`, default 700) + a
   Twilio `clear` flush; barge-in PINS the in-flight prompt (`steerOriginal`, TTL
   `STEER_PIN_TTL_MS`) so a mid-speech correction attaches even after the barge aborts the
   turn, and a `steerPending` counter (incremented around each `runner.steer` until it
   settles) keeps `routeUtterance` on the attach path across the steer UNWIND window -
   the aborted turn clears `busy` while the runner is still interrupting the agent, so
   without it an utterance in that slice would grab the freed lock and run bare AHEAD of
-  the combined re-run (which would then override it). Web routes `send` through
+  the combined re-run (which would then override it). With a phone steer pending,
+  `fireSteer` takes the foreign-busy submit fallback ONLY when `steerPending` is 0: a
+  correction landing while a foreign turn transiently holds the unwind-window lock merges
+  onto the pending phone entry via `runner.steer` (which queues behind the foreign turn
+  without touching it), never a bare submit racing the re-run. Web routes `send` through
   `submitOrSteer`; SMS `runWhenFree` attaches a
   same-source follow-up but waits on a phone/web turn. D5 (a correction is NEVER lost):
   if `Escape` won't interrupt, the combined prompt still injects and runs right after;
@@ -696,10 +703,12 @@ Three features that make a phone call feel like a human call (plan+decisions:
   correction` (a correction DURING a steered re-run merges immediately and the superseded
   turns report `superseded`) + `turns - unwind window` (a second correction landing while
   the aborted turn is still unwinding merges base + c1 + c2 and the stale pending re-run
-  never fires) + four `phone - F3` legs (merge, interrupt, re-run,
+  never fires) + the `phone - F3` legs (merge, interrupt, re-run,
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
-  steered, and an utterance in the phone-leg unwind window attaches via `steerPending`
-  instead of running bare ahead of the re-run) + `text - follow-up steers the SMS turn`
+  steered, an utterance in the phone-leg unwind window attaches via `steerPending`
+  instead of running bare ahead of the re-run, a correction merges into the pending
+  phone steer even when a foreign turn holds the lock, and a barge-in over a
+  foreign-source turn flushes audio without cancelling it) + `text - follow-up steers the SMS turn`
   (no spurious failure SMS for a
   superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
   media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable
