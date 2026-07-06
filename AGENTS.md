@@ -653,15 +653,22 @@ Three features that make a phone call feel like a human call (plan+decisions:
   agent -> wait for it to unwind -> re-run `buildSteerPrompt(original, correction, source)`
   (ONE line, original verbatim; SOURCE-AWARE framing: a SPOKEN phone correction is the
   authoritative fix of a possible STT misread (D3), a typed web/SMS follow-up is an
-  ADDITION that never invites replacing the original). The abort + attach-target capture
-  happen at steer() REQUEST time (before the serialized `steerChain` entry runs), so a
-  SECOND correction arriving DURING a steered re-run breaks that run's await and merges
-  immediately (D4 holds for repeat corrections; the nested framing on the re-merged
-  prompt is an accepted tradeoff). An aborted-for-steer turn leaves NO history/turn-done
-  (no double-speak - it returns before recording) and resolves `TurnResult.superseded` -
-  NOT a failure - so text.ts's `handleInbound` stays silent for it instead of texting a
-  spurious "That turn failed" (only the combined turn's SMS reply goes out; a genuine
-  mid-turn failure still texts the note). Steering is
+  ADDITION that never invites replacing the original). The abort + the combined-prompt
+  build happen at steer() REQUEST time (before the serialized `steerChain` entry runs),
+  and the runner keeps a per-source `pendingSteers` MERGE-TARGET accumulator (the
+  combined prompt each pending re-run WILL inject, removed the moment that run starts):
+  a SECOND correction merges onto base + all prior corrections wherever it lands - DURING
+  the steered re-run (breaks that run's await immediately) or during the UNWIND window
+  before the re-run starts (supersedes the stale pending entry so it never fires; only
+  the fully-merged turn runs). D4 holds for repeat corrections; the nested framing on
+  the re-merged prompt is an accepted tradeoff. An aborted-for-steer turn leaves NO
+  history/turn-done (no double-speak - it returns before recording) and resolves
+  `TurnResult.superseded` - NOT a failure (a superseded never-ran pending steer resolves
+  `superseded` with turn 0) - so text.ts's `handleInbound` stays silent for it instead of
+  texting a spurious "That turn failed" (only the combined turn's SMS reply goes out; a
+  genuine mid-turn failure still texts the note), and a superseded MMS turn's
+  partial-failure note is CARRIED FORWARD (`carriedNotes`) to lead the combined turn's
+  reply - the captain never assumes a dropped photo was seen. Steering is
   SAME-SOURCE only, enforced at BOTH ends: `submitOrSteer` attaches only a same-source
   follow-up, `steer()` never cancels/interrupts a foreign-source in-flight turn (it queues
   behind it), and the phone leg steers only a phone-sourced turn or a barge-pinned prompt
@@ -682,10 +689,13 @@ Three features that make a phone call feel like a human call (plan+decisions:
   attach-and-reinterpret` (incl. per-source framing) + `turns - slow-unwind hold` (the
   correction survives an abort that outlives the wait window) + `turns - second
   correction` (a correction DURING a steered re-run merges immediately and the superseded
-  turns report `superseded`) + three `phone - F3` legs (merge, interrupt, re-run,
+  turns report `superseded`) + `turns - unwind window` (a second correction landing while
+  the aborted turn is still unwinding merges base + c1 + c2 and the stale pending re-run
+  never fires) + three `phone - F3` legs (merge, interrupt, re-run,
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
   steered) + `text - follow-up steers the SMS turn` (no spurious failure SMS for a
-  superseded turn; a genuine failure still texts). All deterministic (injected `PhoneTimers` + fake taps + a controllable
+  superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
+  media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable
   driver - no wall clock; the slow-unwind leg injects a virtual `now`/`sleep`). Real
   Escape-interrupt over tmux is captain-gated (needs a live claude pane).
 

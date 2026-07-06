@@ -2778,6 +2778,59 @@ await reporter.leg('turns - a second correction during a steered re-run attaches
   t.eq(runner.history.length, 1, 'only the final combined turn is in history (superseded turns left none)');
 });
 
+// F3 (D4 in the UNWIND window) - a second correction arriving while the FIRST aborted
+// turn is still unwinding (interrupt wait + draining pipeline, the steered re-run NOT
+// yet started) must merge onto base + c1, not just the base: the stale pending re-run
+// is superseded and only the final fully-merged turn runs. c1 is never lost.
+await reporter.leg('turns - a second correction during the unwind window keeps the first (D4, no stale re-run)', async (t) => {
+  const runs: string[] = [];
+  let interrupts = 0;
+  let releaseStuck: () => void = () => {};
+  let latestRelease: () => void = () => {};
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; },
+    // The FIRST send IGNORES the abort signal (the unwinding pipeline) and resolves only
+    // on explicit release - the unwind window stays open as long as the test needs.
+    send: (text) => new Promise((resolve) => {
+      runs.push(text);
+      const done = (): void => resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 });
+      if (runs.length === 1) releaseStuck = done; else latestRelease = done;
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+
+  const run1 = runner.run('deploy the app', 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the base turn is in flight');
+  const steer1 = runner.steer('to staging', 'phone');
+  t.ok(await until(() => interrupts === 1), 'the first correction aborted + interrupted and is now waiting out the unwind');
+  t.eq(runs.length, 1, 'the steered re-run has NOT started - the aborted turn is still unwinding');
+
+  // The second correction lands INSIDE the unwind window.
+  const steer2 = runner.steer('actually the blue environment', 'phone');
+  t.eq(runs.length, 1, 'still nothing re-ran - both corrections are held');
+
+  releaseStuck(); // the aborted turn finally unwinds
+  t.ok(await until(() => runs.length === 2), 'exactly one re-run fired once the lock freed');
+  t.includes(runs[1]!, 'deploy the app', 'the merged prompt keeps the base');
+  t.includes(runs[1]!, 'to staging', 'the FIRST correction survived the unwind-window merge (never lost)');
+  t.includes(runs[1]!, 'actually the blue environment', 'and the second correction is merged in');
+  const r1 = await run1;
+  t.ok(!r1.ok && r1.superseded === true, 'the aborted base turn resolves superseded');
+  const s1 = await steer1;
+  t.ok(!s1.ok && s1.superseded === true, 'the stale pending re-run resolves superseded (it was re-merged, never ran)');
+
+  latestRelease();
+  const s2 = await steer2;
+  t.ok(s2.ok && s2.turn === 2, 'the second steer resolves with the single fully-merged turn');
+  await until(() => !runner.busy);
+  t.eq(runs.length, 2, 'no stale or bare re-run ever fired - only base, then base + c1 + c2');
+  t.eq(runner.history.length, 1, 'only the merged turn is in history');
+});
+
 // F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced
 // and STEERS: the buffered outbound audio is flushed (`clear`), the agent is interrupted,
 // and the combined prompt (original + correction) is re-run.
@@ -3472,6 +3525,67 @@ await reporter.leg('text - a follow-up text steers the SMS turn: no spurious fai
     await post('please detonate the driver', 'SMsteer3');
     t.ok(await until(() => smsSent.length === 2), 'a genuine failure still produces a text');
     t.includes(smsSent[1]!.params.get('Body') || '', 'That turn failed', 'and it is the failure note');
+  } finally {
+    await app.close();
+    rmSync(inbox, { recursive: true, force: true });
+  }
+});
+
+// T2c - a superseded MMS turn must NOT silently drop its partial-failure note. When an
+// attachment failed to download and the captain's quick follow-up then steers the turn,
+// the "first mate did NOT see it" note is carried forward and LEADS the combined turn's
+// reply - the captain never assumes a dropped photo was seen.
+await reporter.leg('text - a superseded MMS turn\'s media-failure note still reaches the captain', async (t) => {
+  const sends: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 22050 }),
+    start: async () => {},
+    interrupt: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      sends.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: TEXT_REPLY, narration: TEXT_NARRATION, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 22050, ttfbMs: 3, bytes: 0 } }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  // No media mapped -> the MMS fetch 404s and the attachment intake FAILS.
+  const { fetchImpl, smsSent } = makeTextFetch({});
+  const inbox = mkdtempSync(join(tmpdir(), 'ceochat-inbox-'));
+  const runner = new TurnRunner({ driver });
+  const text = createTextApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    inboxDir: inbox, fetchImpl, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, text, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    await postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: 'analyze this photo', NumMedia: '1', MessageSid: 'MMdrop1',
+      MediaUrl0: `https://api.twilio.com/2010-04-01/Accounts/${PHONE_TEST_SECRETS.accountSid}/Messages/MMdrop1/Media/ME0`,
+      MediaContentType0: 'image/jpeg',
+    });
+    t.ok(await until(() => sends.length === 1 && runner.busy), 'the partial-MMS turn is in flight');
+    t.includes(sends[0]!, 'WARNING: MMS 1 of 1 attachment (the 1st) failed to download', 'first mate is told the attachment never arrived');
+
+    await postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: 'and compare it with last week', NumMedia: '0', MessageSid: 'SMdrop2',
+    });
+    t.ok(await until(() => sends.length === 2), 'the follow-up steered: the COMBINED prompt re-ran');
+    releases[1]!(); // finish the combined turn
+    t.ok(await until(() => smsSent.length === 1), 'exactly ONE reply SMS goes out - the combined turn\'s');
+    const body = smsSent[0]!.params.get('Body') || '';
+    t.ok(body.startsWith('Note: 1 of 1 attachment (the 1st) failed to download - first mate did NOT see it.'),
+      'the superseded turn\'s media-failure note was carried forward and LEADS the reply');
+    t.includes(body, TEXT_NARRATION, 'and the combined turn\'s narration follows it');
+    t.ok(body.length <= SMS_BODY_LIMIT, 'note + reply stay within the limit');
+    await realSleep(200);
+    t.eq(smsSent.length, 1, 'the note rode the combined reply - no extra outbound message');
+    t.ok(!smsSent.some((s) => /turn failed/i.test(s.params.get('Body') || '')), 'and no spurious "turn failed" text');
   } finally {
     await app.close();
     rmSync(inbox, { recursive: true, force: true });

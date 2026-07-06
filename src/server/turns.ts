@@ -121,6 +121,13 @@ export class TurnRunner {
   private _currentSource: TurnSource | null = null;
   // Serialize steers so two rapid corrections can't both interrupt+re-run at once.
   private steerChain: Promise<TurnResult> = Promise.resolve({ ok: false, turn: 0 });
+  // The merge-target accumulator: one pending steer per source, holding the combined
+  // prompt its re-run WILL inject. A correction arriving while the aborted turn is
+  // still unwinding (before the re-run starts, so _currentPrompt is the stale base)
+  // merges onto THIS instead - base + all prior corrections, never just the base -
+  // and marks the stale entry superseded so its re-run never fires (D4). The entry
+  // is removed the moment its run starts (from then on _currentPrompt covers it).
+  private pendingSteers = new Map<TurnSource, { combined: string; superseded: boolean }>();
 
   busy = false;
   history: TurnRecord[] = [];
@@ -290,12 +297,15 @@ export class TurnRunner {
    * the combined prompt - so a spoken correction of an STT misread steers the reply
    * instead of being blocked. Not busy (and no explicit `original`): it's a plain new turn.
    *
-   * The attach target is captured and the in-flight turn aborted HERE, at request time -
+   * The combined prompt is built and the in-flight turn aborted HERE, at request time -
    * so a correction arriving DURING a steered re-run breaks that run's await immediately
    * and merges (D4: always attach while in flight), instead of queueing behind the whole
-   * combined turn and then running bare. The aborted turn resolves `superseded`, never a
-   * failure. Serialized (steerChain) so two rapid corrections don't both interrupt+re-run
-   * at once; the returned promise resolves when the FINAL combined run() completes.
+   * combined turn and then running bare. A correction arriving while the aborted turn is
+   * still UNWINDING (the re-run not yet started) merges onto the pending combined prompt
+   * and supersedes that stale re-run, so no earlier correction is ever lost from the
+   * final prompt. Aborted/superseded turns resolve `superseded`, never a failure.
+   * Serialized (steerChain) so two rapid corrections don't both interrupt+re-run at
+   * once; the returned promise resolves when the FINAL combined run() completes.
    * `original` pins the prompt to attach to even if the in-flight turn has already settled
    * (the phone barge-in path captures it before the caller finishes the correction).
    */
@@ -305,7 +315,17 @@ export class TurnRunner {
     // SAME-SOURCE only: a turn started by a DIFFERENT transport is never cancelled or
     // interrupted from here - the combined prompt just queues behind it (_steer's wait).
     const foreign = this.busy && this._currentSource !== source;
-    const original = opts.original ?? this._currentPrompt;
+    // Merge target: a same-source PENDING re-run's combined prompt beats everything (it
+    // already holds base + prior corrections; the pin and _currentPrompt would both be
+    // the stale base during the unwind window), then the barge-in pin, then the
+    // in-flight prompt. Empty -> nothing to attach to, just a fresh turn.
+    const prior = this.pendingSteers.get(source) ?? null;
+    const base = prior?.combined ?? opts.original ?? this._currentPrompt;
+    const entry = { combined: buildSteerPrompt(base, extra, source), superseded: false };
+    // The new correction re-merges everything the stale pending re-run carried, so
+    // that re-run must never fire - it would re-answer an outdated prompt.
+    if (prior) prior.superseded = true;
+    this.pendingSteers.set(source, entry);
     if (this.busy && !foreign && this.currentSignal && !this.currentSignal.aborted) {
       // Stop speaking the in-flight reply NOW (pipeline abort), marked as deliberately
       // superseded so its transport never mistakes the abort for a failure.
@@ -314,17 +334,18 @@ export class TurnRunner {
     }
     this.steerChain = this.steerChain
       .catch(() => ({ ok: false, turn: 0 }))
-      .then(() => this._steer(extra, source, { original, interrupt: !foreign }));
+      .then(() => this._steer(entry, source, { interrupt: !foreign && base !== '' }));
     return this.steerChain;
   }
 
   private async _steer(
-    extra: string,
+    entry: { combined: string; superseded: boolean },
     source: TurnSource,
-    opts: { original: string; interrupt: boolean },
+    opts: { interrupt: boolean },
   ): Promise<TurnResult> {
-    // Nothing was in flight at request time and no pinned prompt -> just a fresh turn.
-    if (!opts.original) return this.run(extra, source);
+    // A newer same-source correction re-merged this one into its own combined prompt -
+    // running it now would inject a stale prompt missing that correction.
+    if (entry.superseded) return { ok: false, turn: 0, superseded: true };
     if (opts.interrupt) {
       // Interrupt the underlying agent so it re-plans against the combined prompt. Best
       // effort (D5): if it will not interrupt, the combined prompt still injects and the
@@ -340,30 +361,36 @@ export class TurnRunner {
     // best-effort and a draining pipeline can hold the lock well past a few seconds -
     // HOLD the correction and keep retrying until the lock frees (bounded), never
     // force run() into a silent busy rejection (D5: a correction is never lost).
-    const combined = buildSteerPrompt(opts.original, extra, source);
     const deadline = this.now() + STEER_UNWIND_TIMEOUT_MS;
     while (this.now() < deadline) {
+      if (entry.superseded) return { ok: false, turn: 0, superseded: true };
       if (!(await this.waitUntilFree(Math.min(8000, deadline - this.now())))) {
         this.log('steer: prior turn still unwinding - holding the correction');
         continue;
       }
-      const r = await this.run(combined, source);
+      if (entry.superseded) return { ok: false, turn: 0, superseded: true };
+      if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
+      const r = await this.run(entry.combined, source);
       if (r.turn !== 0) return r; // it actually ran - done (lost lock races retry)
     }
     this.log('steer: the prior turn never unwound - the correction could not run');
+    if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
     this.emit({ type: 'error', message: 'could not apply the follow-up - the previous turn never finished unwinding' });
     return { ok: false, turn: 0 };
   }
 
   /**
-   * Run a new turn, or - if a turn from the SAME transport is in flight - attach the text
-   * and reinterpret. A DIFFERENT transport being busy falls through to run(), which
+   * Run a new turn, or - if a turn from the SAME transport is in flight OR a same-source
+   * steered re-run is still pending (the aborted turn unwinding) - attach the text and
+   * reinterpret. A DIFFERENT transport being busy falls through to run(), which
    * rejects with the "one at a time" error rather than interrupting the other channel (an
    * inbound SMS must never cut off a live phone-call turn). The phone leg drives steer()
    * directly for its own barge-in/coalesce path.
    */
   submitOrSteer(text: string, source: TurnSource): Promise<TurnResult> {
-    if (this.busy && this._currentSource === source) return this.steer(text, source);
+    if ((this.busy && this._currentSource === source) || this.pendingSteers.has(source)) {
+      return this.steer(text, source);
+    }
     return this.run(text, source);
   }
 
