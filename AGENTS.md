@@ -677,7 +677,12 @@ Three features that make a phone call feel like a human call (plan+decisions:
   work is never rewritten. The phone leg coalesces (`steerCoalesceMs`, default 700) + a
   Twilio `clear` flush; barge-in PINS the in-flight prompt (`steerOriginal`, TTL
   `STEER_PIN_TTL_MS`) so a mid-speech correction attaches even after the barge aborts the
-  turn. Web routes `send` through `submitOrSteer`; SMS `runWhenFree` attaches a
+  turn, and a `steerPending` counter (incremented around each `runner.steer` until it
+  settles) keeps `routeUtterance` on the attach path across the steer UNWIND window -
+  the aborted turn clears `busy` while the runner is still interrupting the agent, so
+  without it an utterance in that slice would grab the freed lock and run bare AHEAD of
+  the combined re-run (which would then override it). Web routes `send` through
+  `submitOrSteer`; SMS `runWhenFree` attaches a
   same-source follow-up but waits on a phone/web turn. D5 (a correction is NEVER lost):
   if `Escape` won't interrupt, the combined prompt still injects and runs right after;
   `_steer` HOLDS it until the aborted turn's lock actually frees (bounded 180s, matching
@@ -691,9 +696,11 @@ Three features that make a phone call feel like a human call (plan+decisions:
   correction` (a correction DURING a steered re-run merges immediately and the superseded
   turns report `superseded`) + `turns - unwind window` (a second correction landing while
   the aborted turn is still unwinding merges base + c1 + c2 and the stale pending re-run
-  never fires) + three `phone - F3` legs (merge, interrupt, re-run,
+  never fires) + four `phone - F3` legs (merge, interrupt, re-run,
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
-  steered) + `text - follow-up steers the SMS turn` (no spurious failure SMS for a
+  steered, and an utterance in the phone-leg unwind window attaches via `steerPending`
+  instead of running bare ahead of the re-run) + `text - follow-up steers the SMS turn`
+  (no spurious failure SMS for a
   superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
   media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable
   driver - no wall clock; the slow-unwind leg injects a virtual `now`/`sleep`). Real

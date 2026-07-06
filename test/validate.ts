@@ -2370,6 +2370,11 @@ await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-sa
   t.eq(verbGerund('Acquire'), 'acquiring', 'drop-e');
   t.eq(verbGerund('Read'), 'reading', 'plain +ing');
   t.eq(verbGerund('Sync'), 'syncing', 'sync takes plain +ing (never "synccing")');
+  t.eq(verbGerund('Submit'), 'submitting', 'submit doubles (never "submiting")');
+  t.eq(verbGerund('Debug'), 'debugging', 'debug doubles');
+  t.eq(verbGerund('Strip'), 'stripping', 'strip doubles (never "striping")');
+  t.eq(verbGerund('Format'), 'formatting', 'format doubles');
+  t.eq(verbGerund('Pin'), 'pinning', 'pin doubles (never "pining")');
   t.eq(verbGerund('Tests'), null, 'a non-verb is never conjugated');
   t.eq(verbGerund('New'), null, 'unknown leading word -> null');
   // -ing words pass ONLY when the stem maps back to a KNOWN verb - "Bring"/"Ongoing"
@@ -2377,6 +2382,8 @@ await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-sa
   t.eq(verbGerund('Running'), 'running', 'an already-gerund known verb passes (de-doubled stem)');
   t.eq(verbGerund('Reading'), 'reading', 'already-gerund, direct stem');
   t.eq(verbGerund('Acquiring'), 'acquiring', 'already-gerund, drop-e stem');
+  t.eq(verbGerund('Submitting'), 'submitting', 'already-gerund, de-doubled stem (submit)');
+  t.eq(verbGerund('Debugging'), 'debugging', 'already-gerund, de-doubled stem (debug)');
   t.eq(verbGerund('Bring'), null, '"bring" is NOT accepted verbatim (its gerund is not its base form)');
   t.eq(verbGerund('Ongoing'), null, 'a non-verb -ing word is never accepted as a gerund');
   t.eq(gerundClause('Bring the branch up to date'), null, 'a "Bring …" label falls back (never "I\'m bring …")');
@@ -3045,6 +3052,92 @@ await reporter.leg('phone - F3: a foreign-source turn is never steered - the utt
     t.ok(!/misread|addition/i.test(runs[1]!) && !runs[1]!.includes('refactor the parser'), 'it ran verbatim - never merged into the web prompt');
     latestRelease();
     await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// F3 (D4 in the phone-leg UNWIND window) - after a steer aborts the turn, `busy` clears
+// while the runner is still interrupting the agent (up to ~3s of pane polling on the real
+// broker) and the coalesce timer / barge pin are already consumed. An utterance landing
+// in that busy=false slice must still ATTACH to the pending steered re-run - never grab
+// the freed lock and run bare ahead of it (the re-run would then override the captain's
+// latest correction). The held driver.interrupt keeps the window open deterministically.
+await reporter.leg('phone - F3: an utterance in the steer unwind window attaches - never a bare turn ahead of the re-run', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  let interrupts = 0;
+  let releaseInterrupt = (): void => {};
+  let latestRelease = (): void => {};
+  const heard = ['deploy the app', 'to staging', 'actually the blue environment'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    // The FIRST interrupt HOLDS (the broker's "esc to interrupt" pane polling) so the
+    // unwind window stays open exactly as long as the test needs; later ones return.
+    interrupt: () => new Promise<void>((resolve) => {
+      interrupts++;
+      if (interrupts === 1) releaseInterrupt = resolve; else resolve();
+    }),
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      latestRelease = done;
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZunwind', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle (still idle)
+
+    call.speakUtterance();
+    t.ok(await until(() => runs.length === 1 && runner.busy), 'the base turn is in flight');
+
+    // c1 arrives -> coalesce -> steer aborts the turn; the interrupt HOLDS
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the first correction is buffered for coalescing');
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window for the first correction');
+    t.ok(await until(() => interrupts === 1), 'the steer aborted the turn and is inside the (held) agent interrupt');
+    t.ok(await until(() => !runner.busy), 'the aborted turn cleared busy - the unwind window is OPEN');
+    t.eq(runs.length, 1, 'the steered re-run has NOT started yet');
+
+    // c2 lands INSIDE the unwind window (busy=false, no coalesce timer, no barge pin)
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the unwind-window utterance is buffered to ATTACH (steer pending) - not run bare');
+    t.eq(runs.length, 1, 'no bare turn grabbed the freed lock');
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window for the second correction');
+    await realSleep(40);
+    t.eq(runs.length, 1, 'the second correction merged into the pending steer - still nothing re-ran');
+
+    releaseInterrupt(); // the agent interrupt finally returns
+    t.ok(await until(() => runs.length === 2), 'exactly one merged re-run fired once the unwind completed');
+    t.includes(runs[1]!, 'deploy the app', 'the merged prompt keeps the base');
+    t.includes(runs[1]!, 'to staging', 'the first correction survives the merge');
+    t.includes(runs[1]!, 'actually the blue environment', 'the unwind-window correction is merged in - never a bare turn ahead of the re-run');
+    latestRelease();
+    await until(() => !runner.busy);
+    t.eq(runs.length, 2, 'no extra bare turn ever ran');
     call.close();
   } finally {
     await app.close();

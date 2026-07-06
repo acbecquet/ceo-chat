@@ -70,12 +70,13 @@ function asRecord(input: unknown): Record<string, unknown> {
   return input && typeof input === 'object' ? (input as Record<string, unknown>) : {};
 }
 
-// Short consonant-doubling verbs (CVC, stress on the last syllable) whose gerund doubles
-// the final letter ('sync' stays out - it takes plain +ing, "syncing"). Anything else in
-// KNOWN_VERBS takes the plain +ing / drop-e rules.
+// Consonant-doubling verbs whose written gerund doubles the final letter ('sync' stays
+// out - it takes plain +ing, "syncing"). Anything else in KNOWN_VERBS takes the plain
+// +ing / drop-e rules.
 const DOUBLE_GERUND = new Set([
   'run', 'set', 'get', 'put', 'cut', 'stop', 'drop', 'plan', 'ship', 'commit', 'begin',
   'trim', 'tag', 'map', 'wrap', 'fit', 'spin', 'scan', 'log', 'swap', 'split',
+  'submit', 'reset', 'debug', 'grep', 'strip', 'format', 'pin',
 ]);
 
 // Verbs we recognize as the leading word of an imperative label. Bash descriptions are
@@ -86,18 +87,18 @@ const DOUBLE_GERUND = new Set([
 const KNOWN_VERBS = new Set([
   'add', 'acquire', 'analyze', 'apply', 'assert', 'audit', 'build', 'bump', 'check',
   'clean', 'clear', 'clone', 'close', 'collect', 'compare', 'compile', 'compute',
-  'configure', 'confirm', 'connect', 'convert', 'copy', 'create', 'debug', 'delete',
+  'configure', 'confirm', 'connect', 'convert', 'copy', 'create', 'delete',
   'deploy', 'diff', 'disable', 'dismiss', 'download', 'drain', 'draft', 'dump', 'edit',
   'enable', 'execute', 'expand', 'export', 'extract', 'fetch', 'fill', 'filter', 'find',
-  'finish', 'fix', 'follow', 'format', 'gather', 'generate', 'grep', 'implement',
+  'finish', 'fix', 'follow', 'gather', 'generate', 'implement',
   'import', 'inspect', 'install', 'investigate', 'launch', 'lint', 'list', 'load',
   'look', 'make', 'measure', 'merge', 'migrate', 'monitor', 'move', 'open', 'parse',
-  'patch', 'pin', 'poll', 'prepare', 'probe', 'process', 'prune', 'publish', 'pull',
+  'patch', 'poll', 'prepare', 'probe', 'process', 'prune', 'publish', 'pull',
   'push', 'read', 'rebase', 'rebuild', 'record', 'refactor', 'refresh', 'register',
   'release', 'reload', 'remove', 'rename', 'render', 'repair', 'replace', 'research',
-  'reset', 'resolve', 'restart', 'restore', 'retry', 'revert', 'review', 'rewrite',
+  'resolve', 'restart', 'restore', 'retry', 'revert', 'review', 'rewrite',
   'rotate', 'save', 'search', 'seed', 'send', 'serve', 'show', 'spawn', 'start',
-  'stream', 'strip', 'submit', 'sweep', 'sync', 'tail', 'test', 'trace', 'track',
+  'stream', 'sweep', 'sync', 'tail', 'test', 'trace', 'track',
   'tune', 'update', 'upgrade', 'upload', 'validate', 'verify', 'wait', 'watch', 'wire',
   'write', ...DOUBLE_GERUND,
 ]);

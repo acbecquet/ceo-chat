@@ -300,6 +300,9 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     private steerPinTimer: unknown = null;
     private steerOriginal: string | null = null; // pinned at barge-in so a mid-speech
                                                   // correction still attaches to that prompt
+    private steerPending = 0; // steers fired but not yet settled - keeps the attach path
+                              // open across the unwind window (busy clears before the
+                              // steered re-run starts; a bare run there would misorder)
     // Serializes prompt/chunk playback so audio order is preserved.
     private sendQueue: Promise<void> = Promise.resolve();
     private readonly detector: UtteranceDetector;
@@ -460,17 +463,22 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.routeUtterance(text);
     }
 
-    // A captain utterance: a FRESH turn when nothing is in flight (immediate, so first
-    // audio stays fast), else attach-and-reinterpret - the follow-up is coalesced with any
+    // A captain utterance: a FRESH turn ONLY when truly idle (immediate, so first audio
+    // stays fast), else attach-and-reinterpret - the follow-up is coalesced with any
     // others and steers the in-flight turn (Feature 3, decision D4: always attach while in
-    // flight). SAME-SOURCE only: steering interrupts and rewrites the in-flight prompt, so
-    // it applies ONLY to a phone-initiated turn (or a barge-in pinned prompt, which is
-    // phone-sourced by construction). A foreign (web/SMS-initiated) turn is never touched -
-    // the utterance takes the D5 silent-queue path and runs as its own turn right after.
+    // flight). `steerPending` keeps the attach path open across the whole steer UNWIND
+    // window: the aborted turn clears `busy` while the runner is still interrupting the
+    // agent (before the combined re-run starts), so without it a correction landing in
+    // that slice would run bare ahead of the re-run and be overridden by it. SAME-SOURCE
+    // only: steering interrupts and rewrites the in-flight prompt, so it applies ONLY to
+    // a phone-initiated turn (or a barge-in pinned prompt, which is phone-sourced by
+    // construction). A foreign (web/SMS-initiated) turn is never touched - the utterance
+    // takes the D5 silent-queue path and runs as its own turn right after.
     private routeUtterance(text: string): void {
       if (this.closed) return;
       const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
-      if (phoneOwnsTurn || this.steerTimer != null || this.steerOriginal != null) {
+      if (phoneOwnsTurn || this.steerPending > 0
+        || this.steerTimer != null || this.steerOriginal != null) {
         this.steerBuffer.push(text);
         this.armSteerTimer();
       } else if (runner.busy) {
@@ -505,7 +513,10 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.send({ event: 'clear', streamSid: this.streamSid });
       this.outstandingMarks = 0;
       this.detector.playing = false;
-      void runner.steer(joined, 'phone', original ? { original } : {});
+      this.steerPending++;
+      void runner.steer(joined, 'phone', original ? { original } : {})
+        .catch(() => undefined)
+        .finally(() => { this.steerPending--; });
     }
 
     /** Hand text to the runner as a fresh turn (captain utterances when nothing phone-
