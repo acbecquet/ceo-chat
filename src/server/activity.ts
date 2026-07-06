@@ -71,20 +71,45 @@ function asRecord(input: unknown): Record<string, unknown> {
 }
 
 // Short consonant-doubling verbs (CVC, stress on the last syllable) whose gerund doubles
-// the final letter. Enough to cover the common dev-imperative verbs; anything else takes
-// the plain +ing / drop-e rules, and a description that doesn't start with a clean verb
-// falls back to the tool's bare verb (still REAL, always grammatical).
+// the final letter ('sync' stays out - it takes plain +ing, "syncing"). Anything else in
+// KNOWN_VERBS takes the plain +ing / drop-e rules.
 const DOUBLE_GERUND = new Set([
   'run', 'set', 'get', 'put', 'cut', 'stop', 'drop', 'plan', 'ship', 'commit', 'begin',
-  'trim', 'tag', 'map', 'wrap', 'fit', 'sync', 'spin', 'scan', 'log', 'swap', 'split',
+  'trim', 'tag', 'map', 'wrap', 'fit', 'spin', 'scan', 'log', 'swap', 'split',
 ]);
 
-/** Gerund of a single verb ("Run"->"running", "Acquire"->"acquiring"), or null. Lowercase. */
+// Verbs we recognize as the leading word of an imperative label. Bash descriptions are
+// imperative by harness convention, but TodoWrite/Agent/Skill content is free text - a
+// leading non-verb ("Tests for the parser", "New validation leg") must NEVER be
+// conjugated into gibberish ("testsing", "newing"); the caller falls back to the tool's
+// bare form instead.
+const KNOWN_VERBS = new Set([
+  'add', 'acquire', 'analyze', 'apply', 'assert', 'audit', 'build', 'bump', 'check',
+  'clean', 'clear', 'clone', 'close', 'collect', 'compare', 'compile', 'compute',
+  'configure', 'confirm', 'connect', 'convert', 'copy', 'create', 'debug', 'delete',
+  'deploy', 'diff', 'disable', 'dismiss', 'download', 'drain', 'draft', 'dump', 'edit',
+  'enable', 'execute', 'expand', 'export', 'extract', 'fetch', 'fill', 'filter', 'find',
+  'finish', 'fix', 'follow', 'format', 'gather', 'generate', 'grep', 'implement',
+  'import', 'inspect', 'install', 'investigate', 'launch', 'lint', 'list', 'load',
+  'look', 'make', 'measure', 'merge', 'migrate', 'monitor', 'move', 'open', 'parse',
+  'patch', 'pin', 'poll', 'prepare', 'probe', 'process', 'prune', 'publish', 'pull',
+  'push', 'read', 'rebase', 'rebuild', 'record', 'refactor', 'refresh', 'register',
+  'release', 'reload', 'remove', 'rename', 'render', 'repair', 'replace', 'research',
+  'reset', 'resolve', 'restart', 'restore', 'retry', 'revert', 'review', 'rewrite',
+  'rotate', 'save', 'search', 'seed', 'send', 'serve', 'show', 'spawn', 'start',
+  'stream', 'strip', 'submit', 'sweep', 'sync', 'tail', 'test', 'trace', 'track',
+  'tune', 'update', 'upgrade', 'upload', 'validate', 'verify', 'wait', 'watch', 'wire',
+  'write', ...DOUBLE_GERUND,
+]);
+
+/** Gerund of a single KNOWN verb ("Run"->"running", "Acquire"->"acquiring"), or null.
+ *  A word that is not a recognized verb is never conjugated. Lowercase. */
 export function verbGerund(word: string): string | null {
   const w = (word || '').toLowerCase();
   if (!/^[a-z]+$/.test(w) || w.length < 2) return null;
   if (w.endsWith('ing')) return w;
   if (DOUBLE_GERUND.has(w)) return w + w[w.length - 1] + 'ing';
+  if (!KNOWN_VERBS.has(w)) return null;
   if (w.endsWith('e') && !w.endsWith('ee')) return w.slice(0, -1) + 'ing';
   return w + 'ing';
 }
@@ -202,8 +227,10 @@ export function makeTranscriptActivity(opts: TranscriptActivityOptions): Activit
         const events = parseTranscript(path);
         const anchor = findPromptAnchor(events, prompt, { afterTs });
         if (anchor < 0) return;
-        for (const tu of toolUseAfterAnchor(events, anchor)) {
-          const id = tu.id || `${tu.name}:${seenIds.size}`;
+        const toolUses = toolUseAfterAnchor(events, anchor);
+        for (let i = 0; i < toolUses.length; i++) {
+          const tu = toolUses[i]!;
+          const id = tu.id || `${tu.name}:${i}`;
           if (seenIds.has(id)) continue;
           seenIds.add(id);
           const line = describeToolUse(tu);

@@ -71,6 +71,10 @@ export const MAX_PENDING_SOCKETS = 8;
 // How long a barge-in keeps the in-flight prompt pinned while waiting for the captain's
 // correction to finish; dropped after this so a barge with no follow-up never strands it.
 const STEER_PIN_TTL_MS = 8 * 1000;
+// Retry budget for an utterance queued behind a FOREIGN-source (web/SMS-initiated) turn
+// we must never steer: 720 x 250ms = 180s, matching the SMS runWhenFree wait cap, so a
+// spoken line survives even a long-running foreign turn (D5: never lost).
+const FOREIGN_BUSY_TRIES = 720;
 
 /** Drop expired stream tokens so unconsumed mints never accumulate. Pure. */
 export function pruneExpiredTokens(tokens: Map<string, number>, now: number): void {
@@ -459,14 +463,20 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     // A captain utterance: a FRESH turn when nothing is in flight (immediate, so first
     // audio stays fast), else attach-and-reinterpret - the follow-up is coalesced with any
     // others and steers the in-flight turn (Feature 3, decision D4: always attach while in
-    // flight). steerOriginal being set means a barge-in already pinned the prompt.
+    // flight). SAME-SOURCE only: steering interrupts and rewrites the in-flight prompt, so
+    // it applies ONLY to a phone-initiated turn (or a barge-in pinned prompt, which is
+    // phone-sourced by construction). A foreign (web/SMS-initiated) turn is never touched -
+    // the utterance takes the D5 silent-queue path and runs as its own turn right after.
     private routeUtterance(text: string): void {
       if (this.closed) return;
-      if (runner.busy || this.steerTimer != null || this.steerOriginal != null) {
+      const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
+      if (phoneOwnsTurn || this.steerTimer != null || this.steerOriginal != null) {
         this.steerBuffer.push(text);
         this.armSteerTimer();
+      } else if (runner.busy) {
+        this.submit(text, 0, FOREIGN_BUSY_TRIES);
       } else {
-        void runner.run(text, 'phone');
+        this.submit(text);
       }
     }
 
@@ -486,19 +496,27 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       const original = this.steerOriginal;
       this.steerOriginal = null;
       if (!joined) return;
+      // A foreign-source turn grabbed the lock while the buffer coalesced (no pin, not a
+      // phone turn): never steer it - queue the utterance to run as its own turn (D5).
+      if (!original && runner.busy && runner.currentSource !== 'phone') {
+        this.submit(joined, 0, FOREIGN_BUSY_TRIES);
+        return;
+      }
       this.send({ event: 'clear', streamSid: this.streamSid });
       this.outstandingMarks = 0;
       this.detector.playing = false;
       void runner.steer(joined, 'phone', original ? { original } : {});
     }
 
-    /** Hand text to the runner as a fresh turn (internal injects, e.g. the safe-default
-     *  'cancel'); if a cancelled turn is still settling, retry briefly. */
-    private submit(text: string, tries = 0): void {
+    /** Hand text to the runner as a fresh turn (captain utterances when nothing phone-
+     *  owned is in flight, and internal injects like the safe-default 'cancel'); if the
+     *  runner is busy - a cancelled turn settling, a busy-flip race, or a foreign-source
+     *  turn we must never interrupt - retry until it frees (bounded by maxTries). */
+    private submit(text: string, tries = 0, maxTries = 20): void {
       if (this.closed) return;
       if (runner.busy) {
-        if (tries >= 20) { log('phone: runner stayed busy - dropping utterance'); return; }
-        timers.setTimeout(() => this.submit(text, tries + 1), 250);
+        if (tries >= maxTries) { log('phone: runner stayed busy - dropping utterance'); return; }
+        timers.setTimeout(() => this.submit(text, tries + 1, maxTries), 250);
         return;
       }
       void runner.run(text, 'phone');
@@ -696,7 +714,8 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       log('phone: barge-in - clearing buffered audio; capturing the follow-up to reinterpret');
       // Pin the in-flight prompt: the barge-in aborts the turn, so busy may clear before the
       // captain finishes the correction - the pin keeps the attach target (Feature 3).
-      if (runner.busy && runner.currentPrompt) {
+      // Phone-sourced turns ONLY: a foreign (web/SMS) turn is never pinned or steered.
+      if (runner.busy && runner.currentPrompt && runner.currentSource === 'phone') {
         this.steerOriginal = runner.currentPrompt;
         if (this.steerPinTimer != null) timers.clearTimeout(this.steerPinTimer);
         // Drop a stale pin if no correction actually follows the barge-in.

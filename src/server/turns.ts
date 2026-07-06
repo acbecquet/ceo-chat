@@ -18,6 +18,11 @@ import type { PipelineStage } from '../broker/pipeline.ts';
 import type { TurnSource, UiStatus } from './protocol.ts';
 import type { VerbatimTap, VerbatimTurnHandle } from './verbatim.ts';
 
+// How long steer keeps holding a correction for the aborted turn to unwind before
+// giving up loudly. Generous - an aborted pipeline can drain a long TTS synth - and
+// matches the SMS runWhenFree wait cap.
+const STEER_UNWIND_TIMEOUT_MS = 180 * 1000;
+
 export type TurnEvent =
   | { type: 'status'; state: UiStatus }
   | { type: 'sent'; turn: number; text: string; source: TurnSource; ts: number }
@@ -60,16 +65,22 @@ export interface TurnRunnerOptions {
 }
 
 // Merge a follow-up utterance into the in-flight prompt for attach-and-reinterpret
-// (Feature 3, captain decision D3: keep the original verbatim, mark the correction as the
-// authoritative fix of a possible speech-to-text misread). ONE line - the broker submits
-// via fm-send, where an embedded newline would split the message. Pure.
-export function buildSteerPrompt(original: string, correction: string): string {
+// (Feature 3, captain decision D3: keep the original verbatim). ONE line - the broker
+// submits via fm-send, where an embedded newline would split the message. Source-aware:
+// only a SPOKEN (phone/STT) follow-up is framed as the authoritative fix of a possible
+// speech-to-text misread; a typed web/SMS follow-up has no STT to misread, so it is
+// framed as an ADDITION that must not invite rewriting the original. Pure.
+export function buildSteerPrompt(original: string, correction: string, source: TurnSource): string {
   const o = (original || '').replace(/\s+/g, ' ').trim();
   const c = (correction || '').replace(/\s+/g, ' ').trim();
   if (!o) return c;
   if (!c) return o;
-  return `${o}  [Correction from the captain, spoken just now - treat this as the ` +
-    `authoritative fix of a possible speech-to-text misread in the message above: ${c}]`;
+  if (source === 'phone') {
+    return `${o}  [Correction from the captain, spoken just now - treat this as the ` +
+      `authoritative fix of a possible speech-to-text misread in the message above: ${c}]`;
+  }
+  return `${o}  [Additional instruction from the captain, sent just now - treat this as ` +
+    `an addition to the message above, not a replacement of any part of it: ${c}]`;
 }
 
 // Stage -> status mapping (moved verbatim from app.ts). synth = audio is being
@@ -291,21 +302,38 @@ export class TurnRunner {
     const original = opts.original ?? this._currentPrompt;
     // Nothing in flight and no pinned prompt to attach to -> just a fresh turn.
     if (!this.busy && !opts.original) return this.run(extra, source);
-    // 1. Stop speaking the in-flight reply (pipeline abort).
-    this.cancel('steer: attaching a correction and reinterpreting');
-    // 2. Interrupt the underlying agent so it re-plans against the combined prompt. Best
-    //    effort (D5): if it will not interrupt, the combined prompt still injects and the
-    //    agent runs it right after the current turn - the correction is never lost.
-    try {
-      await this.driver.interrupt?.();
-    } catch (e) {
-      this.log('steer: agent interrupt failed (' + (e as Error).message + ') - queueing instead');
+    // SAME-SOURCE only: a turn started by a DIFFERENT transport is never cancelled or
+    // interrupted from here - the combined prompt just queues behind it (the wait below).
+    if (!(this.busy && this._currentSource !== source)) {
+      // 1. Stop speaking the in-flight reply (pipeline abort).
+      this.cancel('steer: attaching a correction and reinterpreting');
+      // 2. Interrupt the underlying agent so it re-plans against the combined prompt. Best
+      //    effort (D5): if it will not interrupt, the combined prompt still injects and the
+      //    agent runs it right after the current turn - the correction is never lost.
+      try {
+        await this.driver.interrupt?.();
+      } catch (e) {
+        this.log('steer: agent interrupt failed (' + (e as Error).message + ') - queueing instead');
+      }
     }
-    // 3. Wait for the aborted turn to unwind (busy clears).
-    await this.waitUntilFree(8000);
-    // 4. Run the combined prompt as a fresh turn (fresh transcript anchor, fresh audio).
-    const combined = original ? buildSteerPrompt(original, extra) : extra;
-    return this.run(combined, source);
+    // 3+4. Wait for the aborted turn to unwind (busy clears), then run the combined
+    //    prompt as a fresh turn (fresh transcript anchor, fresh audio). The interrupt is
+    //    best-effort and a draining pipeline can hold the lock well past a few seconds -
+    //    HOLD the correction and keep retrying until the lock frees (bounded), never
+    //    force run() into a silent busy rejection (D5: a correction is never lost).
+    const combined = original ? buildSteerPrompt(original, extra, source) : extra;
+    const deadline = this.now() + STEER_UNWIND_TIMEOUT_MS;
+    while (this.now() < deadline) {
+      if (!(await this.waitUntilFree(Math.min(8000, deadline - this.now())))) {
+        this.log('steer: prior turn still unwinding - holding the correction');
+        continue;
+      }
+      const r = await this.run(combined, source);
+      if (r.turn !== 0) return r; // it actually ran - done (lost lock races retry)
+    }
+    this.log('steer: the prior turn never unwound - the correction could not run');
+    this.emit({ type: 'error', message: 'could not apply the follow-up - the previous turn never finished unwinding' });
+    return { ok: false, turn: 0 };
   }
 
   /**

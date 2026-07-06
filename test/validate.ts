@@ -2355,6 +2355,9 @@ await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-sa
     t.ok(!line.includes('/') && !/\d{4,}/.test(line), `${n} never speaks the path`);
   }
   t.eq(describeToolUse(tu('TodoWrite', { todos: [{ content: 'Add tests for the parser', status: 'in_progress' }, { content: 'x', status: 'pending' }] })), "Still on it. I'm adding tests for the parser.", 'TodoWrite in-progress item is the progress line');
+  // A leading NON-verb is never conjugated into gibberish - the bare fallback speaks.
+  t.eq(describeToolUse(tu('TodoWrite', { todos: [{ content: 'Tests for the parser', status: 'in_progress' }] })), "Still on it. I'm working through the task list.", 'a non-verb TodoWrite item falls back to the bare form (never "testsing")');
+  t.eq(describeToolUse(tu('Agent', { description: 'New validation leg' })), 'Still on it. I started a subtask.', 'a non-verb Agent description falls back to the bare form (never "newing")');
   t.eq(describeToolUse(tu('Agent', { description: 'Research session sharing' })), "Still on it. I'm researching session sharing.", 'Agent description');
   t.eq(describeToolUse(tu('Skill', { skill: 'no-mistakes' })), "Still on it. I'm running the no-mistakes step.", 'Skill name');
   // Internal bookkeeping tools stay SILENT - no generic filler (captain decision D2).
@@ -2366,7 +2369,11 @@ await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-sa
   t.eq(verbGerund('Run'), 'running', 'CVC doubling');
   t.eq(verbGerund('Acquire'), 'acquiring', 'drop-e');
   t.eq(verbGerund('Read'), 'reading', 'plain +ing');
+  t.eq(verbGerund('Sync'), 'syncing', 'sync takes plain +ing (never "synccing")');
+  t.eq(verbGerund('Tests'), null, 'a non-verb is never conjugated');
+  t.eq(verbGerund('New'), null, 'unknown leading word -> null');
   t.eq(gerundClause('Deploy the app'), 'deploying the app', 'gerundClause = verb + rest');
+  t.eq(gerundClause('Tests for the parser'), null, 'a non-verb label -> null (caller uses the bare fallback)');
   t.eq(gerundClause('/just/a/path'), null, 'unsafe input -> null');
   // toolUseAfterAnchor: only THIS turn's tool calls, stopping at the next human turn.
   const dir = mkdtempSync(join(tmpdir(), 'ceochat-act-'));
@@ -2562,13 +2569,23 @@ await reporter.leg('phone - F2: real-only progress - throttled, no repeats, sile
 // attaches a SAME-transport follow-up (an SMS never cuts off a live call), and a FAILED
 // interrupt still re-runs the correction (D5: never lost).
 await reporter.leg('turns - attach-and-reinterpret: buildSteerPrompt + steer (interrupt, merge, re-run, same-source, fallback)', async (t) => {
-  const merged = buildSteerPrompt('summarize the deploy logs', 'I meant the staging logs');
+  const merged = buildSteerPrompt('summarize the deploy logs', 'I meant the staging logs', 'phone');
   t.ok(!merged.includes('\n'), 'the merged prompt is ONE line (fm-send submits on newline)');
   t.includes(merged, 'summarize the deploy logs', 'keeps the original prompt verbatim (D3)');
   t.includes(merged, 'I meant the staging logs', 'carries the correction');
-  t.includes(merged.toLowerCase(), 'misread', 'frames the correction as the authoritative fix of a possible STT misread');
-  t.eq(buildSteerPrompt('', 'x'), 'x', 'no original -> just the correction');
-  t.eq(buildSteerPrompt('o', ''), 'o', 'no correction -> just the original');
+  t.includes(merged.toLowerCase(), 'misread', 'a SPOKEN correction is framed as the authoritative fix of a possible STT misread');
+  // Typed sources have no STT to misread: the follow-up is an ADDITION, never an
+  // invitation to reinterpret/replace the original.
+  for (const src of ['web', 'sms'] as const) {
+    const typed = buildSteerPrompt('summarize the deploy logs', 'also check the error rate', src);
+    t.ok(!typed.includes('\n'), `a typed ${src} merge is still ONE line`);
+    t.includes(typed, 'summarize the deploy logs', `${src}: keeps the original verbatim`);
+    t.includes(typed, 'also check the error rate', `${src}: carries the follow-up`);
+    t.ok(!/misread|speech-to-text/i.test(typed), `${src}: no STT-misread framing for a typed follow-up`);
+    t.includes(typed.toLowerCase(), 'addition', `${src}: framed as an addition, not a correction`);
+  }
+  t.eq(buildSteerPrompt('', 'x', 'phone'), 'x', 'no original -> just the correction');
+  t.eq(buildSteerPrompt('o', '', 'phone'), 'o', 'no correction -> just the original');
 
   const runs: string[] = [];
   let interrupts = 0;
@@ -2643,6 +2660,67 @@ await reporter.leg('turns - attach-and-reinterpret: buildSteerPrompt + steer (in
   await until(() => !runner.busy);
 });
 
+// F3 (D5 hard case) - the aborted turn is SLOW to unwind: the driver ignores the abort
+// signal (a long TTS synth draining in the unit queue) well past the 8s wait window.
+// steer must HOLD the correction until the lock actually frees and then run it - never
+// force run() into a silent "one at a time" busy rejection that drops it.
+await reporter.leg('turns - steer holds a correction through a slow unwind (never dropped, D5)', async (t) => {
+  const runs: string[] = [];
+  const errors: string[] = [];
+  let releaseStuck: () => void = () => {};
+  let latestRelease: () => void = () => {};
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => {},
+    // The FIRST send IGNORES the abort signal entirely (the stuck/draining pipeline) and
+    // resolves only when the test releases it; later sends hold for an explicit release.
+    send: (text) => new Promise((resolve) => {
+      runs.push(text);
+      const done = (): void => resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 });
+      if (runs.length === 1) releaseStuck = done; else latestRelease = done;
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  // Virtual clock: every runner sleep(ms) advances vnow by ms (so hours of wait burn in
+  // milliseconds of real time). Once vnow passes 9s - beyond the old fixed 8s window -
+  // the stuck turn finally unwinds; the held state at that instant is snapshotted.
+  let vnow = 0;
+  let releasedAt = 0;
+  let runsAtRelease = -1;
+  let errorsAtRelease = -1;
+  const runner = new TurnRunner({
+    driver,
+    now: () => vnow,
+    sleep: async (ms) => {
+      vnow += ms;
+      if (vnow > 9000 && !releasedAt) {
+        releasedAt = vnow;
+        runsAtRelease = runs.length;
+        errorsAtRelease = errors.length;
+        releaseStuck();
+      }
+      await realSleep(1);
+    },
+  });
+  runner.on((ev) => { if (ev.type === 'error') errors.push(ev.message); });
+
+  void runner.run('the base task', 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the base turn is in flight');
+  const steerP = runner.steer('actually use staging', 'phone');
+  t.ok(await until(() => runs.length === 2), 'the combined correction ran once the lock freed (never dropped, D5)');
+  t.ok(releasedAt > 9000, 'the aborted turn stayed busy well past the old 8s wait window', `unwound at ${releasedAt}ms virtual`);
+  t.eq(runsAtRelease, 1, 'the correction was HELD while the turn unwound - never force-run while busy');
+  t.eq(errorsAtRelease, 0, 'no silent "one at a time" rejection while holding');
+  t.includes(runs[1]!, 'the base task', 'the combined re-run keeps the original');
+  t.includes(runs[1]!, 'actually use staging', 'the correction survived the slow unwind');
+  latestRelease();
+  const r = await steerP;
+  t.ok(r.ok && r.turn === 2, 'the steer resolved with the combined turn');
+  await until(() => !runner.busy);
+});
+
 // F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced
 // and STEERS: the buffered outbound audio is flushed (`clear`), the agent is interrupted,
 // and the combined prompt (original + correction) is re-run.
@@ -2705,6 +2783,7 @@ await reporter.leg('phone - F3: a follow-up utterance attaches + reinterprets (c
     t.ok(await until(() => runs.length === 2), 'the combined prompt is re-run');
     t.includes(runs[1]!, 'summarize the deploy logs', 'the re-run keeps the original prompt');
     t.includes(runs[1]!, 'staging logs', 'the re-run carries the spoken correction');
+    t.includes(runs[1]!.toLowerCase(), 'misread', 'the phone leg keeps the STT-misread framing (spoken source)');
     latestRelease();
     await until(() => !runner.busy);
     call.close();
@@ -2779,6 +2858,81 @@ await reporter.leg('phone - F3: barge-in pins the prompt so a mid-speech correct
     t.ok(await until(() => runs.length === 2), 'the combined prompt is re-run');
     t.includes(runs[1]!, 'summarize the deploy logs', 'the PINNED original prompt is attached (survived the barge-in abort)');
     t.includes(runs[1]!, 'staging logs', 'the correction is attached');
+    latestRelease();
+    await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// F3 (cross-source) - SAME-SOURCE steering only: a spoken line while a WEB-initiated turn
+// is in flight must never steer or interrupt it (typed work is never rewritten). The
+// utterance takes the D5 silent-queue path instead and runs as its own turn right after.
+await reporter.leg('phone - F3: a foreign-source turn is never steered - the utterance queues and runs after (D5)', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  let interrupts = 0;
+  let latestRelease = (): void => {};
+  const heard = ['note the login bug too'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; },
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      latestRelease = done;
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZforeign', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle
+    call.out.length = 0;
+
+    // a WEB-initiated turn is in flight
+    void runner.run('web: refactor the parser', 'web');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a web-initiated turn is in flight');
+
+    // the captain speaks on the call -> queued behind the foreign turn, NOT steered
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === 250)), 'the spoken line is QUEUED (250ms settle-retry armed), not merged');
+    t.ok(!pending.some((p) => p.ms === COALESCE), 'no steer coalesce window opens for a foreign-source turn');
+    t.ok(fireByMs(250), 'a retry tick fires while the web turn is still busy');
+    await realSleep(40);
+    t.eq(runs.length, 1, 'the foreign turn keeps running - nothing was re-run over it');
+    t.eq(interrupts, 0, 'the web turn is NEVER interrupted by a phone utterance (same-source only)');
+    t.ok(!call.out.some((m) => m.event === 'clear'), 'no clear frame - the foreign turn audio is untouched');
+
+    // the web turn finishes normally -> the queued utterance runs as its OWN turn
+    latestRelease();
+    t.ok(await until(() => !runner.busy), 'the web turn settled normally (kept its reply)');
+    t.eq(runner.history.length, 1, 'the web turn recorded its history (never aborted)');
+    t.ok(fireByMs(250), 'the next retry tick fires with the lock free');
+    t.ok(await until(() => runs.length === 2), 'the queued spoken line ran as its own turn (never lost, D5)');
+    t.includes(runs[1]!, 'note the login bug too', 'the utterance text survived intact');
+    t.ok(!/misread|addition/i.test(runs[1]!) && !runs[1]!.includes('refactor the parser'), 'it ran verbatim - never merged into the web prompt');
     latestRelease();
     await until(() => !runner.busy);
     call.close();
