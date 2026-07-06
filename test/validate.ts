@@ -3058,6 +3058,89 @@ await reporter.leg('phone - F3: a foreign-source turn is never steered - the utt
   }
 });
 
+// F3 (foreign-busy FIFO) - multiple spoken lines arriving while a FOREIGN (web/SMS)
+// turn holds the lock must run in SPOKEN order. Per-utterance retry timers would race
+// when the lock frees (whichever tick lands first wins - u2 could run before u1); the
+// shared FIFO drains them one at a time, each as its own fresh phone turn - never
+// reordered, never merged into one prompt.
+await reporter.leg('phone - F3: utterances queued behind a foreign turn drain in spoken order - one FIFO, never reordered or merged', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  const releases: Array<() => void> = [];
+  const heard = ['first check the deploy status', 'second read me the failing test'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZfifo', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle (still idle)
+
+    // a WEB-initiated turn holds the lock
+    const webResult = runner.run('web: refactor the parser', 'web');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a web-initiated turn is in flight');
+
+    // two spoken lines land while the foreign turn is busy - ONE queue, ONE drain
+    call.speakUtterance();
+    t.ok(await until(() => pending.filter((p) => p.ms === 250).length === 1), 'the first line joins the FIFO (one drain tick armed)');
+    call.speakUtterance();
+    await realSleep(40);
+    t.eq(pending.filter((p) => p.ms === 250).length, 1, 'the second line joins the SAME queue - no second racing retry timer');
+    t.ok(!pending.some((p) => p.ms === COALESCE), 'no steer coalesce window opens for a foreign-source turn');
+
+    // a drain tick while still busy just re-arms - nothing runs over the foreign turn
+    t.ok(fireByMs(250), 'a drain tick fires while the web turn is still busy');
+    await realSleep(20);
+    t.eq(runs.length, 1, 'the foreign turn keeps running - nothing dispatched over it');
+
+    // the web turn finishes -> the FIFO drains IN ORDER, one fresh phone turn at a time
+    releases[0]!();
+    const web = await webResult;
+    t.ok(web.ok, 'the web turn completed normally');
+    t.ok(fireByMs(250), 'the next drain tick fires with the lock free');
+    t.ok(await until(() => runs.length === 2), 'the FIRST spoken line runs first');
+    t.includes(runs[1]!, 'first check the deploy status', 'u1 kept its spot at the head of the queue');
+    t.ok(!runs[1]!.includes('second read me'), 'u1 ran as its own turn - not merged with u2');
+    releases[1]!();
+    t.ok(await until(() => runs.length === 3), 'the SECOND spoken line runs right after');
+    t.includes(runs[2]!, 'second read me the failing test', 'u2 ran after u1 - spoken order preserved');
+    t.ok(!runs[2]!.includes('first check'), 'u2 ran as its own turn - never merged');
+    releases[2]!();
+    await until(() => !runner.busy);
+    t.eq(runs.length, 3, 'exactly three turns - no duplicates, no drops');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
 // F3 (D4 in the phone-leg UNWIND window) - after a steer aborts the turn, `busy` clears
 // while the runner is still interrupting the agent (up to ~3s of pane polling on the real
 // broker) and the coalesce timer / barge pin are already consumed. An utterance landing

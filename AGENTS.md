@@ -673,8 +673,10 @@ Three features that make a phone call feel like a human call (plan+decisions:
   follow-up, `steer()` never cancels/interrupts a foreign-source in-flight turn (it queues
   behind it), and the phone leg steers only a phone-sourced turn, a barge-pinned prompt
   (the pin is itself phone-only), or an ALREADY-PENDING phone steer chain - a spoken line
-  during a web/SMS turn takes the silent submit queue (250ms retries, 180s cap) and runs
-  as its OWN turn right after, so typed work is never rewritten. Barge-in cancels ONLY a
+  during a web/SMS turn joins the ordered foreign-busy FIFO (`foreignQueue`, ONE drain
+  loop with 250ms ticks, 180s cap - per-utterance retry timers would race when the lock
+  frees and run lines out of spoken order) and runs as its OWN turn right after, in
+  spoken order, so typed work is never rewritten. Barge-in cancels ONLY a
   phone-sourced turn; over a foreign turn it flushes the local Twilio audio (`clear`) and
   lets the turn complete, so its transport never texts a spurious "turn failed". The
   phone leg coalesces (`steerCoalesceMs`, default 700) + a
@@ -707,7 +709,8 @@ Three features that make a phone call feel like a human call (plan+decisions:
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
   steered, an utterance in the phone-leg unwind window attaches via `steerPending`
   instead of running bare ahead of the re-run, a correction merges into the pending
-  phone steer even when a foreign turn holds the lock, and a barge-in over a
+  phone steer even when a foreign turn holds the lock, utterances queued behind a
+  foreign turn drain in spoken order, and a barge-in over a
   foreign-source turn flushes audio without cancelling it) + `text - follow-up steers the SMS turn`
   (no spurious failure SMS for a
   superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its

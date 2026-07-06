@@ -71,9 +71,10 @@ export const MAX_PENDING_SOCKETS = 8;
 // How long a barge-in keeps the in-flight prompt pinned while waiting for the captain's
 // correction to finish; dropped after this so a barge with no follow-up never strands it.
 const STEER_PIN_TTL_MS = 8 * 1000;
-// Retry budget for an utterance queued behind a FOREIGN-source (web/SMS-initiated) turn
-// we must never steer: 720 x 250ms = 180s, matching the SMS runWhenFree wait cap, so a
-// spoken line survives even a long-running foreign turn (D5: never lost).
+// Wait budget for the ordered FIFO of utterances queued behind a FOREIGN-source
+// (web/SMS-initiated) turn we must never steer: 720 x 250ms = 180s, matching the SMS
+// runWhenFree wait cap, so a spoken line survives even a long-running foreign turn
+// (D5: never lost).
 const FOREIGN_BUSY_TRIES = 720;
 
 /** Drop expired stream tokens so unconsumed mints never accumulate. Pure. */
@@ -303,6 +304,9 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     private steerPending = 0; // steers fired but not yet settled - keeps the attach path
                               // open across the unwind window (busy clears before the
                               // steered re-run starts; a bare run there would misorder)
+    private foreignQueue: string[] = []; // spoken lines waiting out a foreign-source
+                                          // turn, drained strictly in spoken order
+    private foreignDraining = false;      // ONE drain loop at a time
     // Serializes prompt/chunk playback so audio order is preserved.
     private sendQueue: Promise<void> = Promise.resolve();
     private readonly detector: UtteranceDetector;
@@ -473,7 +477,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     // only: steering interrupts and rewrites the in-flight prompt, so it applies ONLY to
     // a phone-initiated turn (or a barge-in pinned prompt, which is phone-sourced by
     // construction). A foreign (web/SMS-initiated) turn is never touched - the utterance
-    // takes the D5 silent-queue path and runs as its own turn right after.
+    // joins the ordered foreign-busy FIFO and runs as its own turn right after (D5).
     private routeUtterance(text: string): void {
       if (this.closed) return;
       const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
@@ -481,8 +485,8 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         || this.steerTimer != null || this.steerOriginal != null) {
         this.steerBuffer.push(text);
         this.armSteerTimer();
-      } else if (runner.busy) {
-        this.submit(text, 0, FOREIGN_BUSY_TRIES);
+      } else if (runner.busy || this.foreignDraining) {
+        this.enqueueForeignBusy(text);
       } else {
         this.submit(text);
       }
@@ -510,7 +514,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       // phone chain instead: runner.steer merges it onto the pending combined prompt and
       // queues behind the foreign turn without ever cancelling or interrupting it.
       if (!original && this.steerPending === 0 && runner.busy && runner.currentSource !== 'phone') {
-        this.submit(joined, 0, FOREIGN_BUSY_TRIES);
+        this.enqueueForeignBusy(joined);
         return;
       }
       this.send({ event: 'clear', streamSid: this.streamSid });
@@ -534,6 +538,43 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         return;
       }
       void runner.run(text, 'phone');
+    }
+
+    /** Queue an utterance behind a FOREIGN (web/SMS-initiated) turn we must never
+     *  steer. ONE shared FIFO with a single drain loop - per-utterance submit()
+     *  retries would race each other's timers when the lock frees and could run the
+     *  captain's lines out of spoken order. Each line runs as its OWN fresh phone
+     *  turn, strictly FIFO; once a drained phone turn is in flight, routeUtterance's
+     *  normal attach path handles any follow-up. */
+    private enqueueForeignBusy(text: string): void {
+      this.foreignQueue.push(text);
+      if (!this.foreignDraining) {
+        this.foreignDraining = true;
+        this.drainForeignQueue(0);
+      }
+    }
+
+    private drainForeignQueue(tries: number): void {
+      if (this.closed) { this.foreignQueue = []; this.foreignDraining = false; return; }
+      if (this.foreignQueue.length === 0) { this.foreignDraining = false; return; }
+      // Hold the drain while a phone steer is pending/coalescing too: dispatching a
+      // queued line under an armed coalesce window would hand fireSteer the WRONG
+      // in-flight turn to correct.
+      if (runner.busy || this.steerPending > 0
+        || this.steerTimer != null || this.steerOriginal != null) {
+        if (tries >= FOREIGN_BUSY_TRIES) {
+          log(`phone: runner stayed busy - dropping ${this.foreignQueue.length} queued utterance(s)`);
+          this.foreignQueue = [];
+          this.foreignDraining = false;
+          return;
+        }
+        timers.setTimeout(() => this.drainForeignQueue(tries + 1), 250);
+        return;
+      }
+      const text = this.foreignQueue.shift()!;
+      void runner.run(text, 'phone')
+        .catch(() => undefined)
+        .finally(() => this.drainForeignQueue(0));
     }
 
     // ---- interactive-prompt fallback (re-ask once, then the safe default) ----
@@ -772,6 +813,7 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       if (this.steerPinTimer != null) { timers.clearTimeout(this.steerPinTimer); this.steerPinTimer = null; }
       this.steerBuffer = [];
       this.steerOriginal = null;
+      this.foreignQueue = [];
       if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
       this.detector.reset();
       if (this.unsubRunner) { this.unsubRunner(); this.unsubRunner = null; }
