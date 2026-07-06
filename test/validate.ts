@@ -21,8 +21,12 @@ import { join } from 'node:path';
 import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, minimaxVoiceId, type Secrets } from '../src/config/secrets.ts';
 import {
   parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
-  findPromptAnchor, saysAfterAnchor, latestTranscriptWithPrompt,
+  findPromptAnchor, saysAfterAnchor, toolUseAfterAnchor, latestTranscriptWithPrompt,
 } from '../src/transcript/transcript.ts';
+import {
+  describeToolUse, screenSafe, verbGerund, gerundClause,
+  type ActivityTap, type ActivityTurnOpts,
+} from '../src/server/activity.ts';
 import { waitForReply, streamReply, splitCompleteUnits, splitCompleteBlocks } from '../src/transcript/reply.ts';
 import { runStreamingPipeline, type PipelineChunk as PipelineChunkT } from '../src/broker/pipeline.ts';
 import { detectBenignModal, dismissBenignModals } from '../src/session/session.ts';
@@ -87,10 +91,10 @@ import {
 } from '../src/server/text.ts';
 import { textCapabilities, textNotifyEnabled } from '../src/config/secrets.ts';
 import {
-  createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY,
+  createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY, DEFAULT_FILLER,
   PHONE_WS_PATH, PHONE_TWIML_PATH, MAX_PENDING_SOCKETS, type PhoneTimers,
 } from '../src/server/phone.ts';
-import { TurnRunner } from '../src/server/turns.ts';
+import { TurnRunner, buildSteerPrompt } from '../src/server/turns.ts';
 import { makeTranscriptVerbatim } from '../src/server/verbatim.ts';
 import { phoneSecrets, phoneCapabilities, type PhoneSecrets } from '../src/config/secrets.ts';
 import { splitFencedSegments, extractPrompt } from '../src/web/prompt-card.js';
@@ -2327,6 +2331,459 @@ await reporter.leg('phone - interactive prompt: re-ask once, then the safe defau
     b.call.close();
   } finally {
     await b.app.close();
+  }
+});
+
+// F2 (pure) - REAL-only progress rendering: describeToolUse turns a tool_use event into
+// a short, screen-safe spoken line reflecting ACTUAL activity (never generic), or null
+// when there is nothing worth narrating. Paths/URLs/code/raw-ids are never spoken.
+await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-safe lines (pure)', (t) => {
+  const tu = (name: string, input: unknown, id = 't1'): Extract<TranscriptEvent, { kind: 'tool_use' }> =>
+    ({ kind: 'tool_use', role: 'assistant', ts: null, id, name, input });
+  // Bash description -> a natural gerund (what the agent is DOING), not an imperative.
+  t.eq(describeToolUse(tu('Bash', { description: 'Run firstmate bootstrap' })), "Still on it. I'm running firstmate bootstrap.", 'Bash description spoken as a gerund');
+  t.eq(describeToolUse(tu('Bash', { description: 'Acquire session lock' })), "Still on it. I'm acquiring session lock.", 'drop-e gerund');
+  // A path/slash in the description degrades to the bare verb (§7.3: never speak a path).
+  const pathy = describeToolUse(tu('Bash', { description: 'Recovery: drain backlog/metas/projects' }));
+  t.eq(pathy, 'Still on it. I just ran a command.', 'a path in the description degrades to the bare verb');
+  t.ok(!/backlog|metas|projects|\//.test(pathy || ''), 'no path fragment is spoken');
+  t.eq(describeToolUse(tu('Bash', { command: 'ls -la' })), 'Still on it. I just ran a command.', 'Bash with no description -> bare verb (still REAL)');
+  // Path-bearing tools speak only the VERB - never the file path.
+  for (const [n, expect] of [['Read', 'reading through a file'], ['Edit', 'making an edit'], ['Write', 'writing a file']] as const) {
+    const line = describeToolUse(tu(n, { file_path: '/home/acbecquet/firstmate/data/projects.md' }))!;
+    t.includes(line, expect, `${n} -> "${expect}"`);
+    t.ok(!line.includes('/') && !/\d{4,}/.test(line), `${n} never speaks the path`);
+  }
+  t.eq(describeToolUse(tu('TodoWrite', { todos: [{ content: 'Add tests for the parser', status: 'in_progress' }, { content: 'x', status: 'pending' }] })), "Still on it. I'm adding tests for the parser.", 'TodoWrite in-progress item is the progress line');
+  t.eq(describeToolUse(tu('Agent', { description: 'Research session sharing' })), "Still on it. I'm researching session sharing.", 'Agent description');
+  t.eq(describeToolUse(tu('Skill', { skill: 'no-mistakes' })), "Still on it. I'm running the no-mistakes step.", 'Skill name');
+  // Internal bookkeeping tools stay SILENT - no generic filler (captain decision D2).
+  t.eq(describeToolUse(tu('ToolSearch', { query: 'x' })), null, 'a non-narratable tool returns null (silence, never generic)');
+  t.eq(describeToolUse(tu('TaskGet', { id: 'x' })), null, 'internal tool -> null');
+  // screenSafe guard + gerund helpers.
+  t.ok(screenSafe('acquire the session lock') && screenSafe('plain words'), 'plain prose is screen-safe');
+  for (const bad of ['see /home/x', 'http://a.b', 'use `code`', 'pid 66035', 'a<b>c']) t.ok(!screenSafe(bad), `unsafe rejected: ${bad}`);
+  t.eq(verbGerund('Run'), 'running', 'CVC doubling');
+  t.eq(verbGerund('Acquire'), 'acquiring', 'drop-e');
+  t.eq(verbGerund('Read'), 'reading', 'plain +ing');
+  t.eq(gerundClause('Deploy the app'), 'deploying the app', 'gerundClause = verb + rest');
+  t.eq(gerundClause('/just/a/path'), null, 'unsafe input -> null');
+  // toolUseAfterAnchor: only THIS turn's tool calls, stopping at the next human turn.
+  const dir = mkdtempSync(join(tmpdir(), 'ceochat-act-'));
+  const p = join(dir, 'sess.jsonl');
+  writeFileSync(p, [
+    userPrompt('first', '2026-06-27T00:00:00.000Z'),
+    assistantToolUse('Bash', { description: 'Run bootstrap' }, 'a1'),
+    assistantSay('done'),
+    userPrompt('second'),
+    assistantToolUse('Read', { file_path: '/x' }, 'b1'),
+  ].join('\n') + '\n');
+  const events = parseTranscript(p);
+  const tools = toolUseAfterAnchor(events, findPromptAnchor(events, 'first'));
+  t.eq(tools.length, 1, 'only the first turn tool_use is in scope (stops at the next human)');
+  t.eq(tools[0]!.name, 'Bash', 'the right tool call is surfaced');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// F1 - exactly ONE thinking-filler per turn (captain decision D1): armed at the 3s
+// threshold, fired only if no real reply audio has played, one-shot (never a repeating
+// cadence), and cancelled outright when the reply is prompt. Manual timers make it
+// deterministic (no wall-clock wait).
+await reporter.leg('phone - F1: exactly one thinking-filler per turn (3s), cancelled by prompt reply audio', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const hasMs = (ms: number): boolean => pending.some((p) => p.ms === ms);
+  const TH = DEFAULT_FILLER.thresholdMs;
+  const spoken: string[] = [];
+  const sends: string[] = [];
+  const heard = ['first task', 'second task'];
+  let emitAudio = false;
+  let release: () => void = () => {};
+  const chunk = speechFramePcm();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      sends.push(text);
+      if (emitAudio) hooks.onChunk?.({ index: 0, narration: 'Reply.', speakBackend: 'mock', pcm: chunk, sampleRate: 8000 });
+      release = () => resolve({ reply: 'r', narration: 'Reply.', speakBackend: 'mock', audio: { pcm: emitAudio ? chunk : Buffer.alloc(0), sampleRate: 8000, ttfbMs: emitAudio ? 1 : null, bytes: emitAudio ? chunk.length : 0 }, chunks: emitAudio ? 1 : 0 });
+      if (hooks.signal?.aborted) release();
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: silenceFramePcm(), sampleRate: 8000 }; },
+    timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  const isFiller = (s: string): boolean => DEFAULT_FILLER.phrases.includes(s);
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZfiller', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+
+    // ---- turn 1: NO reply audio in time -> the SINGLE filler fires at 3s
+    emitAudio = false;
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 1), 'turn 1 started');
+    t.ok(await until(() => hasMs(TH)), 'the filler timer is armed at the 3s threshold');
+    const before = spoken.filter(isFiller).length;
+    t.ok(fireByMs(TH), 'fire the 3s filler timer');
+    t.ok(await until(() => spoken.filter(isFiller).length === before + 1), 'exactly ONE filler is spoken');
+    t.ok(!hasMs(TH), 'the filler is one-shot - no repeating 3s cadence (captain decision D1)');
+    release();
+    t.ok(await until(() => !runner.busy), 'turn 1 settled');
+    const fillerCount1 = spoken.filter(isFiller).length;
+    t.eq(fillerCount1, before + 1, 'still exactly one filler for the whole turn');
+
+    // ---- turn 2: reply audio arrives BEFORE the threshold -> NO filler at all
+    emitAudio = true;
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 2), 'turn 2 started');
+    t.ok(await until(() => !hasMs(TH)), 'prompt reply audio cancels the filler timer (no dead-air filler needed)');
+    release();
+    await until(() => !runner.busy);
+    await realSleep(60);
+    t.eq(spoken.filter(isFiller).length, fillerCount1, 'no filler is spoken when the reply is prompt');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// F2 (integration) - REAL-only progress over the wire: a progress line is spoken ONLY
+// when there is NEW real activity, throttled to the min gap, never the same statement
+// twice, SILENT when nothing new happened, and it yields while the reply is actually
+// speaking. Driven by manual timers + a fake activity tap (deterministic).
+await reporter.leg('phone - F2: real-only progress - throttled, no repeats, silent when nothing new, yields to reply audio', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const GAP = 20000;
+  const fireGap = (): boolean => { const i = pending.findIndex((p) => p.ms === GAP); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const hasGap = (): boolean => pending.some((p) => p.ms === GAP);
+  const spoken: string[] = [];
+  const sends: string[] = [];
+  const heard = ['do the big task'];
+  let emitChunk: () => void = () => {};
+  let release: () => void = () => {};
+  const chunk = speechFramePcm();
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      sends.push(text);
+      emitChunk = () => hooks.onChunk?.({ index: 0, narration: 'Partial.', speakBackend: 'mock', pcm: chunk, sampleRate: 8000 });
+      release = () => resolve({ reply: 'done', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 });
+      if (hooks.signal?.aborted) release();
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  let pushActivity: ((line: string) => void) | null = null;
+  const activity: ActivityTap = (o: ActivityTurnOpts) => { pushActivity = o.onActivity; return { stop: () => { pushActivity = null; } }; };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: silenceFramePcm(), sampleRate: 8000 }; },
+    activity, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  const A = "Still on it. I'm acquiring session lock.";
+  const B = "Still on it. I'm running the tests.";
+  const C = "Still on it. I'm making an edit.";
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZprog', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 1), 'the long turn started');
+    t.ok(await until(() => pushActivity !== null), 'the activity tap was started for this turn');
+    t.ok(await until(() => hasGap()), 'the progress throttle timer is armed');
+
+    // NEW real activity A -> spoken at the next tick
+    pushActivity!(A);
+    t.ok(fireGap(), 'fire progress tick 1');
+    t.ok(await until(() => spoken.includes(A)), 'the freshest REAL activity is spoken at the tick');
+
+    // nothing new -> the next tick is SILENT (never a generic line)
+    const n1 = spoken.length;
+    t.ok(fireGap(), 'fire progress tick 2 (nothing new)');
+    await realSleep(60);
+    t.eq(spoken.length, n1, 'silence when there is no new activity - REAL only, never generic (D2)');
+
+    // the SAME activity again -> never spoken twice in a turn
+    pushActivity!(A);
+    t.ok(fireGap(), 'fire progress tick 3 (A repeats)');
+    await realSleep(60);
+    t.eq(spoken.filter((s) => s === A).length, 1, 'the same statement is never spoken twice in a turn');
+
+    // a NEW activity B -> spoken
+    pushActivity!(B);
+    t.ok(fireGap(), 'fire progress tick 4');
+    t.ok(await until(() => spoken.includes(B)), 'a new real activity is spoken');
+
+    // reply audio plays this window -> progress YIELDS; then speaks once quiet again
+    emitChunk();
+    pushActivity!(C);
+    t.ok(fireGap(), 'fire progress tick 5 (audio played this window)');
+    await realSleep(60);
+    t.ok(!spoken.includes(C), 'progress yields while the reply is actually speaking');
+    t.ok(fireGap(), 'fire progress tick 6 (quiet again)');
+    t.ok(await until(() => spoken.includes(C)), 'the held activity is spoken once the reply pauses');
+
+    release();
+    await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// F3 (core) - attach-and-reinterpret at the TurnRunner: buildSteerPrompt frames the merge,
+// steer() aborts the in-flight turn + interrupts the agent + re-runs the COMBINED prompt,
+// the aborted turn leaves no history/turn-done (no double-speak), submitOrSteer only
+// attaches a SAME-transport follow-up (an SMS never cuts off a live call), and a FAILED
+// interrupt still re-runs the correction (D5: never lost).
+await reporter.leg('turns - attach-and-reinterpret: buildSteerPrompt + steer (interrupt, merge, re-run, same-source, fallback)', async (t) => {
+  const merged = buildSteerPrompt('summarize the deploy logs', 'I meant the staging logs');
+  t.ok(!merged.includes('\n'), 'the merged prompt is ONE line (fm-send submits on newline)');
+  t.includes(merged, 'summarize the deploy logs', 'keeps the original prompt verbatim (D3)');
+  t.includes(merged, 'I meant the staging logs', 'carries the correction');
+  t.includes(merged.toLowerCase(), 'misread', 'frames the correction as the authoritative fix of a possible STT misread');
+  t.eq(buildSteerPrompt('', 'x'), 'x', 'no original -> just the correction');
+  t.eq(buildSteerPrompt('o', ''), 'o', 'no correction -> just the original');
+
+  const runs: string[] = [];
+  let interrupts = 0;
+  let aborts = 0;
+  let interruptOk = true;
+  let latestRelease = (): void => {};
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; if (!interruptOk) throw new Error('cannot interrupt'); },
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      latestRelease = done;
+      iv = setInterval(() => { if (hooks.signal?.aborted) { aborts++; done(); } }, 5);
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const events: Array<{ type: string; turn?: number }> = [];
+  runner.on((ev) => events.push(ev as { type: string; turn?: number }));
+
+  // ---- happy path: a phone turn in flight, a spoken correction steers it
+  void runner.run('summarize the deploy logs', 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the first turn is in flight');
+  t.eq(runner.currentPrompt, 'summarize the deploy logs', 'currentPrompt tracks the in-flight prompt');
+  t.eq(runner.currentSource, 'phone', 'currentSource tracks the transport');
+  const steerP = runner.steer('I meant the staging logs', 'phone');
+  t.ok(await until(() => aborts === 1), 'steer aborts the in-flight turn (stops speaking the old reply)');
+  t.ok(await until(() => interrupts === 1), 'steer interrupts the underlying agent (Escape) so it re-plans');
+  t.ok(await until(() => runs.length === 2), 'the COMBINED prompt is re-run as a fresh turn');
+  t.includes(runs[1]!, 'summarize the deploy logs', 're-run keeps the original');
+  t.includes(runs[1]!, 'staging logs', 're-run carries the correction');
+  t.ok(!events.some((e) => e.type === 'turn-done' && e.turn === 1), 'the aborted turn emitted NO turn-done (no residue, no double-speak)');
+  latestRelease(); // finish the combined turn (it is a "thinking" hold)
+  await steerP;
+  t.ok(await until(() => !runner.busy), 'the combined turn settles');
+  const doneTurns = events.filter((e) => e.type === 'turn-done').map((e) => e.turn);
+  t.ok(doneTurns.includes(2) && !doneTurns.includes(1), 'only the combined turn recorded a turn-done');
+  t.eq(runner.history.length, 1, 'only the combined turn is in history (the aborted one left none)');
+
+  // ---- submitOrSteer: a DIFFERENT transport never interrupts the live turn
+  void runner.run('a phone task', 'phone');
+  await until(() => runner.busy && runs.length === 3);
+  const before = runs.length;
+  const errsBefore = events.filter((e) => e.type === 'error').length;
+  const rWeb = await runner.submitOrSteer('an unrelated web line', 'web');
+  t.eq(rWeb.turn, 0, 'a DIFFERENT transport does NOT interrupt the live turn (one at a time)');
+  t.eq(interrupts, 1, 'no agent interrupt for the cross-transport attempt');
+  t.eq(runs.length, before, 'no re-run for the cross-transport attempt');
+  t.ok(events.filter((e) => e.type === 'error').length === errsBefore + 1, 'the cross-transport send got the busy error');
+  // same transport -> attaches + reinterprets
+  const rPhone = runner.submitOrSteer('actually the other task', 'phone');
+  t.ok(await until(() => runs.length === before + 1 && interrupts === 2), 'a SAME-transport follow-up attaches + reinterprets');
+  t.includes(runs[before]!, 'actually the other task', 'the combined re-run carries the follow-up');
+  latestRelease();
+  await rPhone;
+  await until(() => !runner.busy);
+
+  // ---- queue fallback: a FAILED interrupt still re-runs the combined prompt
+  interruptOk = false;
+  void runner.run('the base task', 'phone');
+  await until(() => runner.busy);
+  const n = runs.length;
+  const fbP = runner.steer('and also this fix', 'phone');
+  t.ok(await until(() => runs.length === n + 1), 'a FAILED interrupt still re-runs the combined prompt (correction never lost, D5)');
+  t.includes(runs[n]!, 'and also this fix', 'the correction survives the interrupt failure');
+  latestRelease();
+  await fbP;
+  await until(() => !runner.busy);
+});
+
+// F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced
+// and STEERS: the buffered outbound audio is flushed (`clear`), the agent is interrupted,
+// and the combined prompt (original + correction) is re-run.
+await reporter.leg('phone - F3: a follow-up utterance attaches + reinterprets (coalesce -> clear -> interrupt -> combined re-run)', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  let interrupts = 0;
+  let latestRelease = (): void => {};
+  const heard = ['summarize the deploy logs', 'I meant the staging logs'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; },
+    // a thinking turn: NO reply audio, resolve only on abort or explicit release.
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      latestRelease = done;
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZsteer', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth + greeting settle (still idle)
+
+    // first command -> a thinking turn (no audio)
+    call.speakUtterance();
+    t.ok(await until(() => runs.length === 1 && runner.busy), 'the first command started a (thinking) turn');
+    call.out.length = 0;
+
+    // a correction arrives while the turn is in flight -> coalesced, not dropped
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the follow-up utterance is buffered for coalescing (NOT dropped)');
+    t.eq(runs.length, 1, 'the follow-up did not start a second concurrent turn');
+
+    // fire the coalesce window -> steer
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window');
+    t.ok(await until(() => call.out.some((m) => m.event === 'clear')), 'steering flushes buffered outbound audio (clear)');
+    t.ok(await until(() => interrupts === 1), 'the agent is interrupted to reinterpret');
+    t.ok(await until(() => runs.length === 2), 'the combined prompt is re-run');
+    t.includes(runs[1]!, 'summarize the deploy logs', 'the re-run keeps the original prompt');
+    t.includes(runs[1]!, 'staging logs', 'the re-run carries the spoken correction');
+    latestRelease();
+    await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// F3 (phone barge-in) - a correction spoken OVER the reply barges in: the old audio is
+// flushed, the in-flight prompt is PINNED, and the ensuing utterance attaches to it (so a
+// mid-speech fix still steers the right prompt even though barge-in aborted the turn).
+await reporter.leg('phone - F3: barge-in pins the prompt so a mid-speech correction attaches + reinterprets', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const COALESCE = 700;
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  let interrupts = 0;
+  let latestRelease = (): void => {};
+  const chunk = speechFramePcm();
+  const heard = ['summarize the deploy logs', 'I meant the staging logs'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; },
+    // emits reply audio (so it is "playing" and can be barged over), then holds.
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      hooks.onChunk?.({ index: 0, narration: 'Working on it.', speakBackend: 'mock', pcm: chunk, sampleRate: 8000 });
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: chunk, sampleRate: 8000, ttfbMs: 1, bytes: chunk.length }, chunks: 1 }); };
+      latestRelease = done;
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    // empty prompt audio so the PIN/greeting never set "playing" (only the reply chunk does)
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    steerCoalesceMs: COALESCE, timers: manualTimers, log: () => {},
+  });
+  // marks never echo -> the reply audio stays "playing", so the captain talks over it
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port, { echoMarks: false });
+    call.send({ event: 'start', start: { streamSid: 'MZbargere', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => !runner.busy);
+
+    call.speakUtterance(); // command -> turn plays reply audio (now "playing")
+    t.ok(await until(() => runs.length === 1), 'the command started a turn that is speaking');
+    t.ok(await until(() => call.out.some((m) => m.event === 'mark')), 'reply audio is on the wire (playing)');
+    call.out.length = 0;
+
+    // the captain talks OVER the reply: sustained speech -> barge-in (raw wire frames)
+    for (let i = 0; i < 14; i++) call.ws.send(asMediaFrame(speechFramePcm()));
+    t.ok(await until(() => call.out.some((m) => m.event === 'clear')), 'barge-in flushes the buffered audio (clear)');
+
+    // the correction utterance completes -> attaches to the PINNED prompt
+    call.speakUtterance();
+    t.ok(await until(() => pending.some((p) => p.ms === COALESCE)), 'the mid-speech correction is captured (not dropped)');
+    t.ok(fireByMs(COALESCE), 'fire the coalesce window');
+    t.ok(await until(() => interrupts === 1), 'the agent is interrupted to reinterpret');
+    t.ok(await until(() => runs.length === 2), 'the combined prompt is re-run');
+    t.includes(runs[1]!, 'summarize the deploy logs', 'the PINNED original prompt is attached (survived the barge-in abort)');
+    t.includes(runs[1]!, 'staging logs', 'the correction is attached');
+    latestRelease();
+    await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
   }
 });
 

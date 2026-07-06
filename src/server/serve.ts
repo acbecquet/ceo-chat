@@ -37,6 +37,7 @@ import { TurnRunner } from './turns.ts';
 import { createPhoneApp, type PhoneApp } from './phone.ts';
 import { createTextApp, type TextApp } from './text.ts';
 import { makeTranscriptVerbatim, resolveBrokerProjectDir } from './verbatim.ts';
+import { makeTranscriptActivity } from './activity.ts';
 import {
   loadSecrets, hasMinimaxCreds, minimaxVoiceId, phoneSecrets, phoneCapabilities,
   textCapabilities, textNotifyEnabled,
@@ -116,10 +117,17 @@ const phoneCaps = phoneCapabilities(phoneCfg);
 const publicUrl = process.env.CEOCHAT_PUBLIC_URL || 'https://ceo-chat.acb-apps.com';
 let phone: PhoneApp | null = null;
 if (phoneCaps.inbound) {
+  // REAL-only mid-turn progress source: taps the SAME session JSONL the spoken path
+  // anchors to (from the outside) and surfaces the agent's live tool activity.
+  const activity = makeTranscriptActivity({
+    resolveProjectDir: () => resolveBrokerProjectDir(),
+    log,
+  });
   phone = createPhoneApp({
     runner,
     transcribe: transcriber ? (pcm, sr) => transcriber.transcribe(pcm, sr) : undefined,
     synthPrompt: makePromptSynth(),
+    activity,
     secrets: phoneCfg,
     publicUrl,
     log,

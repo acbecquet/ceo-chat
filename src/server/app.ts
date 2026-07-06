@@ -273,7 +273,9 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
       try { msg = JSON.parse(raw.toString()) as ClientMessage; } catch { return; }
       if (msg.type === 'send') {
         const text = (msg.text || '').trim();
-        if (text) void runner.run(text, 'web');
+        // A second line while a web turn is in flight attaches + reinterprets (Feature 3);
+        // a different transport being busy still gets the "one at a time" error.
+        if (text) void runner.submitOrSteer(text, 'web');
       } else if (msg.type === 'listening') {
         broadcast({ type: 'status', state: msg.on ? 'listening' : runner.idleStatus() });
       } else if (msg.type === 'call-me') {

@@ -269,6 +269,25 @@ export function saysAfterAnchor(
   return out;
 }
 
+// The `tool_use` events that belong to the turn anchored at `anchorIndex`, in order -
+// the raw material for REAL mid-turn progress updates (plan Feature 2). While the agent
+// works it emits tool calls (Bash/Read/Edit/...) but no `say` text, so the say tap sees
+// nothing; these are the only live signal of what it is actually doing. Same boundary
+// rule as saysAfterAnchor (stop at the next human turn). Returns [] when anchorIndex < 0.
+export function toolUseAfterAnchor(
+  events: TranscriptEvent[],
+  anchorIndex: number,
+): Extract<TranscriptEvent, { kind: 'tool_use' }>[] {
+  if (anchorIndex < 0) return [];
+  const out: Extract<TranscriptEvent, { kind: 'tool_use' }>[] = [];
+  for (let i = anchorIndex + 1; i < events.length; i++) {
+    const e = events[i]!;
+    if (e.kind === 'human') break; // the next turn started - stop at our turn's boundary
+    if (e.kind === 'tool_use') out.push(e);
+  }
+  return out;
+}
+
 // Newest transcript under `projectDir` that contains the injected prompt as a human
 // event — the robust replacement for latestTranscriptIn() when tapping an attached
 // first mate. Scans .jsonl files newest-first (so a mid-turn /clear or compaction that

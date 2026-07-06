@@ -611,6 +611,59 @@ streaming TTS. Decision-ready plan:
   the partial-failure note leading the SMS reply), and notify gates (token 403s,
   config-off 404, framing). Live texting stays captain-gated on A2P registration.
 
+## Phase 11 - Call Mode UX: thinking-filler, real-only progress, attach-and-reinterpret
+Three features that make a phone call feel like a human call (plan+decisions:
+`data/ceochat-callux-n7/`). All three live at the phone/turn seam; the pipeline below
+`Driver.send` is UNCHANGED.
+- **F1 - one thinking-filler per turn** (`phone.ts`, `DEFAULT_FILLER`). When a turn is
+  slow to produce its first spoken audio, ONE short varied "give me a second" line is
+  spoken after `fillerThresholdMs` (default 3000). Captain decision D1: EXACTLY ONE per
+  turn - a one-shot timer armed on the `sent` event, fired only if no reply `audio` has
+  played, cancelled by the first audio / `turn-done`. NOT a repeating cadence. The pool
+  is rotated (never canned) and synthesized through the SAME `speak`->`sendPcm` path, so
+  filler inherits half-duplex (`playing=true`) and is never transcribed back; `speak(text,
+  cache=true)` memoizes the finite static pool. `sendQueue` serialization guarantees the
+  filler plays BEFORE the first real chunk (wait-for-gap, never a collision).
+- **F2 - REAL-ONLY progress** (`src/server/activity.ts` + `phone.ts`). Captain decision
+  D2 (override): progress is spoken ONLY when there is NEW real agent activity - there is
+  NO generic layer, no fixed cadence, no "still working on it" pool. The transcript tap
+  already parses `tool_use` (transcript.ts `toolUseAfterAnchor`); `describeToolUse` renders
+  one into a short, screen-safe gerund line ("Still on it. I'm running firstmate
+  bootstrap.") from `Bash.description` / TodoWrite in-progress content / Agent/Skill
+  descriptions, or the bare tool VERB ("reading a file") for path-bearing tools - the path
+  is NEVER spoken (`screenSafe` + `gerundClause`, §7.3). Non-narratable internal tools
+  (ToolSearch, TaskGet, ...) return null = silence. The `ActivityTap`
+  (`makeTranscriptActivity`, parallels `verbatim.ts`) is wired in `serve.ts` and started
+  per-turn on the `sent` event; the phone leg throttles to `progressMinGapMs` (default
+  20000), speaks the FRESHEST un-spoken line, NEVER the same statement twice in a turn
+  (`spokenActivity` set), stays SILENT when nothing new, and YIELDS while real reply audio
+  is streaming (`audioThisWindow`).
+- **F3 - attach-and-reinterpret** (`turns.ts` + `phone.ts` + `app.ts` + `text.ts`). A
+  follow-up utterance while a turn is in flight is MERGED into the in-flight prompt and the
+  turn is re-run - primarily to fix STT misreads (decision D4: always attach while in
+  flight). The crux: `runner.cancel` only stops ceo-chat SPEAKING; it does NOT stop the
+  agent. New optional `Driver.interrupt()` (`Broker.interrupt` = send `Escape` to the pane,
+  guarded by the SAME "esc to interrupt" idle latch the reply tap uses) actually
+  interrupts claude. `TurnRunner.steer` = abort the in-flight pipeline -> interrupt the
+  agent -> wait for it to unwind -> re-run `buildSteerPrompt(original, correction)` (ONE
+  line, original verbatim + the correction framed as the authoritative fix of a possible
+  misread, decision D3). An aborted-for-steer turn leaves NO history/turn-done (no
+  double-speak - it returns before recording). `submitOrSteer` attaches only a SAME-source
+  follow-up (an inbound SMS must NEVER interrupt a live call); the phone leg drives `steer`
+  directly with coalescing (`steerCoalesceMs`, default 700) + a Twilio `clear` flush, and
+  its barge-in PINS the in-flight prompt (`steerOriginal`, TTL `STEER_PIN_TTL_MS`) so a
+  mid-speech correction attaches even after the barge aborts the turn. Web routes `send`
+  through `submitOrSteer`; SMS `runWhenFree` attaches a same-source follow-up but waits on
+  a phone/web turn. D5 fallback: if `Escape` won't interrupt, the combined prompt still
+  injects and runs right after (queued) - a correction is NEVER lost.
+- **Validation:** `npm run validate` gains `phone - F1` (single filler, one-shot,
+  cancelled by prompt audio), `phone - F2 progress` (pure `describeToolUse`/`screenSafe`/
+  gerund + boundary) and `phone - F2: real-only progress` (throttle, no repeats, silence
+  when nothing new, yields to audio), and `turns - attach-and-reinterpret` + two `phone -
+  F3` legs (merge, interrupt, re-run, same-source-only, queue fallback, barge-in pin). All
+  deterministic (injected `PhoneTimers` + fake taps + a controllable driver - no wall
+  clock). Real Escape-interrupt over tmux is captain-gated (needs a live claude pane).
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.
 - **CI:** `.github/workflows/validate.yml` runs `npm ci` + `npm run typecheck` +

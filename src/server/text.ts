@@ -281,12 +281,15 @@ export function createTextApp(opts: TextAppOptions): TextApp {
     return { path, contentType, bytes: bytes.length };
   }
 
-  /** Run the injected text once the shared turn lock frees up (bounded wait). */
+  /** Run the injected text once the shared turn lock frees up (bounded wait). A quick
+   *  follow-up text while ANOTHER SMS turn is in flight attaches + reinterprets (Feature
+   *  3); a phone/web turn holding the lock is WAITED on, never interrupted - an inbound
+   *  text must never cut off a live call. */
   async function runWhenFree(text: string): Promise<{ ok: boolean; turn: number }> {
     const t0 = now();
     for (;;) {
-      if (!runner.busy) {
-        const r = await runner.run(text, 'sms');
+      if (!runner.busy || runner.currentSource === 'sms') {
+        const r = await runner.submitOrSteer(text, 'sms');
         // ok, or it genuinely ran and failed mid-turn (turn > 0): both are final.
         // turn === 0 means the run never started (lost a busy race) - keep waiting.
         if (r.ok || r.turn > 0) return r;

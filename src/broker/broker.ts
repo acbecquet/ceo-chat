@@ -223,6 +223,28 @@ export class Broker {
     return { ...result, wavPath, narrationPath };
   }
 
+  // Interrupt the agent's in-flight turn (send Escape to the pane) so the NEXT injected
+  // prompt is re-planned from scratch - the mechanism behind attach-and-reinterpret
+  // (Feature 3). Guarded by the SAME idle latch the reply tap uses ("esc to interrupt"
+  // shows only while claude is streaming): if the agent is already idle there is nothing
+  // to interrupt, so we send nothing (Escape on an idle composer would be a no-op at
+  // best). If it will not return to idle, we give up and let the caller queue the prompt
+  // (claude runs it after the current turn) - a correction is never lost.
+  async interrupt(): Promise<void> {
+    if (!this.ctx) return;
+    const target = this.ctx.target;
+    const streaming = (): boolean => /esc to interrupt/i.test(capturePane(target));
+    if (!streaming()) return; // nothing in flight
+    this.log('interrupt: Escape -> steer the agent turn (attach-and-reinterpret)');
+    sendKey(target, 'Escape');
+    for (let i = 0; i < 20; i++) {
+      await sleep(150);
+      if (!streaming()) return; // returned to the composer
+      if (i === 6) sendKey(target, 'Escape'); // one more nudge, then give up
+    }
+    this.log('interrupt: agent did not return to idle - the correction will queue instead');
+  }
+
   // A colour-preserving snapshot of the live agent pane, for the web terminal view
   // (xterm.js). Empty string before the session is up.
   terminalSnapshot(): string {
