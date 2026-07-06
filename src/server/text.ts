@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { PhoneSecrets } from '../config/secrets.ts';
 import { textCapabilities } from '../config/secrets.ts';
-import type { TurnRunner } from './turns.ts';
+import type { TurnResult, TurnRunner } from './turns.ts';
 import { parseFormBody, validateTwilioSignature, sameNumber, sendSms, timingSafeEqualStr } from './twilio.ts';
 
 export const TEXT_WEBHOOK_PATH = '/text/webhook';
@@ -285,13 +285,13 @@ export function createTextApp(opts: TextAppOptions): TextApp {
    *  follow-up text while ANOTHER SMS turn is in flight attaches + reinterprets (Feature
    *  3); a phone/web turn holding the lock is WAITED on, never interrupted - an inbound
    *  text must never cut off a live call. */
-  async function runWhenFree(text: string): Promise<{ ok: boolean; turn: number }> {
+  async function runWhenFree(text: string): Promise<TurnResult> {
     const t0 = now();
     for (;;) {
       if (!runner.busy || runner.currentSource === 'sms') {
         const r = await runner.submitOrSteer(text, 'sms');
-        // ok, or it genuinely ran and failed mid-turn (turn > 0): both are final.
-        // turn === 0 means the run never started (lost a busy race) - keep waiting.
+        // ok, genuinely failed mid-turn, or superseded by a follow-up (turn > 0): all
+        // final. turn === 0 means the run never started (lost a busy race) - keep waiting.
         if (r.ok || r.turn > 0) return r;
       }
       if (now() - t0 >= busyTimeoutMs) return { ok: false, turn: 0 };
@@ -347,6 +347,13 @@ export function createTextApp(opts: TextAppOptions): TextApp {
       return;
     }
     if (!result.ok) {
+      if (result.superseded) {
+        // The captain's own follow-up text steered this turn: the combined turn answers
+        // both messages, so the superseded one stays silent - no failure text, no wasted
+        // outbound message.
+        log(`text: turn ${result.turn} superseded by a follow-up - the combined turn replies`);
+        return;
+      }
       await textCaptain(failNote + `That turn failed - check the transcript at ${publicUrl}`);
       return;
     }

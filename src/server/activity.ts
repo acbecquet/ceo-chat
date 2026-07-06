@@ -103,15 +103,25 @@ const KNOWN_VERBS = new Set([
 ]);
 
 /** Gerund of a single KNOWN verb ("Run"->"running", "Acquire"->"acquiring"), or null.
- *  A word that is not a recognized verb is never conjugated. Lowercase. */
+ *  A word that is not a recognized verb is never conjugated. A word already ending in
+ *  -ing passes ONLY when its stem maps back to a known verb ("reading"->read, "acquiring"->acquire,
+ *  "running"->run) - "Bring"/"Ongoing" end in -ing but are gerunds of nothing we know,
+ *  so they return null instead of leaking wrong speech. Lowercase. */
 export function verbGerund(word: string): string | null {
   const w = (word || '').toLowerCase();
   if (!/^[a-z]+$/.test(w) || w.length < 2) return null;
-  if (w.endsWith('ing')) return w;
-  if (DOUBLE_GERUND.has(w)) return w + w[w.length - 1] + 'ing';
-  if (!KNOWN_VERBS.has(w)) return null;
-  if (w.endsWith('e') && !w.endsWith('ee')) return w.slice(0, -1) + 'ing';
-  return w + 'ing';
+  if (KNOWN_VERBS.has(w)) {
+    if (DOUBLE_GERUND.has(w)) return w + w[w.length - 1] + 'ing';
+    if (w.endsWith('e') && !w.endsWith('ee')) return w.slice(0, -1) + 'ing';
+    return w + 'ing';
+  }
+  if (w.endsWith('ing')) {
+    const stem = w.slice(0, -3);
+    if (KNOWN_VERBS.has(stem) || KNOWN_VERBS.has(stem + 'e')) return w;
+    if (stem.length >= 2 && stem[stem.length - 1] === stem[stem.length - 2]
+      && DOUBLE_GERUND.has(stem.slice(0, -1))) return w;
+  }
+  return null;
 }
 
 // Turn an imperative/active-voice label ("Run firstmate bootstrap", "Add parser tests")

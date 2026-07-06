@@ -632,9 +632,11 @@ Three features that make a phone call feel like a human call (plan+decisions:
   bootstrap.") from `Bash.description` / TodoWrite in-progress content / Agent/Skill
   descriptions, or the bare tool VERB ("reading a file") for path-bearing tools - the path
   is NEVER spoken (`screenSafe` + `gerundClause`, §7.3). `gerundClause` conjugates ONLY a
-  recognized leading verb (`KNOWN_VERBS` allowlist; 'sync' takes plain +ing, "syncing"):
-  a free-text TodoWrite/Agent label that doesn't start with one ("Tests for the parser")
-  falls back to the tool's bare form, never gibberish. Non-narratable internal tools
+  recognized leading verb (`KNOWN_VERBS` allowlist; 'sync' takes plain +ing, "syncing");
+  a word already ending in -ing passes only when its STEM maps back to a known verb
+  ("reading", "running") - "Bring"/"Ongoing" do not, so they fall back too. A free-text TodoWrite/
+  Agent label that doesn't start with a known verb ("Tests for the parser") falls back
+  to the tool's bare form, never gibberish. Non-narratable internal tools
   (ToolSearch, TaskGet, ...) return null = silence. The `ActivityTap`
   (`makeTranscriptActivity`, parallels `verbatim.ts`) is wired in `serve.ts` and started
   per-turn on the `sent` event; the phone leg throttles to `progressMinGapMs` (default
@@ -651,10 +653,17 @@ Three features that make a phone call feel like a human call (plan+decisions:
   agent -> wait for it to unwind -> re-run `buildSteerPrompt(original, correction, source)`
   (ONE line, original verbatim; SOURCE-AWARE framing: a SPOKEN phone correction is the
   authoritative fix of a possible STT misread (D3), a typed web/SMS follow-up is an
-  ADDITION that never invites replacing the original). An aborted-for-steer turn leaves NO
-  history/turn-done (no double-speak - it returns before recording). Steering is
+  ADDITION that never invites replacing the original). The abort + attach-target capture
+  happen at steer() REQUEST time (before the serialized `steerChain` entry runs), so a
+  SECOND correction arriving DURING a steered re-run breaks that run's await and merges
+  immediately (D4 holds for repeat corrections; the nested framing on the re-merged
+  prompt is an accepted tradeoff). An aborted-for-steer turn leaves NO history/turn-done
+  (no double-speak - it returns before recording) and resolves `TurnResult.superseded` -
+  NOT a failure - so text.ts's `handleInbound` stays silent for it instead of texting a
+  spurious "That turn failed" (only the combined turn's SMS reply goes out; a genuine
+  mid-turn failure still texts the note). Steering is
   SAME-SOURCE only, enforced at BOTH ends: `submitOrSteer` attaches only a same-source
-  follow-up, `_steer` never cancels/interrupts a foreign-source in-flight turn (it queues
+  follow-up, `steer()` never cancels/interrupts a foreign-source in-flight turn (it queues
   behind it), and the phone leg steers only a phone-sourced turn or a barge-pinned prompt
   (the pin is itself phone-only) - a spoken line during a web/SMS turn takes the silent
   submit queue (250ms retries, 180s cap) and runs as its OWN turn right after, so typed
@@ -668,12 +677,15 @@ Three features that make a phone call feel like a human call (plan+decisions:
   runWhenFree) instead of force-running into a silent "one at a time" busy rejection.
 - **Validation:** `npm run validate` gains `phone - F1` (single filler, one-shot,
   cancelled by prompt audio), `phone - F2 progress` (pure `describeToolUse`/`screenSafe`/
-  gerund + non-verb fallback + boundary) and `phone - F2: real-only progress` (throttle,
-  no repeats, silence when nothing new, yields to audio), `turns - attach-and-reinterpret`
-  (incl. per-source framing) + `turns - slow-unwind hold` (the correction survives an
-  abort that outlives the wait window) + three `phone - F3` legs (merge, interrupt,
-  re-run, same-source-only, queue fallback, barge-in pin, foreign-source turns queued
-  not steered). All deterministic (injected `PhoneTimers` + fake taps + a controllable
+  gerund + non-verb fallback + boundary + the -ing stem rule) and `phone - F2: real-only
+  progress` (throttle, no repeats, silence when nothing new, yields to audio), `turns -
+  attach-and-reinterpret` (incl. per-source framing) + `turns - slow-unwind hold` (the
+  correction survives an abort that outlives the wait window) + `turns - second
+  correction` (a correction DURING a steered re-run merges immediately and the superseded
+  turns report `superseded`) + three `phone - F3` legs (merge, interrupt, re-run,
+  same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
+  steered) + `text - follow-up steers the SMS turn` (no spurious failure SMS for a
+  superseded turn; a genuine failure still texts). All deterministic (injected `PhoneTimers` + fake taps + a controllable
   driver - no wall clock; the slow-unwind leg injects a virtual `now`/`sleep`). Real
   Escape-interrupt over tmux is captain-gated (needs a live claude pane).
 

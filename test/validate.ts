@@ -2372,6 +2372,16 @@ await reporter.leg('phone - F2 progress: describeToolUse renders REAL, screen-sa
   t.eq(verbGerund('Sync'), 'syncing', 'sync takes plain +ing (never "synccing")');
   t.eq(verbGerund('Tests'), null, 'a non-verb is never conjugated');
   t.eq(verbGerund('New'), null, 'unknown leading word -> null');
+  // -ing words pass ONLY when the stem maps back to a KNOWN verb - "Bring"/"Ongoing"
+  // end in -ing but are gerunds of nothing we know.
+  t.eq(verbGerund('Running'), 'running', 'an already-gerund known verb passes (de-doubled stem)');
+  t.eq(verbGerund('Reading'), 'reading', 'already-gerund, direct stem');
+  t.eq(verbGerund('Acquiring'), 'acquiring', 'already-gerund, drop-e stem');
+  t.eq(verbGerund('Bring'), null, '"bring" is NOT accepted verbatim (its gerund is not its base form)');
+  t.eq(verbGerund('Ongoing'), null, 'a non-verb -ing word is never accepted as a gerund');
+  t.eq(gerundClause('Bring the branch up to date'), null, 'a "Bring …" label falls back (never "I\'m bring …")');
+  t.eq(describeToolUse(tu('Bash', { description: 'Bring the branch up to date' })), 'Still on it. I just ran a command.', 'a Bash "Bring …" description uses the bare fallback');
+  t.eq(describeToolUse(tu('TodoWrite', { todos: [{ content: 'Ongoing cleanup of the parser', status: 'in_progress' }] })), "Still on it. I'm working through the task list.", 'an "Ongoing …" TodoWrite item uses the bare fallback (never "I\'m ongoing …")');
   t.eq(gerundClause('Deploy the app'), 'deploying the app', 'gerundClause = verb + rest');
   t.eq(gerundClause('Tests for the parser'), null, 'a non-verb label -> null (caller uses the bare fallback)');
   t.eq(gerundClause('/just/a/path'), null, 'unsafe input -> null');
@@ -2719,6 +2729,53 @@ await reporter.leg('turns - steer holds a correction through a slow unwind (neve
   const r = await steerP;
   t.ok(r.ok && r.turn === 2, 'the steer resolved with the combined turn');
   await until(() => !runner.busy);
+});
+
+// F3 (D4 for SECOND corrections) - a correction arriving DURING a steered re-run must
+// abort that run at request time and merge (never queue behind the whole combined turn,
+// never run bare); the superseded turn resolves `superseded`, not a failure.
+await reporter.leg('turns - a second correction during a steered re-run attaches immediately (D4, superseded not failed)', async (t) => {
+  const runs: string[] = [];
+  let interrupts = 0;
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => { interrupts++; },
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+
+  const run1 = runner.run('deploy the app', 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the base turn is in flight');
+  const steer1 = runner.steer('to staging', 'phone');
+  t.ok(await until(() => runs.length === 2 && runner.busy && runner.currentPrompt === runs[1]), 'the first correction re-ran the combined prompt');
+  const r1 = await run1;
+  t.ok(!r1.ok && r1.turn === 1 && r1.superseded === true, 'the steered-away base turn resolves superseded, not a bare failure');
+
+  // The steered re-run is IN FLIGHT (never released). A second correction lands.
+  const steer2 = runner.steer('actually the blue environment', 'phone');
+  t.ok(await until(() => runs.length === 3), 'the second correction re-ran WITHOUT waiting for the combined turn to complete');
+  t.includes(runs[2]!, 'deploy the app', 'the original survives the second merge');
+  t.includes(runs[2]!, 'to staging', 'the FIRST correction is still in the merged prompt');
+  t.includes(runs[2]!, 'actually the blue environment', 'the second correction is merged, never dropped or run bare');
+  t.eq(interrupts, 2, 'each correction interrupted the agent once');
+  const s1 = await steer1;
+  t.ok(!s1.ok && s1.turn === 2 && s1.superseded === true, 'the superseded steered re-run also resolves superseded');
+
+  releases[2]!();
+  const s2 = await steer2;
+  t.ok(s2.ok && s2.turn === 3, 'the second steer resolves when the final combined turn completes');
+  await until(() => !runner.busy);
+  t.eq(runner.history.length, 1, 'only the final combined turn is in history (superseded turns left none)');
 });
 
 // F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced
@@ -3357,6 +3414,65 @@ await reporter.leg('text - SMS webhook: signature gate + allowlist + Body->send 
     t.eq(sent?.text, 'status of the deploy?', 'with the captain\'s exact words');
   } finally {
     try { watcher.close(); } catch { /* ignore */ }
+    await app.close();
+    rmSync(inbox, { recursive: true, force: true });
+  }
+});
+
+// T2b - a quick same-source follow-up text steers the in-flight SMS turn (Feature 3).
+// The deliberately superseded first turn must NOT text the captain "That turn failed" -
+// only the combined turn's reply goes out. A GENUINE mid-turn failure still does.
+await reporter.leg('text - a follow-up text steers the SMS turn: no spurious failure SMS for the superseded turn', async (t) => {
+  const sends: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 22050 }),
+    start: async () => {},
+    interrupt: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve, reject) => {
+      sends.push(text);
+      if (/detonate the driver/.test(text)) { reject(new Error('driver exploded')); return; }
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: TEXT_REPLY, narration: TEXT_NARRATION, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 22050, ttfbMs: 3, bytes: 0 } }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const { fetchImpl, smsSent } = makeTextFetch({});
+  const inbox = mkdtempSync(join(tmpdir(), 'ceochat-inbox-'));
+  const runner = new TurnRunner({ driver });
+  const text = createTextApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    inboxDir: inbox, fetchImpl, log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, text, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const post = (body: string, sid: string): Promise<{ status: number; body: string }> => postText(app.url, {
+      From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber!,
+      Body: body, NumMedia: '0', MessageSid: sid,
+    });
+    await post('summarize the deploy logs', 'SMsteer1');
+    t.ok(await until(() => sends.length === 1 && runner.busy), 'the first text turn is in flight');
+    await post('I meant the staging logs', 'SMsteer2');
+    t.ok(await until(() => sends.length === 2), 'the follow-up steered: the COMBINED prompt re-ran');
+    t.includes(sends[1]!, 'summarize the deploy logs', 'the combined turn keeps the first message verbatim');
+    t.includes(sends[1]!, 'I meant the staging logs', 'and carries the follow-up');
+    releases[1]!(); // finish the combined turn
+    t.ok(await until(() => smsSent.length === 1), 'exactly ONE reply SMS goes out - the combined turn\'s');
+    const body = smsSent[0]!.params.get('Body') || '';
+    t.ok(body.startsWith(TEXT_NARRATION), 'the reply is the combined turn\'s narration');
+    await realSleep(200);
+    t.eq(smsSent.length, 1, 'the superseded first message never sent its own reply');
+    t.ok(!smsSent.some((s) => /turn failed/i.test(s.params.get('Body') || '')), 'NO spurious "turn failed" text for the deliberately superseded turn');
+
+    // a GENUINE mid-turn failure still texts the captain a failure note
+    await until(() => !runner.busy);
+    await post('please detonate the driver', 'SMsteer3');
+    t.ok(await until(() => smsSent.length === 2), 'a genuine failure still produces a text');
+    t.includes(smsSent[1]!.params.get('Body') || '', 'That turn failed', 'and it is the failure note');
+  } finally {
     await app.close();
     rmSync(inbox, { recursive: true, force: true });
   }
