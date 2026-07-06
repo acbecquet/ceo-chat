@@ -674,11 +674,16 @@ Three features that make a phone call feel like a human call (plan+decisions:
   behind it), and the phone leg steers only a phone-sourced turn, a barge-pinned prompt
   (the pin is itself phone-only), or an ALREADY-PENDING phone steer chain - a spoken line
   during a web/SMS turn joins the ordered foreign-busy FIFO (`foreignQueue`, ONE drain
-  loop with 250ms ticks, 180s cap - per-utterance retry timers would race when the lock
+  loop with 250ms ticks; each queued line ages on its OWN 180s budget from its own
+  arrival, so an early item's expiry drops only that item and a late-spoken line keeps
+  its full patience window - per-utterance retry timers would race when the lock
   frees and run lines out of spoken order) and runs as its OWN turn right after, in
-  spoken order, so typed work is never rewritten. Barge-in cancels ONLY a
-  phone-sourced turn; over a foreign turn it flushes the local Twilio audio (`clear`) and
-  lets the turn complete, so its transport never texts a spurious "turn failed". The
+  spoken order, so typed work is never rewritten. The phone leg NEVER cancels a turn
+  it does not own (`cancelOwnTurn`: no-op unless `runner.currentSource === 'phone'`) -
+  both barge-in AND hangup/teardown cancel only a phone-sourced turn; over a foreign
+  turn barge-in flushes the local Twilio audio (`clear`) and a hangup just tears the
+  call down, letting the turn complete so its transport never texts a spurious
+  "turn failed". The
   phone leg coalesces (`steerCoalesceMs`, default 700) + a
   Twilio `clear` flush; barge-in PINS the in-flight prompt (`steerOriginal`, TTL
   `STEER_PIN_TTL_MS`) so a mid-speech correction attaches even after the barge aborts the
@@ -710,8 +715,10 @@ Three features that make a phone call feel like a human call (plan+decisions:
   steered, an utterance in the phone-leg unwind window attaches via `steerPending`
   instead of running bare ahead of the re-run, a correction merges into the pending
   phone steer even when a foreign turn holds the lock, utterances queued behind a
-  foreign turn drain in spoken order, and a barge-in over a
-  foreign-source turn flushes audio without cancelling it) + `text - follow-up steers the SMS turn`
+  foreign turn drain in spoken order, a late-queued utterance keeps its own patience
+  budget, a barge-in over a foreign-source turn flushes audio without cancelling it,
+  and a hangup cancels only the caller's own turn - a foreign turn survives the
+  teardown) + `text - follow-up steers the SMS turn`
   (no spurious failure SMS for a
   superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
   media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable

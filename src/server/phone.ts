@@ -7,8 +7,9 @@
 //   bidirectional Media Streams WS at /phone    (8 kHz mu-law base64 both ways)
 //     inbound : mu-law -> PCM -> whisper transcribe -> TurnRunner.run(text)
 //     outbound: runner audio events (s16le@22k/32k) -> 8 kHz mu-law -> media+mark
-//     barge-in: sustained captain speech during playback -> `clear` + runner.cancel
-//     hangup  : `stop` frame / WS close -> runner.cancel (signal.aborted)
+//     barge-in: sustained captain speech during playback -> `clear` + cancel the
+//               caller's OWN phone-sourced turn (a foreign turn is never cancelled)
+//     hangup  : `stop` frame / WS close -> same phone-owned-only cancel
 //
 // SECURITY (mandatory - the broker fronts a shell-capable agent), layered:
 //   1. Caller-ID allowlist at the webhook: From/To must match CEOCHAT_ALLOWED_CALLER
@@ -304,8 +305,10 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     private steerPending = 0; // steers fired but not yet settled - keeps the attach path
                               // open across the unwind window (busy clears before the
                               // steered re-run starts; a bare run there would misorder)
-    private foreignQueue: string[] = []; // spoken lines waiting out a foreign-source
-                                          // turn, drained strictly in spoken order
+    private foreignQueue: Array<{ text: string; tries: number }> = [];
+                                          // spoken lines waiting out a foreign-source
+                                          // turn, drained strictly in spoken order;
+                                          // each carries its OWN patience budget
     private foreignDraining = false;      // ONE drain loop at a time
     // Serializes prompt/chunk playback so audio order is preserved.
     private sendQueue: Promise<void> = Promise.resolve();
@@ -547,14 +550,14 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
      *  turn, strictly FIFO; once a drained phone turn is in flight, routeUtterance's
      *  normal attach path handles any follow-up. */
     private enqueueForeignBusy(text: string): void {
-      this.foreignQueue.push(text);
+      this.foreignQueue.push({ text, tries: 0 });
       if (!this.foreignDraining) {
         this.foreignDraining = true;
-        this.drainForeignQueue(0);
+        this.drainForeignQueue();
       }
     }
 
-    private drainForeignQueue(tries: number): void {
+    private drainForeignQueue(): void {
       if (this.closed) { this.foreignQueue = []; this.foreignDraining = false; return; }
       if (this.foreignQueue.length === 0) { this.foreignDraining = false; return; }
       // Hold the drain while a phone steer is pending/coalescing too: dispatching a
@@ -562,19 +565,23 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       // in-flight turn to correct.
       if (runner.busy || this.steerPending > 0
         || this.steerTimer != null || this.steerOriginal != null) {
-        if (tries >= FOREIGN_BUSY_TRIES) {
-          log(`phone: runner stayed busy - dropping ${this.foreignQueue.length} queued utterance(s)`);
-          this.foreignQueue = [];
-          this.foreignDraining = false;
-          return;
+        // Each queued line ages on its OWN budget from its own arrival: an early
+        // item's timeout drops only that item - a line spoken late into a long
+        // foreign turn keeps its full patience window (D5: never lost early).
+        for (const item of this.foreignQueue) item.tries++;
+        const expired = this.foreignQueue.filter((i) => i.tries >= FOREIGN_BUSY_TRIES).length;
+        if (expired > 0) {
+          log(`phone: runner stayed busy - dropping ${expired} queued utterance(s)`);
+          this.foreignQueue = this.foreignQueue.filter((i) => i.tries < FOREIGN_BUSY_TRIES);
+          if (this.foreignQueue.length === 0) { this.foreignDraining = false; return; }
         }
-        timers.setTimeout(() => this.drainForeignQueue(tries + 1), 250);
+        timers.setTimeout(() => this.drainForeignQueue(), 250);
         return;
       }
-      const text = this.foreignQueue.shift()!;
-      void runner.run(text, 'phone')
+      const item = this.foreignQueue.shift()!;
+      void runner.run(item.text, 'phone')
         .catch(() => undefined)
-        .finally(() => this.drainForeignQueue(0));
+        .finally(() => this.drainForeignQueue());
     }
 
     // ---- interactive-prompt fallback (re-ask once, then the safe default) ----
@@ -785,7 +792,15 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.send({ event: 'clear', streamSid: this.streamSid });
       this.outstandingMarks = 0;
       this.detector.playing = false; // start collecting the captain's ongoing speech
-      if (phoneOwnsTurn) runner.cancel('phone barge-in'); // stop the old reply audio now
+      this.cancelOwnTurn('phone barge-in'); // stop the old reply audio now
+    }
+
+    /** The phone leg must never cancel a turn it does not own: a foreign (web/SMS)
+     *  turn runs to completion and delivers its own reply - aborting it would read
+     *  as a spurious failure on that transport (a "turn failed" text, a dead web
+     *  turn). Every phone-side runner.cancel routes through here. */
+    private cancelOwnTurn(reason: string): void {
+      if (runner.busy && runner.currentSource === 'phone') runner.cancel(reason);
     }
 
     private send(obj: unknown): void {
@@ -817,10 +832,11 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
       this.detector.reset();
       if (this.unsubRunner) { this.unsubRunner(); this.unsubRunner = null; }
-      // Hanging up cancels the in-flight turn (stops speech + synthesis) - but only
-      // an AUTHENTICATED call has a stake in it; an anonymous/refused connection
-      // dropping must never abort the captain's live turn.
-      if (this.authed) runner.cancel('phone hangup (' + reason + ')');
+      // Hanging up cancels the caller's OWN in-flight turn (stops speech + synthesis) -
+      // but only an AUTHENTICATED call has a stake in it, and a foreign (web/SMS)
+      // turn is never the caller's to abort: it runs to completion and delivers its
+      // own reply (audio to the dead call is moot - sendPcm no-ops on a closed socket).
+      if (this.authed) this.cancelOwnTurn('phone hangup (' + reason + ')');
       try { this.ws.close(); } catch { /* ignore */ }
       pending.delete(this);
       if (session === this) session = null;

@@ -3391,6 +3391,152 @@ await reporter.leg('phone - barge-in over a foreign-source turn flushes audio on
   }
 });
 
+// Foreign-busy FIFO: each queued line ages on its OWN patience budget from its own
+// arrival. An early item that waits out a long-blocking foreign turn is dropped ALONE
+// when ITS budget expires; a line spoken late into that window keeps its full window
+// and still runs when the lock frees (a shared budget would evict it after seconds).
+await reporter.leg('phone - F3: a late-queued utterance keeps its own patience budget - an early timeout never evicts it', async (t) => {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  const manualTimers: PhoneTimers = {
+    setTimeout: (fn, ms) => { const h = { fn, ms }; pending.push(h); return h; },
+    clearTimeout: (h) => { const i = pending.indexOf(h as { fn: () => void; ms: number }); if (i >= 0) pending.splice(i, 1); },
+  };
+  const fireByMs = (ms: number): boolean => { const i = pending.findIndex((p) => p.ms === ms); if (i < 0) return false; const [h] = pending.splice(i, 1); h!.fn(); return true; };
+  const runs: string[] = [];
+  const logs: string[] = [];
+  const releases: Array<() => void> = [];
+  const heard = ['early spoken line about the deploy', 'late spoken line about the tests'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    timers: manualTimers, log: (m) => logs.push(m),
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZbudget', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle (still idle)
+
+    // a WEB-initiated turn holds the lock for a LONG time
+    const webResult = runner.run('web: refactor the parser', 'web');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a web-initiated turn is in flight');
+
+    // u1 joins the FIFO and waits almost its whole 720-tick (180s) budget
+    call.speakUtterance();
+    t.ok(await until(() => pending.filter((p) => p.ms === 250).length === 1), 'the early line joins the FIFO (drain armed)');
+    let fired = 0;
+    for (let i = 0; i < 700; i++) if (fireByMs(250)) fired++;
+    t.eq(fired, 700, 'the drain kept ticking while the foreign turn stayed busy');
+
+    // u2 arrives LATE - 175s into u1's wait - with a fresh budget of its own
+    call.speakUtterance();
+    await realSleep(40);
+    const dropped = (): boolean => logs.some((l) => l.includes('dropping 1 queued utterance(s)'));
+    for (let i = 0; i < 30 && !dropped(); i++) fireByMs(250);
+    t.ok(dropped(), 'the early line expired on ITS OWN budget and was dropped alone');
+    t.ok(!logs.some((l) => l.includes('dropping 2')), 'the late line was never evicted with it');
+    t.eq(pending.filter((p) => p.ms === 250).length, 1, 'the drain keeps running for the late line');
+
+    // the foreign turn finally frees the lock -> the surviving late line runs
+    releases[0]!();
+    const web = await webResult;
+    t.ok(web.ok, 'the web turn completed normally');
+    t.ok(fireByMs(250), 'the next drain tick fires with the lock free');
+    t.ok(await until(() => runs.length === 2), 'the late line runs as its own phone turn');
+    t.includes(runs[1]!, 'late spoken line about the tests', 'the surviving line is the late one');
+    t.ok(!runs.some((r) => r.includes('early spoken line')), 'the expired early line never ran');
+    releases[1]!();
+    await until(() => !runner.busy);
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// Hangup over a FOREIGN turn: a `stop` frame / dead-zone socket drop tears the call
+// down but must never cancel a web/SMS-initiated turn - it runs to completion and
+// keeps its ok result (no spurious "turn failed" text, no dead web turn). Hanging up
+// during the caller's OWN phone turn still aborts it.
+await reporter.leg('phone - hangup cancels only the caller\'s own turn - a foreign turn survives the teardown', async (t) => {
+  let sawAborted = 0;
+  const runs: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'done', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) { sawAborted++; done(); } }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const heard = ['check the deploy status'];
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    synthPrompt: async () => ({ pcm: Buffer.alloc(0), sampleRate: 8000 }),
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    // ---- call 1: hangup while an SMS-initiated turn is in flight
+    const twiml1 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call1 = await connectPhoneClient(app.port);
+    call1.send({ event: 'start', start: { streamSid: 'MZhangfor', customParameters: { token: tokenFromTwiml(twiml1.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call1.send({ event: 'dtmf', dtmf: { digit: d } });
+    await realSleep(60); // let the DTMF auth settle
+    const smsP = runner.run('sms: summarize the inbox', 'sms');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a foreign SMS turn is in flight');
+    call1.send({ event: 'stop' }); // the caller hangs up mid foreign turn
+    t.ok(await until(() => !phone.activeCall), 'the call tears down on hangup');
+    await realSleep(80);
+    t.eq(sawAborted, 0, 'the hangup did NOT cancel the foreign turn');
+    t.ok(runner.busy, 'the foreign turn keeps running');
+    releases[0]!();
+    const sms = await smsP;
+    t.ok(sms.ok, 'the foreign turn completed with ok:true - no "turn failed" text would ever be sent');
+    t.eq(runner.history.length, 1, 'the foreign turn recorded its history (never aborted)');
+    call1.close();
+
+    // ---- call 2: hangup during the caller's OWN phone turn still aborts it
+    const twiml2 = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call2 = await connectPhoneClient(app.port);
+    call2.send({ event: 'start', start: { streamSid: 'MZhangown', customParameters: { token: tokenFromTwiml(twiml2.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call2.send({ event: 'dtmf', dtmf: { digit: d } });
+    call2.speakUtterance(); // command -> the caller's own long phone turn
+    t.ok(await until(() => runs.length === 2), 'the second call started its own phone turn');
+    call2.send({ event: 'stop' });
+    t.ok(await until(() => sawAborted === 1), "hangup still aborts the caller's OWN phone turn");
+    call2.close();
+    await until(() => !runner.busy);
+  } finally {
+    await app.close();
+  }
+});
+
 // V1 - the 1:1 VERBATIM transcript, byte-exact. The tap streams the exact assistant
 // text (code fences, odd whitespace and all) while the reply grows, and the final
 // read equals the session transcript text byte-for-byte.
