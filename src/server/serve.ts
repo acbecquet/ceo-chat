@@ -62,9 +62,13 @@ const driver = new BrokerDriver(broker);
 // the SAME transcriber for the captain's call audio.
 const transcriber = forceMock ? null : makeWhisperTranscriber({ log });
 
+// STT/cleanup config reads secrets.env AND the process env (env wins) - one merged
+// map so CEOCHAT_* set in either place is honored consistently.
+const configEnv = { ...secrets, ...process.env };
+
 // A reserved config name for future pluggable engines (decision D1). Only whisper-local
 // is wired today; a request for another engine is honored as a no-op with a clear note.
-const engine = sttEngine(process.env);
+const engine = sttEngine(configEnv);
 if (engine !== 'whisper-local') {
   log(`CEOCHAT_STT_ENGINE=${engine} is reserved but not yet available - using whisper-local`);
 }
@@ -73,7 +77,7 @@ if (engine !== 'whisper-local') {
 // one fast LLM call, with a HARD raw fallback so it can never block. Gemini is the
 // default backend, MiniMax is configurable; null when disabled (mode off, or auto with
 // no cleanup key = today's raw behavior). Shared by the phone leg and the web STT path.
-const cleanupCfg = cleanupConfig({ ...secrets, ...process.env });
+const cleanupCfg = cleanupConfig(configEnv);
 const cleaner = makePromptCleaner({
   mode: cleanupCfg.mode,
   backendPref: cleanupCfg.backendPref,

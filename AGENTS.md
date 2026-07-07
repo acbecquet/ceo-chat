@@ -757,8 +757,12 @@ well-formed prompt, before it reaches the agent. Pipeline below `Broker.send` is
   reference the harness asserts). `mockCleanup` = the §4.3 contract as code (obvious ASR
   fixes, filler removal, repeat-collapse, single line, sentence case) - conservative on
   purpose (never change meaning / drop a specific). `sanitizeCleaned` enforces the output
-  invariants: flatten newlines + strip backticks/quotes IN PLACE, but REJECT (-> raw) an
-  empty or ballooned (> 2.5x word-count) result (hallucination guard). Gemini body reuses
+  invariants: flatten newlines + strip backticks (and a SAME-character quote pair that
+  wraps the whole string - never mismatched/interior pairs) IN PLACE, but REJECT (-> raw)
+  an empty or ballooned (> 2.5x word-count) result (hallucination guard). A TRUNCATED
+  response is a failure too: Gemini `finishReason: MAX_TOKENS` / MiniMax
+  `finish_reason: length` -> raw fallback (never inject a request with its tail silently
+  dropped). Gemini body reuses
   the `thinkingBudget:0` gotcha; MiniMax is `chatcompletion_v2` (Bearer + GroupId-in-query,
   model `MiniMax-Text-01`).
 - **Selection/config** (`src/config/secrets.ts`): `cleanupConfig(env)` reads
@@ -776,13 +780,19 @@ well-formed prompt, before it reaches the agent. Pipeline below `Broker.send` is
   non-negotiable):** a consequential CONFIRMATION (yes/no) NEVER passes through the cleanup
   LLM - `onUtterance` skips cleanup when `awaitingConfirmation && looksConsequential`, and
   `handleCommand` classifies + injects the RAW transcript for the guard-send path. An LLM
-  can never flip a "no" to a "yes". The web STT path cleans only the transcript the human
-  still confirms (report §5). Absent config -> `cleanPrompt` is undefined -> verbatim inject
+  can never flip a "no" to a "yes". The web server-STT path (`app.ts`) enforces the SAME
+  gate: the client AUTO-SUBMITS a spoken transcript after `guardUtterance`, so while a
+  consequential confirmation is pending the `transcript` frame hands back the RAW words.
+  Phone utterance processing is SERIALIZED per call (`utteranceChain`) so a fast second
+  utterance never overtakes a slow first one (varying transcribe/cleanup latency) into
+  the runner. Absent config -> `cleanPrompt` is undefined -> verbatim inject
   (today's behavior).
 - **Validate legs (mock, no network):** cleanup mock contract + sanitize, request bodies +
-  backend/config selection, the fail-safe (error/non-200/timeout/empty all return raw), and
-  the explicit **D4 guard-safety leg** over the real phone WS (a normal command IS cleaned;
-  a consequential confirmation is injected RAW and the cleanup spy is never called). A
+  backend/config selection, the fail-safe (error/non-200/timeout/empty/
+  truncated all return raw), the explicit **D4 guard-safety legs** over the real phone WS
+  AND the web WS (a normal command IS cleaned; a consequential confirmation is injected /
+  handed back RAW and the cleanup spy is never called), and a spoken-order leg (a fast
+  second utterance waits for a slow first). A
   `--live` leg reports Gemini cleanup quality as PENDING (never red) without a key.
 
 ## Validation / shipping

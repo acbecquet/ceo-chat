@@ -76,8 +76,7 @@ export interface CleanupResult {
 // meaning. The real LLM backends handle the long tail.
 const ASR_FIXES: Array<[RegExp, string]> = [
   [/\bpo(?:le|ll)\s+request\b/gi, 'pull request'],
-  [/\bpull\s+request\b/gi, 'pull request'],
-  [/\bsee\s+eye\b/gi, 'CI'],
+  [/\bsee\s+eye\b(?!\s+to\s+eye\b)/gi, 'CI'],
   [/\b(?:get|git)\s+hub\b/gi, 'GitHub'],
   [/\blarge\s+v\s*(?:three|3)\b/gi, 'large-v3'],
   [/\bvalidation\s+sweet\b/gi, 'validation suite'],
@@ -107,8 +106,13 @@ export function mockCleanup(raw: string): string {
 // or has ballooned well past the input (a sign the LLM invented content). Pure.
 export function sanitizeCleaned(out: string, rawInput: string): string | null {
   let s = (out || '').replace(/[\r\n]+/g, ' ').replace(/`+/g, '').trim();
-  // strip a single pair of wrapping quotes the model sometimes adds
-  if (s.length >= 2 && /^["'].*["']$/.test(s)) s = s.slice(1, -1).trim();
+  // strip a single pair of wrapping quotes the model sometimes adds - only when the
+  // SAME quote character wraps the whole string (never mismatched or interior pairs,
+  // e.g. `"foo" and "bar"` stays intact)
+  const q = s.charAt(0);
+  if (s.length >= 2 && (q === '"' || q === "'") && s.endsWith(q) && !s.slice(1, -1).includes(q)) {
+    s = s.slice(1, -1).trim();
+  }
   s = s.replace(/\s+/g, ' ').trim();
   if (!s) return null;
   const words = (str: string): number => (str.match(/\S+/g) || []).length;
@@ -260,9 +264,12 @@ async function viaGemini(
     });
     if (!res.ok) throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
     const data = (await res.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>;
     };
-    const out = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text ?? '').join('');
+    const cand = data.candidates?.[0];
+    // A truncated cleanup silently drops the tail of the request - worse than raw.
+    if (cand?.finishReason === 'MAX_TOKENS') throw new Error('Gemini output truncated (MAX_TOKENS)');
+    const out = (cand?.content?.parts || []).map((p) => p.text ?? '').join('');
     if (!out.trim()) throw new Error('Gemini returned empty text');
     return out;
   } finally {
@@ -286,11 +293,13 @@ async function viaMinimax(
     });
     if (!res.ok) throw new Error(`MiniMax API ${res.status}: ${await res.text()}`);
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
       base_resp?: { status_code?: number; status_msg?: string };
     };
     const status = data.base_resp?.status_code ?? 0;
     if (status !== 0) throw new Error(`MiniMax base_resp ${status}: ${data.base_resp?.status_msg || ''}`);
+    // A truncated cleanup silently drops the tail of the request - worse than raw.
+    if (data.choices?.[0]?.finish_reason === 'length') throw new Error('MiniMax output truncated (finish_reason length)');
     const out = data.choices?.[0]?.message?.content ?? '';
     if (!out.trim()) throw new Error('MiniMax returned empty text');
     return out;

@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import { WS_PATH, AUDIO_FORMAT, STT_SAMPLE_RATE, type ServerMessage, type ClientMessage } from './protocol.ts';
+import { looksConsequential } from '../web/confirm.js';
 import type { Driver } from './driver.ts';
 import { TurnRunner } from './turns.ts';
 import type { VerbatimTap } from './verbatim.ts';
@@ -70,7 +71,9 @@ export interface WebAppOptions {
   /**
    * Optional dictation cleanup for the server-STT transcript (report ceochat-stt-w4).
    * When present, the transcribed text is cleaned before it is handed back to the
-   * client to confirm. NEVER throws (raw on failure). Absent -> the raw transcript.
+   * client. SKIPPED while a consequential confirmation is pending (D4) - the client
+   * auto-submits after its guard, so a yes/no must be classified on the raw words.
+   * NEVER throws (raw on failure). Absent -> the raw transcript.
    */
   cleanPrompt?: (raw: string) => Promise<string>;
   /** Human label for the STT backend (advertised in `hello`). */
@@ -326,9 +329,13 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         void transcribe(pcm, rate)
           .then(async (text) => {
             let t = (text || '').trim();
-            // Optional dictation cleanup before the human confirms (report §5: safe here
-            // because the client still confirms). Never blocks - raw on any failure.
-            if (t && cleanPrompt) {
+            // Optional dictation cleanup (report ceochat-stt-w4). The client AUTO-SUBMITS
+            // a final voice transcript after guardUtterance - there is no human review
+            // step - so a consequential confirmation is handed back RAW (D4): the guard
+            // must classify the captain's own yes/no, never a cleanup-LLM rewrite.
+            // Never blocks - raw on any failure.
+            const guardActive = runner.awaitingConfirmation && looksConsequential(runner.lastNarration);
+            if (t && cleanPrompt && !guardActive) {
               try { t = (await cleanPrompt(t)).trim() || t; } catch { /* keep raw */ }
             }
             // ALWAYS return a transcript frame - even empty - so the client can SHOW

@@ -320,12 +320,19 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     private foreignDraining = false;      // ONE drain loop at a time
     // Serializes prompt/chunk playback so audio order is preserved.
     private sendQueue: Promise<void> = Promise.resolve();
+    // Serializes utterance processing (transcribe -> cleanup -> handleCommand) so two
+    // quick consecutive utterances always reach handleCommand in SPOKEN order - the
+    // per-utterance transcription/cleanup latencies vary (and some skip cleanup), so
+    // fire-and-forget handling could scramble fresh-turn vs steer composition.
+    private utteranceChain: Promise<void> = Promise.resolve();
     private readonly detector: UtteranceDetector;
 
     constructor(ws: WebSocket) {
       this.ws = ws;
       this.detector = new UtteranceDetector({
-        onUtterance: (pcm) => { void this.onUtterance(pcm); },
+        onUtterance: (pcm) => {
+          this.utteranceChain = this.utteranceChain.then(() => this.onUtterance(pcm)).catch(() => {});
+        },
         onBargeIn: () => this.onBargeIn(),
       }, opts.vad);
       ws.on('message', (raw) => this.onFrame(raw as Buffer));

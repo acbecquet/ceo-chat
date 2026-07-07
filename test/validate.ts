@@ -2357,6 +2357,8 @@ await reporter.leg('dictation cleanup - mock contract + sanitize (deterministic)
 
   const b = mockCleanup('text me when see eye is green');
   t.includes(b, 'CI', 'fixes "see eye" -> "CI"');
+  const idiom = mockCleanup('we do not see eye to eye on this');
+  t.includes(idiom.toLowerCase(), 'see eye to eye', 'the idiom "see eye to eye" is never corrupted by the CI fix');
 
   // filler removal + immediate-repeat collapse, still one line, meaning intact.
   const c = mockCleanup('um so bump the the whisper model uh to base');
@@ -2373,6 +2375,8 @@ await reporter.leg('dictation cleanup - mock contract + sanitize (deterministic)
   // sanitize: flatten newlines, strip backticks/quotes; reject a ballooned hallucination.
   t.eq(sanitizeCleaned('`merge` the\nPR', 'merge the pr'), 'merge the PR', 'newlines flattened, backticks stripped');
   t.eq(sanitizeCleaned('"just this"', 'just this'), 'just this', 'wrapping quotes stripped');
+  t.eq(sanitizeCleaned('"foo" and "bar"', 'foo and bar'), '"foo" and "bar"', 'two separate quoted terms are never mangled');
+  t.eq(sanitizeCleaned('"mismatched pair\'', 'mismatched pair'), '"mismatched pair\'', 'a mismatched quote pair is never stripped');
   t.eq(sanitizeCleaned('', 'hi'), null, 'empty output -> null (caller keeps raw)');
   const balloon = 'merge the pr and also deploy and also write docs and also refactor everything and rewrite the readme and add tests and update the changelog and notify the team and schedule a meeting';
   t.eq(sanitizeCleaned(balloon, 'merge the pr'), null, 'a wildly expanded output -> null (raw fallback guard)');
@@ -2443,6 +2447,19 @@ await reporter.leg('dictation cleanup - fail-safe returns raw, never blocks', as
     fetchImpl: (async () => ({ ok: false, status: 429, text: async () => 'rate limited', json: async () => ({}) })) as unknown as typeof fetch });
   t.eq(non200.text, 'do the thing', 'a non-200 (minimax) falls back to raw');
 
+  // a TRUNCATED response silently dropped the tail of the dictation - treated as a
+  // failure so the RAW transcript wins (never inject a cut-off request).
+  const truncGemini = await cleanPrompt('summarize the whole plan end to end', { backend: 'gemini', geminiApiKey: 'k',
+    fetchImpl: (async () => ({ ok: true, status: 200, text: async () => '',
+      json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summarize the whole' }] }, finishReason: 'MAX_TOKENS' }] }) })) as unknown as typeof fetch });
+  t.eq(truncGemini.backend, 'raw-fallback', 'gemini finishReason MAX_TOKENS -> raw fallback (truncation is a failure)');
+  t.eq(truncGemini.text, 'summarize the whole plan end to end', 'the RAW transcript wins over a cut-off gemini cleanup');
+  const truncMinimax = await cleanPrompt('summarize the whole plan end to end', { backend: 'minimax', minimaxApiKey: 'k', minimaxGroupId: 'g',
+    fetchImpl: (async () => ({ ok: true, status: 200, text: async () => '',
+      json: async () => ({ base_resp: { status_code: 0 }, choices: [{ message: { content: 'Summarize the whole' }, finish_reason: 'length' }] }) })) as unknown as typeof fetch });
+  t.eq(truncMinimax.backend, 'raw-fallback', 'minimax finish_reason length -> raw fallback (truncation is a failure)');
+  t.eq(truncMinimax.text, 'summarize the whole plan end to end', 'the RAW transcript wins over a cut-off minimax cleanup');
+
   // a hung call aborts on the timeout and falls back to raw (AbortController).
   const hangFetch = ((_url: string, init: { signal?: AbortSignal }) => new Promise((_res, rej) => {
     init.signal?.addEventListener('abort', () => rej(new Error('aborted')));
@@ -2505,6 +2522,116 @@ await reporter.leg('dictation cleanup - guard/confirmation utterances are NEVER 
     t.eq(sends[1], 'go ahead', 'the confirmation is injected RAW (never a cleaned rewrite)');
     t.ok(!cleanCalls.includes('go ahead'), 'REGRESSION GUARD (D4): the cleanup LLM never saw the confirmation');
     t.eq(cleanCalls.length, 1, 'cleanup ran exactly once (command only, never the yes/no)');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// 4b) The SAME D4 invariant on the WEB server-STT path: public/app.js AUTO-SUBMITS a
+//     final voice transcript after guardUtterance (no human review step), so while a
+//     consequential confirmation is pending the transcript frame must carry the RAW
+//     words for the guard to classify. A normal (idle) transcript IS cleaned.
+await reporter.leg('dictation cleanup - web server-STT hands back RAW while a consequential confirmation is pending (D4)', async (t) => {
+  const cleanCalls: string[] = [];
+  const heard = ['merge the branch', 'go ahead'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 16000 }),
+    start: async () => {},
+    send: async () => {
+      const narration = 'Want me to merge and deploy it?';
+      return { reply: narration, narration, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 16000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const app = await createWebApp({
+    driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {},
+    sttLabel: 'mock-asr',
+    transcribe: async () => heard.shift() ?? '',
+    cleanPrompt: async (raw) => { cleanCalls.push(raw); return raw + ' [CLEANED]'; },
+  });
+  try {
+    const samplePcm = bytesToBase64(float32ToPcmS16le(new Float32Array(320).fill(0.05)));
+    const transcripts: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('web D4 WS timed out')); }, 8000);
+      const stt = (): void => {
+        client.send(JSON.stringify({ type: 'stt-audio', pcm: samplePcm, sampleRate: STT_SAMPLE_RATE }));
+        client.send(JSON.stringify({ type: 'stt-end' }));
+      };
+      client.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (m.type === 'hello') stt(); // idle, nothing pending -> cleanup applies
+        if (m.type === 'transcript') {
+          transcripts.push(String(m.text ?? ''));
+          if (transcripts.length === 1) client.send(JSON.stringify({ type: 'send', text: 'merge it' }));
+          if (transcripts.length === 2) { clearTimeout(timer); client.close(); resolve(); }
+        }
+        if (m.type === 'turn-done') stt(); // a consequential confirmation is now pending
+      });
+      client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+    t.eq(transcripts[0], 'merge the branch [CLEANED]', 'an idle transcript IS cleaned before it returns to the client');
+    t.ok(app.runner.awaitingConfirmation, 'the turn left a consequential confirmation pending');
+    t.eq(transcripts[1], 'go ahead', 'the confirmation-window transcript returns RAW (the client guard classifies the captain\'s words)');
+    t.ok(!cleanCalls.includes('go ahead'), 'REGRESSION GUARD (D4): the cleanup LLM never saw the confirmation utterance');
+    t.eq(cleanCalls.length, 1, 'cleanup ran exactly once (the idle transcript only)');
+  } finally {
+    await app.close();
+  }
+});
+
+// 4c) SPOKEN ORDER: per-utterance transcription/cleanup latencies differ (and the
+//     guard path skips cleanup entirely), so utterance processing is SERIALIZED -
+//     a fast second utterance must never overtake a slow first one into the runner.
+await reporter.leg('phone - utterances reach the runner in spoken order (serialized transcribe/cleanup)', async (t) => {
+  const events: string[] = [];
+  const sends: string[] = [];
+  const spoken: string[] = [];
+  const heard = ['first line', 'second line'];
+  const delayMs: Record<string, number> = { 'first line': 120, 'second line': 0 };
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: async (text) => {
+      sends.push(text);
+      return { reply: 'Done.', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => {
+      const v = heard.shift() ?? '';
+      events.push('start:' + v);
+      await new Promise((r) => setTimeout(r, delayMs[v] ?? 0));
+      events.push('end:' + v);
+      return v;
+    },
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZorder', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+
+    // Both utterances land back-to-back: the second's audio is fully buffered while
+    // the first's (slow) transcription is still running.
+    call.speakUtterance();
+    call.speakUtterance();
+    t.ok(await until(() => events.filter((e) => e.startsWith('end:')).length === 2), 'both utterances were transcribed');
+    t.eq(events.join(' | '), 'start:first line | end:first line | start:second line | end:second line',
+      'the second utterance WAITS for the first (processing is serialized, never interleaved)');
+    t.ok(await until(() => sends.length >= 1), 'the first turn ran');
+    t.includes(sends[0]!, 'first line', 'the FIRST spoken line reaches the runner first');
     call.close();
   } finally {
     await app.close();
