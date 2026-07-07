@@ -65,7 +65,7 @@ say "piper smoke test…"
 echo "ceo chat local voice is online." | \
   "$VOICE_DIR/piper/piper" --model "$VOICE_DIR/voices/${VOICE}.onnx" \
   --output_file "$VOICE_DIR/piper-smoke.wav" >/dev/null 2>&1 || { echo "piper smoke FAILED"; exit 1; }
-ls -l "$VOICE_DIR/piper-smoke.wav" | awk '{print "    piper wav bytes:", $5}'
+printf '    piper wav bytes: %s\n' "$(wc -c < "$VOICE_DIR/piper-smoke.wav")"
 
 if [ "${CEOCHAT_SKIP_WHISPER:-0}" = "1" ]; then
   say "skipping whisper (CEOCHAT_SKIP_WHISPER=1) — TTS-only setup done."
