@@ -3,8 +3,11 @@
 # speaks (and hears) real words on hub with NO external key and NO sudo.
 #
 #   - piper (rhasspy/piper) + an English voice model  -> real neural TTS read-aloud
-#   - whisper.cpp + ggml-tiny.en                       -> local STT (server fallback
+#   - whisper.cpp + ggml-base.en                       -> local STT (server fallback
 #                                                         + the round-trip e2e gate)
+#     (base.en is the dictation-upgrade default: materially fewer telephony misreads
+#      than tiny.en at ~2s/utterance on CPU. Override the model via
+#      CEOCHAT_WHISPER_MODEL_NAME=ggml-tiny.en.bin for the smaller/faster old model.)
 #
 # Everything lands OUTSIDE the repo in $CEOCHAT_VOICE_DIR (default
 # ~/.local/share/ceo-chat) so it persists across worktrees and is found by the
@@ -16,7 +19,7 @@
 # Paths the rest of the app probes (see src/tts/local-tts.ts, src/server/stt.ts):
 #   $VOICE_DIR/piper/piper
 #   $VOICE_DIR/voices/<voice>.onnx (+ .onnx.json)
-#   $VOICE_DIR/whisper/whisper-cli   $VOICE_DIR/whisper/ggml-tiny.en.bin
+#   $VOICE_DIR/whisper/whisper-cli   $VOICE_DIR/whisper/ggml-base.en.bin
 set -euo pipefail
 
 VOICE_DIR="${CEOCHAT_VOICE_DIR:-$HOME/.local/share/ceo-chat}"
@@ -27,7 +30,8 @@ VOICE_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/le
 CMAKE_VER="3.30.5"
 CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
 WHISPER_REPO="https://github.com/ggerganov/whisper.cpp"
-WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+WHISPER_MODEL="${CEOCHAT_WHISPER_MODEL_NAME:-ggml-base.en.bin}"
+WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL}"
 
 say() { printf '  · %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -61,7 +65,7 @@ say "piper smoke test…"
 echo "ceo chat local voice is online." | \
   "$VOICE_DIR/piper/piper" --model "$VOICE_DIR/voices/${VOICE}.onnx" \
   --output_file "$VOICE_DIR/piper-smoke.wav" >/dev/null 2>&1 || { echo "piper smoke FAILED"; exit 1; }
-ls -l "$VOICE_DIR/piper-smoke.wav" | awk '{print "    piper wav bytes:", $5}'
+printf '    piper wav bytes: %s\n' "$(wc -c < "$VOICE_DIR/piper-smoke.wav")"
 
 if [ "${CEOCHAT_SKIP_WHISPER:-0}" = "1" ]; then
   say "skipping whisper (CEOCHAT_SKIP_WHISPER=1) — TTS-only setup done."
@@ -100,11 +104,11 @@ else
   say "whisper-cli already present"
 fi
 
-# ---- whisper model ----
-if [ ! -f "$VOICE_DIR/whisper/ggml-tiny.en.bin" ]; then
-  say "downloading whisper ggml-tiny.en (~75MB)…"
-  curl -sSL -m 600 -o "$VOICE_DIR/whisper/ggml-tiny.en.bin" "$WHISPER_MODEL_URL"
-  say "model installed -> $VOICE_DIR/whisper/ggml-tiny.en.bin"
+# ---- whisper model (default base.en; the app falls back to an older tiny.en too) ----
+if [ ! -f "$VOICE_DIR/whisper/$WHISPER_MODEL" ]; then
+  say "downloading whisper $WHISPER_MODEL (base.en ~148MB)…"
+  curl -sSL -m 600 -o "$VOICE_DIR/whisper/$WHISPER_MODEL" "$WHISPER_MODEL_URL"
+  say "model installed -> $VOICE_DIR/whisper/$WHISPER_MODEL"
 else
   say "whisper model already present"
 fi

@@ -7,7 +7,7 @@
 //   2. the round-trip audio e2e gate (`npm run validate`): piper TTS -> this STT,
 //      proving the voice loop with REAL generated audio, headless, no creds.
 //
-// `bin/setup-local-voice.sh` builds whisper-cli + downloads ggml-tiny.en into
+// `bin/setup-local-voice.sh` builds whisper-cli + downloads ggml-base.en into
 // $CEOCHAT_VOICE_DIR. whisper.cpp requires 16 kHz mono WAV, so we resample with the
 // SAME pure helper the browser uses (src/web/pcm.js#downsampleFloat32) — one
 // resampler, asserted by the harness — then wrap the result in a WAV header.
@@ -26,21 +26,38 @@ export const WHISPER_SAMPLE_RATE = 16000;
 export interface Transcriber {
   /** Transcribe s16le mono PCM at `sampleRate` into text (best-effort, may be ''). */
   transcribe(pcm: Buffer, sampleRate: number): Promise<string>;
-  /** Human label for logs / the UI (e.g. "whisper.cpp tiny.en"). */
+  /** Human label for logs / the UI (e.g. "whisper.cpp base.en"). */
   readonly label: string;
 }
 
 export interface WhisperPaths {
   bin: string;
   model: string;
+  /** Short model name for the label/UI, e.g. "base.en" (from the resolved .bin). */
+  modelName: string;
 }
 
-/** Locate a built whisper-cli + model, honoring CEOCHAT_WHISPER_BIN/_MODEL. */
+/** Short model name from a ggml path: ".../ggml-base.en.bin" -> "base.en". */
+function modelLabel(modelPath: string): string {
+  const base = modelPath.replace(/^.*[\\/]/, '').replace(/^ggml-/, '').replace(/\.bin$/, '');
+  return base || 'model';
+}
+
+/**
+ * Locate a built whisper-cli + model, honoring CEOCHAT_WHISPER_BIN/_MODEL. The default
+ * model is `base.en` (decision D1 - materially fewer telephony misreads than the old
+ * tiny.en at ~2s/utterance), but an existing install that only has tiny.en still works:
+ * we fall back to it so a stale voice dir is not silently STT-less until `npm run voice`.
+ */
 export function findWhisper(dir: string = voiceDir()): WhisperPaths | null {
   const bin = process.env.CEOCHAT_WHISPER_BIN || join(dir, 'whisper', 'whisper-cli');
-  const model = process.env.CEOCHAT_WHISPER_MODEL || join(dir, 'whisper', 'ggml-tiny.en.bin');
-  if (!existsSync(bin) || !existsSync(model)) return null;
-  return { bin, model };
+  if (!existsSync(bin)) return null;
+  const candidates = process.env.CEOCHAT_WHISPER_MODEL
+    ? [process.env.CEOCHAT_WHISPER_MODEL]
+    : [join(dir, 'whisper', 'ggml-base.en.bin'), join(dir, 'whisper', 'ggml-tiny.en.bin')];
+  const model = candidates.find((p) => existsSync(p));
+  if (!model) return null;
+  return { bin, model, modelName: modelLabel(model) };
 }
 
 // whisper.cpp prints one line per audio segment to stdout (with -nt = no timestamps).
@@ -68,7 +85,7 @@ export function makeWhisperTranscriber(opts: WhisperOptions = {}): Transcriber |
   const log = opts.log ?? (() => {});
   const timeoutMs = opts.timeoutMs ?? 60000;
   return {
-    label: 'whisper.cpp tiny.en',
+    label: 'whisper.cpp ' + paths.modelName,
     transcribe(pcm: Buffer, sampleRate: number): Promise<string> {
       // Resample to 16 kHz mono (whisper's required rate) with the shared pure helper.
       const f32 = pcmS16leToFloat32(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));

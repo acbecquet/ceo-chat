@@ -18,7 +18,14 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, minimaxVoiceId, type Secrets } from '../src/config/secrets.ts';
+import {
+  loadSecrets, has, hasMinimaxCreds, hasGeminiCreds, minimaxVoiceId,
+  cleanupConfig, sttEngine, type Secrets,
+} from '../src/config/secrets.ts';
+import {
+  cleanPrompt, mockCleanup, sanitizeCleaned, resolveCleanup, makePromptCleaner,
+  geminiCleanupRequestBody, minimaxCleanupRequestBody, CLEANUP_SYSTEM_PROMPT,
+} from '../src/stt/cleanup.ts';
 import {
   parseTranscript, tailTranscript, latestTranscriptIn, type TranscriptEvent,
   findPromptAnchor, saysAfterAnchor, toolUseAfterAnchor, latestTranscriptWithPrompt,
@@ -2333,6 +2340,324 @@ await reporter.leg('phone - interactive prompt: re-ask once, then the safe defau
     await b.app.close();
   }
 });
+
+// ─────────────── dictation cleanup (Wispr-Flow-style) — report ceochat-stt-w4 ───────
+// The LLM cleanup pass: raw ASR transcript -> a cleaned, well-formed prompt, with a
+// HARD raw fallback. Deterministic mock legs are the gate (no network, no creds).
+
+// 1) The offline contract: mockCleanup fixes obvious misreads, punctuates, removes
+//    fillers, and NEVER changes meaning / drops a specific; sanitizeCleaned enforces the
+//    single-line/no-markdown/no-ballooning invariants.
+await reporter.leg('dictation cleanup - mock contract + sanitize (deterministic)', (t) => {
+  const a = mockCleanup('merge the speakability pole request into main');
+  t.includes(a.toLowerCase(), 'pull request', 'fixes "pole request" -> "pull request"');
+  t.notIncludes(a.toLowerCase(), 'pole request', 'the misread is gone');
+  t.ok(/[.?!]$/.test(a), 'terminal punctuation added', a);
+  t.ok(/^[A-Z]/.test(a), 'sentence-cased', a);
+
+  const b = mockCleanup('text me when see eye is green');
+  t.includes(b, 'CI', 'fixes "see eye" -> "CI"');
+  const idiom = mockCleanup('we do not see eye to eye on this');
+  t.includes(idiom.toLowerCase(), 'see eye to eye', 'the idiom "see eye to eye" is never corrupted by the CI fix');
+
+  // filler removal + immediate-repeat collapse, still one line, meaning intact.
+  const c = mockCleanup('um so bump the the whisper model uh to base');
+  t.notIncludes(c.toLowerCase(), ' um ', 'drops the "um" filler');
+  t.notIncludes(c.toLowerCase(), 'the the', 'collapses the doubled word');
+  t.includes(c.toLowerCase(), 'whisper model', 'keeps the real request');
+  t.eq(c.split('\n').length, 1, 'output is a single line');
+
+  // INVARIANT: a specific the speaker said (a number/flag) is never dropped.
+  const d = mockCleanup('run validate with 6 threads and the --live flag');
+  t.includes(d, '6', 'a number specific survives');
+  t.includes(d, '--live', 'a flag specific survives');
+
+  // sanitize: flatten newlines, strip backticks/quotes; reject a ballooned hallucination.
+  t.eq(sanitizeCleaned('`merge` the\nPR', 'merge the pr'), 'merge the PR', 'newlines flattened, backticks stripped');
+  t.eq(sanitizeCleaned('"just this"', 'just this'), 'just this', 'wrapping quotes stripped');
+  t.eq(sanitizeCleaned('"foo" and "bar"', 'foo and bar'), '"foo" and "bar"', 'two separate quoted terms are never mangled');
+  t.eq(sanitizeCleaned('"mismatched pair\'', 'mismatched pair'), '"mismatched pair\'', 'a mismatched quote pair is never stripped');
+  t.eq(sanitizeCleaned('', 'hi'), null, 'empty output -> null (caller keeps raw)');
+  const balloon = 'merge the pr and also deploy and also write docs and also refactor everything and rewrite the readme and add tests and update the changelog and notify the team and schedule a meeting';
+  t.eq(sanitizeCleaned(balloon, 'merge the pr'), null, 'a wildly expanded output -> null (raw fallback guard)');
+});
+
+// 2) Request bodies + backend/config selection (pure).
+await reporter.leg('dictation cleanup - request bodies + selection + config (pure)', (t) => {
+  const g = geminiCleanupRequestBody('fix the pole request') as {
+    generationConfig: { thinkingConfig: { thinkingBudget: number }; maxOutputTokens: number };
+    contents: Array<{ parts: Array<{ text: string }> }>;
+  };
+  t.eq(g.generationConfig.thinkingConfig.thinkingBudget, 0, 'gemini body disables thinking (thinkingBudget:0)');
+  t.eq(g.generationConfig.maxOutputTokens, 200, 'gemini maxOutputTokens:200');
+  t.includes(g.contents[0]!.parts[0]!.text, CLEANUP_SYSTEM_PROMPT, 'system contract folded into the prompt');
+  t.includes(g.contents[0]!.parts[0]!.text, 'fix the pole request', 'transcript included');
+
+  const m = minimaxCleanupRequestBody('fix the pole request') as {
+    model: string; messages: Array<{ role: string; content: string }>;
+  };
+  t.eq(m.model, 'MiniMax-Text-01', 'minimax model set');
+  t.eq(m.messages[0]!.role, 'system', 'minimax system message first');
+  t.includes(m.messages[1]!.content, 'fix the pole request', 'minimax user message carries the transcript');
+
+  // resolveCleanup: mode gate x backend precedence (D2/D3).
+  t.eq(resolveCleanup({ mode: 'off', backendPref: 'gemini', forceMock: false, hasGemini: true, hasMinimax: true }).enabled, false, 'mode off -> disabled');
+  t.eq(resolveCleanup({ mode: 'on', backendPref: 'gemini', forceMock: false, hasGemini: false, hasMinimax: false }).enabled, true, 'mode on -> enabled even with no key (mock)');
+  t.eq(resolveCleanup({ mode: 'auto', backendPref: 'gemini', forceMock: false, hasGemini: true, hasMinimax: false }).backend, 'gemini', 'auto + gemini key -> gemini (default)');
+  t.eq(resolveCleanup({ mode: 'auto', backendPref: 'gemini', forceMock: false, hasGemini: false, hasMinimax: true }).backend, 'minimax', 'auto + only minimax -> minimax');
+  t.eq(resolveCleanup({ mode: 'auto', backendPref: 'minimax', forceMock: false, hasGemini: true, hasMinimax: true }).backend, 'minimax', 'backend pref minimax honored when its key exists');
+  t.eq(resolveCleanup({ mode: 'auto', backendPref: 'gemini', forceMock: false, hasGemini: false, hasMinimax: false }).enabled, false, 'auto + no key -> disabled (today\'s raw behavior)');
+  t.eq(resolveCleanup({ mode: 'auto', backendPref: 'gemini', forceMock: true, hasGemini: false, hasMinimax: false }).backend, 'mock', 'forceMock -> deterministic mock backend');
+
+  // makePromptCleaner: null when disabled, a cleaner (+backend) when enabled.
+  t.eq(makePromptCleaner({ mode: 'off', backendPref: 'gemini', forceMock: false }), null, 'disabled -> null (no cleaner injected)');
+  const built = makePromptCleaner({ mode: 'auto', backendPref: 'gemini', forceMock: false, geminiApiKey: 'k' });
+  t.ok(built != null && built.backend === 'gemini', 'auto + gemini key -> a gemini cleaner');
+  t.eq(makePromptCleaner({ mode: 'auto', backendPref: 'gemini', forceMock: false })?.backend ?? 'none', 'none', 'auto + no key -> null');
+
+  // config parsing over an env map.
+  t.eq(sttEngine({}), 'whisper-local', 'STT engine defaults to whisper-local');
+  t.eq(sttEngine({ CEOCHAT_STT_ENGINE: 'deepgram' }), 'deepgram', 'reserved engine name parses');
+  t.eq(sttEngine({ CEOCHAT_STT_ENGINE: 'bogus' }), 'whisper-local', 'unknown engine -> whisper-local');
+  t.eq(cleanupConfig({}).mode, 'auto', 'cleanup mode defaults to auto');
+  t.eq(cleanupConfig({ CEOCHAT_STT_CLEANUP: 'off' }).mode, 'off', 'cleanup mode off parses');
+  t.eq(cleanupConfig({ CEOCHAT_STT_CLEANUP_BACKEND: 'minimax' }).backendPref, 'minimax', 'cleanup backend pref parses');
+  t.eq(cleanupConfig({ CEOCHAT_STT_CLEANUP_TIMEOUT_MS: '900' }).timeoutMs, 900, 'cleanup timeout parses');
+});
+
+// 3) FAIL-SAFE: the cleanup call NEVER throws and NEVER blocks - any error/timeout/
+//    sanity failure returns the RAW transcript (report §4.4). Faked HTTP, no network.
+await reporter.leg('dictation cleanup - fail-safe returns raw, never blocks', async (t) => {
+  const okFetch = (async (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { contents: Array<{ parts: Array<{ text: string }> }> };
+    t.includes(body.contents[0]!.parts[0]!.text, 'DICTATED TRANSCRIPT', 'transcript labeled in the gemini prompt');
+    return { ok: true, status: 200, text: async () => '',
+      json: async () => ({ candidates: [{ content: { parts: [{ text: 'Merge the pull request into main.' }] } }] }) };
+  }) as unknown as typeof fetch;
+  const good = await cleanPrompt('merge the pole request into main', { backend: 'gemini', geminiApiKey: 'k', fetchImpl: okFetch });
+  t.eq(good.backend, 'gemini', 'gemini cleaned the transcript');
+  t.eq(good.text, 'Merge the pull request into main.', 'the cleaned prompt is returned');
+
+  const err = await cleanPrompt('merge the pole request', { backend: 'gemini', geminiApiKey: 'k',
+    fetchImpl: (async () => { throw new Error('network down'); }) as unknown as typeof fetch });
+  t.eq(err.backend, 'raw-fallback', 'a network error falls back');
+  t.eq(err.text, 'merge the pole request', 'the RAW transcript is returned on failure (never blocks)');
+
+  const non200 = await cleanPrompt('do the thing', { backend: 'minimax', minimaxApiKey: 'k', minimaxGroupId: 'g',
+    fetchImpl: (async () => ({ ok: false, status: 429, text: async () => 'rate limited', json: async () => ({}) })) as unknown as typeof fetch });
+  t.eq(non200.text, 'do the thing', 'a non-200 (minimax) falls back to raw');
+
+  // a TRUNCATED response silently dropped the tail of the dictation - treated as a
+  // failure so the RAW transcript wins (never inject a cut-off request).
+  const truncGemini = await cleanPrompt('summarize the whole plan end to end', { backend: 'gemini', geminiApiKey: 'k',
+    fetchImpl: (async () => ({ ok: true, status: 200, text: async () => '',
+      json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summarize the whole' }] }, finishReason: 'MAX_TOKENS' }] }) })) as unknown as typeof fetch });
+  t.eq(truncGemini.backend, 'raw-fallback', 'gemini finishReason MAX_TOKENS -> raw fallback (truncation is a failure)');
+  t.eq(truncGemini.text, 'summarize the whole plan end to end', 'the RAW transcript wins over a cut-off gemini cleanup');
+  const truncMinimax = await cleanPrompt('summarize the whole plan end to end', { backend: 'minimax', minimaxApiKey: 'k', minimaxGroupId: 'g',
+    fetchImpl: (async () => ({ ok: true, status: 200, text: async () => '',
+      json: async () => ({ base_resp: { status_code: 0 }, choices: [{ message: { content: 'Summarize the whole' }, finish_reason: 'length' }] }) })) as unknown as typeof fetch });
+  t.eq(truncMinimax.backend, 'raw-fallback', 'minimax finish_reason length -> raw fallback (truncation is a failure)');
+  t.eq(truncMinimax.text, 'summarize the whole plan end to end', 'the RAW transcript wins over a cut-off minimax cleanup');
+
+  // a hung call aborts on the timeout and falls back to raw (AbortController).
+  const hangFetch = ((_url: string, init: { signal?: AbortSignal }) => new Promise((_res, rej) => {
+    init.signal?.addEventListener('abort', () => rej(new Error('aborted')));
+  })) as unknown as typeof fetch;
+  const timedOut = await cleanPrompt('slow one', { backend: 'gemini', geminiApiKey: 'k', timeoutMs: 20, fetchImpl: hangFetch });
+  t.eq(timedOut.text, 'slow one', 'a hung cleanup times out and returns raw');
+
+  // empty transcript is a no-op (never even calls out).
+  const empty = await cleanPrompt('   ', { backend: 'gemini', geminiApiKey: 'k',
+    fetchImpl: (async () => { throw new Error('should not be called'); }) as unknown as typeof fetch });
+  t.eq(empty.backend, 'noop', 'empty input is a no-op');
+});
+
+// 4) SAFETY (decision D4): a consequential CONFIRMATION utterance NEVER passes through
+//    the cleanup LLM - it is classified on the RAW transcript. A normal command IS
+//    cleaned. Driven over the real phone WS with a cleanPrompt spy.
+await reporter.leg('dictation cleanup - guard/confirmation utterances are NEVER cleaned (D4)', async (t) => {
+  const sends: string[] = [];
+  const spoken: string[] = [];
+  const cleanCalls: string[] = [];
+  const heard = ['merge the branch', 'go ahead'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: async (text) => {
+      sends.push(text);
+      // The command turn asks a consequential question; the confirmation turn does not.
+      const narration = text.includes('[CLEANED]') ? 'Want me to merge and deploy it?' : 'Done.';
+      return { reply: narration, narration, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => heard.shift() ?? '',
+    cleanPrompt: async (raw) => { cleanCalls.push(raw); return raw + ' [CLEANED]'; },
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZclean', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+
+    // a normal command IS cleaned before injection.
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 1 && !runner.busy), 'the command turn ran');
+    t.eq(sends[0], 'merge the branch [CLEANED]', 'a normal command is CLEANED before it reaches the runner');
+    t.ok(cleanCalls.includes('merge the branch'), 'cleanup ran on the command');
+    t.ok(await until(() => runner.awaitingConfirmation), 'now awaiting a consequential confirmation');
+
+    // the confirmation answer is NOT cleaned - it is classified/injected RAW.
+    call.speakUtterance();
+    t.ok(await until(() => sends.length === 2), 'the confirmation reached the runner');
+    t.eq(sends[1], 'go ahead', 'the confirmation is injected RAW (never a cleaned rewrite)');
+    t.ok(!cleanCalls.includes('go ahead'), 'REGRESSION GUARD (D4): the cleanup LLM never saw the confirmation');
+    t.eq(cleanCalls.length, 1, 'cleanup ran exactly once (command only, never the yes/no)');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// 4b) The SAME D4 invariant on the WEB server-STT path: public/app.js AUTO-SUBMITS a
+//     final voice transcript after guardUtterance (no human review step), so while a
+//     consequential confirmation is pending the transcript frame must carry the RAW
+//     words for the guard to classify. A normal (idle) transcript IS cleaned.
+await reporter.leg('dictation cleanup - web server-STT hands back RAW while a consequential confirmation is pending (D4)', async (t) => {
+  const cleanCalls: string[] = [];
+  const heard = ['merge the branch', 'go ahead'];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 16000 }),
+    start: async () => {},
+    send: async () => {
+      const narration = 'Want me to merge and deploy it?';
+      return { reply: narration, narration, speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 16000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const app = await createWebApp({
+    driver, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {},
+    sttLabel: 'mock-asr',
+    transcribe: async () => heard.shift() ?? '',
+    cleanPrompt: async (raw) => { cleanCalls.push(raw); return raw + ' [CLEANED]'; },
+  });
+  try {
+    const samplePcm = bytesToBase64(float32ToPcmS16le(new Float32Array(320).fill(0.05)));
+    const transcripts: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+      const timer = setTimeout(() => { try { client.close(); } catch { /* ignore */ } reject(new Error('web D4 WS timed out')); }, 8000);
+      const stt = (): void => {
+        client.send(JSON.stringify({ type: 'stt-audio', pcm: samplePcm, sampleRate: STT_SAMPLE_RATE }));
+        client.send(JSON.stringify({ type: 'stt-end' }));
+      };
+      client.on('message', (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (m.type === 'hello') stt(); // idle, nothing pending -> cleanup applies
+        if (m.type === 'transcript') {
+          transcripts.push(String(m.text ?? ''));
+          if (transcripts.length === 1) client.send(JSON.stringify({ type: 'send', text: 'merge it' }));
+          if (transcripts.length === 2) { clearTimeout(timer); client.close(); resolve(); }
+        }
+        if (m.type === 'turn-done') stt(); // a consequential confirmation is now pending
+      });
+      client.on('error', (e: Error) => { clearTimeout(timer); reject(e); });
+    });
+    t.eq(transcripts[0], 'merge the branch [CLEANED]', 'an idle transcript IS cleaned before it returns to the client');
+    t.ok(app.runner.awaitingConfirmation, 'the turn left a consequential confirmation pending');
+    t.eq(transcripts[1], 'go ahead', 'the confirmation-window transcript returns RAW (the client guard classifies the captain\'s words)');
+    t.ok(!cleanCalls.includes('go ahead'), 'REGRESSION GUARD (D4): the cleanup LLM never saw the confirmation utterance');
+    t.eq(cleanCalls.length, 1, 'cleanup ran exactly once (the idle transcript only)');
+  } finally {
+    await app.close();
+  }
+});
+
+// 4c) SPOKEN ORDER: per-utterance transcription/cleanup latencies differ (and the
+//     guard path skips cleanup entirely), so utterance processing is SERIALIZED -
+//     a fast second utterance must never overtake a slow first one into the runner.
+await reporter.leg('phone - utterances reach the runner in spoken order (serialized transcribe/cleanup)', async (t) => {
+  const events: string[] = [];
+  const sends: string[] = [];
+  const spoken: string[] = [];
+  const heard = ['first line', 'second line'];
+  const delayMs: Record<string, number> = { 'first line': 120, 'second line': 0 };
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: async (text) => {
+      sends.push(text);
+      return { reply: 'Done.', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 };
+    },
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const phone = createPhoneApp({
+    runner, secrets: PHONE_TEST_SECRETS, publicUrl: PHONE_PUBLIC_URL,
+    transcribe: async () => {
+      const v = heard.shift() ?? '';
+      events.push('start:' + v);
+      await new Promise((r) => setTimeout(r, delayMs[v] ?? 0));
+      events.push('end:' + v);
+      return v;
+    },
+    synthPrompt: async (text) => { spoken.push(text); return { pcm: Buffer.alloc(0), sampleRate: 8000 }; },
+    log: () => {},
+  });
+  const app = await createWebApp({ driver, runner, phone, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const twiml = await postTwiml(app.url, { From: PHONE_TEST_SECRETS.allowedCaller!, To: PHONE_TEST_SECRETS.phoneNumber! });
+    const call = await connectPhoneClient(app.port);
+    call.send({ event: 'start', start: { streamSid: 'MZorder', customParameters: { token: tokenFromTwiml(twiml.body) } } });
+    for (const d of PHONE_TEST_SECRETS.pin!) call.send({ event: 'dtmf', dtmf: { digit: d } });
+    await until(() => spoken.includes(DEFAULT_PHRASES.greeting));
+
+    // Both utterances land back-to-back: the second's audio is fully buffered while
+    // the first's (slow) transcription is still running.
+    call.speakUtterance();
+    call.speakUtterance();
+    t.ok(await until(() => events.filter((e) => e.startsWith('end:')).length === 2), 'both utterances were transcribed');
+    t.eq(events.join(' | '), 'start:first line | end:first line | start:second line | end:second line',
+      'the second utterance WAITS for the first (processing is serialized, never interleaved)');
+    t.ok(await until(() => sends.length >= 1), 'the first turn ran');
+    t.includes(sends[0]!, 'first line', 'the FIRST spoken line reaches the runner first');
+    call.close();
+  } finally {
+    await app.close();
+  }
+});
+
+// 5) LIVE (quality report, never a gate): the SAME cleanup contract against real
+//    Gemini/MiniMax. Non-deterministic -> a miss is PENDING, never red. Needs a key.
+if (LIVE) {
+  await reporter.leg('live - dictation cleanup fixes real ASR misreads', async (t) => {
+    const secrets = loadSecrets();
+    const geminiKey = has(secrets, 'GEMINI_API_KEY') ? secrets.GEMINI_API_KEY : '';
+    if (!geminiKey) { t.pending('no GEMINI_API_KEY paired - live cleanup skipped'); return; }
+    const raw = 'merge the speakability pole request into main and text me when see eye is green';
+    const r = await cleanPrompt(raw, { backend: 'gemini', geminiApiKey: geminiKey });
+    const out = r.text.toLowerCase();
+    if (r.backend === 'raw-fallback') { t.pending('gemini cleanup fell back to raw: ' + r.text); return; }
+    const fixedPr = out.includes('pull request');
+    const fixedCi = /\bci\b/.test(out);
+    if (fixedPr && fixedCi) {
+      t.ok(true, 'real Gemini fixed "pole request"->"pull request" and "see eye"->"CI"', r.text);
+    } else {
+      t.pending('gemini output did not fix both misreads (non-deterministic): ' + r.text);
+    }
+  });
+}
 
 // F2 (pure) - REAL-only progress rendering: describeToolUse turns a tool_use event into
 // a short, screen-safe spoken line reflecting ACTUAL activity (never generic), or null

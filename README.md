@@ -71,7 +71,8 @@ npm run dev -- --mock "tell me the tests passed and ask if I should merge"   # C
 
 `npm run voice` lands everything **outside the repo** in `$CEOCHAT_VOICE_DIR`
 (default `~/.local/share/ceo-chat`): the piper binary + an English voice, and a
-static whisper.cpp + `ggml-tiny.en`. It's sudo-free and idempotent. Without it the
+static whisper.cpp + `ggml-base.en` (an older tiny.en-only install still works -
+the app falls back to it). It's sudo-free and idempotent. Without it the
 app still runs (mock synthetic tone for TTS, text input for STT) and `validate` stays
 green — the real-audio leg just reports PENDING.
 
@@ -144,7 +145,8 @@ insets, ≥44px targets). Open the printed URL and you get:
   driven off real pipeline stages;
 - **hands-free voice input** — robust `webkitSpeechRecognition` (re-armed for iOS),
   with a **server-side whisper STT fallback** when the browser path is unavailable;
-  the composer is always there too;
+  server-transcribed speech gets the **dictation cleanup** pass (see below) before it
+  is handed back; the composer is always there too;
 - a **tools sheet** (⋯) holding the **live terminal view** of the target agent pane —
   your real first mate in attach mode, else the dedicated `ceo-chat` session (xterm.js,
   fed colour-preserving `capture-pane` snapshots over the WebSocket), plus the
@@ -266,6 +268,10 @@ the web app is the **in-call companion** showing the exact reply text.
   lost (if the agent won't interrupt, it runs right after). Steering is same-source
   only: the phone never cancels or rewrites a web/SMS-started turn - spoken lines
   queue in spoken order and run right after it.
+- **Spoken requests arrive clean:** each utterance is transcribed locally (whisper
+  `base.en`) and run through the dictation cleanup pass (next section) before it is
+  injected - while a consequential yes/no confirmation always bypasses the cleanup
+  LLM and is classified on your raw words.
 
 Call Mode mounts only when `CEOCHAT_ALLOWED_CALLER` + `CEOCHAT_PHONE_PIN` are in
 `~/.config/ceo-chat/secrets.env`; outbound "Call me" also needs the
@@ -274,6 +280,31 @@ setup checklist, usage, security model, and per-minute cost live in
 [`docs/call-mode.md`](./docs/call-mode.md). Everything is proven against a **mock Media
 Streams client** with no Twilio account (see the harness below); the end-to-end call
 over a real number is the remaining captain-gated live test.
+
+## Dictation cleanup - spoken words arrive as a clean prompt
+
+Server-transcribed speech - a phone-call utterance or the web app's server-STT
+fallback - runs through a **Wispr-Flow-style dictation cleanup**
+([`src/stt/cleanup.ts`](./src/stt/cleanup.ts)) before it reaches first mate:
+one fast LLM call fixes obvious speech-to-text misreads ("pole request" →
+"pull request"), drops filler, and reshapes rambling speech into the request you
+meant - never adding, dropping, or changing a specific.
+It can never stall a live call: on any error, timeout, or suspect output (empty,
+ballooned, or truncated) the RAW transcript is injected instead.
+And a consequential **yes/no confirmation always bypasses the cleanup LLM** - it is
+classified on your raw words, so a model can never turn a "no" into a "yes".
+The local whisper model is now **`base.en`** (materially fewer telephony misreads
+than the old tiny.en, at ~2s/utterance on CPU).
+
+Backends: **Gemini Flash** by default (the same free-tier `GEMINI_API_KEY`
+speakability uses), MiniMax configurable (spends credits), plus a deterministic
+offline mock the harness asserts.
+All config is optional, set in `secrets.env` or the environment:
+`CEOCHAT_STT_CLEANUP` (`auto` default - on iff a cleanup key exists; `on`; `off`),
+`CEOCHAT_STT_CLEANUP_BACKEND` (`gemini` | `minimax`), and
+`CEOCHAT_STT_CLEANUP_TIMEOUT_MS` (default 1500).
+`CEOCHAT_STT_ENGINE` is a reserved name for future cloud transcription engines -
+only `whisper-local` is wired today.
 
 ## Text Mode - SMS/MMS to first mate on the same number
 
@@ -346,6 +377,7 @@ It covers:
 | **Speakability drift** | root cause (sentence fragments lose context, topic blocks keep it) · `runStreamingPipeline` summarizes blocks with the reply-so-far as context · mock-contract summaries cover every topic, name the recommended option, strip paths/URLs/PIDs (real reply-shape fixtures); `validate:live` adds a real-Gemini quality report (PENDING, never red) |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
+| **Dictation cleanup (STT)** | mock contract + sanitize (ASR fixes like "pole request"→"pull request", filler/repeat removal, single line; empty or ballooned output rejected → raw) · request bodies + backend/config selection (`thinkingBudget:0`, `auto`/`on`/`off`, gemini default / minimax) · fail-safe (error / non-200 / timeout / empty / truncated all return the RAW transcript, never a throw) · **D4 guard-safety over the real phone WS and the web WS** (a normal command IS cleaned; a consequential confirmation is injected / handed back raw and the cleanup LLM is never called) · spoken-order serialization (a fast second utterance never overtakes a slow first) · `validate:live` adds a real-Gemini cleanup quality report (PENDING without a key) |
 | **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort (both **ownership-gated**: only a phone-sourced turn; a web/SMS turn survives, as does a foreign turn on a web `stop`) · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **human-call UX** (single thinking-filler per turn, one-shot, cancelled by real audio · real-only progress: throttle / no repeats / silence when nothing new / yields to reply audio · attach-and-reinterpret: merge + interrupt + re-run, source-aware framing, same-source-only, foreign-busy FIFO in spoken order with per-item budgets, barge-in pin, unwind-window attach) · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
 | **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary and is FORCED by any truncation; one-line inject incl. the partial-MMS `WARNING`; ordinal failure naming; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only, the failure note leads the SMS reply) · follow-up steering (a second text attaches + re-runs the in-flight SMS turn; a superseded turn sends NO spurious failure text while a genuine failure still texts; a superseded MMS turn's failure note is carried forward) · notify gates (bad token 403, config-off 404, REST framing) |
 
@@ -412,10 +444,15 @@ npm run dev -- --mock "..."       # force the fully-offline path (mock TTS + spe
    # optional — speak in YOUR OWN cloned voice (register it via `npm run clone-voice`;
    # see docs/voice-clone.md). Unset → MiniMax's default system voice:
    MINIMAX_VOICE_ID=...
-   # optional — the PREFERRED speakability backend (fast, free-tier, no Anthropic key):
+   # optional — the PREFERRED speakability backend AND the default dictation-cleanup
+   # backend (fast, free-tier, no Anthropic key):
    GEMINI_API_KEY=...
    # optional — switches speakability to the Anthropic Messages API:
    ANTHROPIC_API_KEY=...
+   # optional - dictation cleanup tuning (defaults shown; see "Dictation cleanup"):
+   # CEOCHAT_STT_CLEANUP=auto            # on iff a cleanup key exists; or on|off
+   # CEOCHAT_STT_CLEANUP_BACKEND=gemini  # or minimax (spends credits)
+   # CEOCHAT_STT_CLEANUP_TIMEOUT_MS=1500
    # optional - Call Mode (the Twilio phone leg) adds TWILIO_ACCOUNT_SID /
    # TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER + CEOCHAT_ALLOWED_CALLER +
    # CEOCHAT_PHONE_PIN - see docs/call-mode.md
@@ -460,6 +497,7 @@ src/
   transcript/transcript.ts JSONL tap (normalize/parse/tail; prompt-anchored resolution)
   transcript/reply.ts      reply-wait latch + incremental streamReply (injectable, regression-guarded)
   speakability/            rewrite-for-the-ear (gemini | anthropic-api | claude-cli | mock)
+  stt/cleanup.ts           Wispr-Flow dictation cleanup: raw ASR transcript -> clean prompt (raw fallback)
   tts/minimax.ts           MiniMax streaming TTS client (+ WAV codec; cloned voice_id support)
   tts/voice-clone.ts       register the captain's OWN cloned voice (npm run clone-voice)
   tts/local-tts.ts         LOCAL piper neural voice — the default offline TTS

@@ -40,8 +40,9 @@ import { makeTranscriptVerbatim, resolveBrokerProjectDir } from './verbatim.ts';
 import { makeTranscriptActivity } from './activity.ts';
 import {
   loadSecrets, hasMinimaxCreds, minimaxVoiceId, phoneSecrets, phoneCapabilities,
-  textCapabilities, textNotifyEnabled,
+  textCapabilities, textNotifyEnabled, cleanupConfig, sttEngine,
 } from '../config/secrets.ts';
+import { makePromptCleaner } from '../stt/cleanup.ts';
 import { synthStreaming, INTL_WS } from '../tts/minimax.ts';
 import { findPiper, synthLocal } from '../tts/local-tts.ts';
 
@@ -60,6 +61,34 @@ const driver = new BrokerDriver(broker);
 // the browser's own Web Speech is the primary path either way. The phone leg uses
 // the SAME transcriber for the captain's call audio.
 const transcriber = forceMock ? null : makeWhisperTranscriber({ log });
+
+// STT/cleanup config reads secrets.env AND the process env (env wins) - one merged
+// map so CEOCHAT_* set in either place is honored consistently.
+const configEnv = { ...secrets, ...process.env };
+
+// A reserved config name for future pluggable engines (decision D1). Only whisper-local
+// is wired today; a request for another engine is honored as a no-op with a clear note.
+const engine = sttEngine(configEnv);
+if (engine !== 'whisper-local') {
+  log(`CEOCHAT_STT_ENGINE=${engine} is reserved but not yet available - using whisper-local`);
+}
+
+// Dictation cleanup (report ceochat-stt-w4 §4): raw ASR transcript -> cleaned prompt via
+// one fast LLM call, with a HARD raw fallback so it can never block. Gemini is the
+// default backend, MiniMax is configurable; null when disabled (mode off, or auto with
+// no cleanup key = today's raw behavior). Shared by the phone leg and the web STT path.
+const cleanupCfg = cleanupConfig(configEnv);
+const cleaner = makePromptCleaner({
+  mode: cleanupCfg.mode,
+  backendPref: cleanupCfg.backendPref,
+  forceMock,
+  geminiApiKey: secrets.GEMINI_API_KEY,
+  minimaxApiKey: secrets.MINIMAX_API_KEY,
+  minimaxGroupId: secrets.MINIMAX_GROUP_ID,
+  timeoutMs: cleanupCfg.timeoutMs,
+  log,
+});
+const cleanPrompt = cleaner ? cleaner.clean : undefined;
 
 const attached = broker.isAttached();
 
@@ -126,6 +155,7 @@ if (phoneCaps.inbound) {
   phone = createPhoneApp({
     runner,
     transcribe: transcriber ? (pcm, sr) => transcriber.transcribe(pcm, sr) : undefined,
+    cleanPrompt,
     synthPrompt: makePromptSynth(),
     activity,
     secrets: phoneCfg,
@@ -156,6 +186,7 @@ const ttsLine =
 console.log('ceo-chat - web interface to firstmate');
 console.log(`TTS: ${ttsLine}`);
 console.log(`STT fallback: ${transcriber ? transcriber.label + ' (server-side)' : 'browser Web Speech only'}`);
+console.log(`STT cleanup: ${cleaner ? cleaner.backend + ` (${cleanupCfg.mode})` : `off (${cleanupCfg.mode})`}`);
 console.log(`speakability backend: ${broker.speakBackendHint()}`);
 console.log(`target: ${broker.targetLabel()}`);
 console.log(phone
@@ -178,6 +209,7 @@ try {
     text: text ?? undefined,
     log,
     transcribe: transcriber ? (pcm, sr) => transcriber.transcribe(pcm, sr) : undefined,
+    cleanPrompt,
     sttLabel: transcriber ? transcriber.label : '',
   });
 } catch (e) {

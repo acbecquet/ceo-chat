@@ -133,3 +133,38 @@ export function textNotifyEnabled(secrets: Secrets): boolean {
   const v = (secrets.CEOCHAT_TEXT_NOTIFY || '').trim().toLowerCase();
   return !(v === '0' || v === 'false' || v === 'off');
 }
+
+// ── Dictation upgrade (STT engine + LLM cleanup pass — report ceochat-stt-w4) ────
+
+export type SttEngine = 'whisper-local' | 'gemini-audio' | 'deepgram';
+
+// Which transcription engine drives STT. Only 'whisper-local' is wired today; the
+// other two are RESERVED pluggable engines (decision D1) so the config name is stable
+// for a future build. Anything unknown/absent resolves to 'whisper-local' (today's
+// behavior). Reads a plain env-like map so `npm run validate` can assert it purely.
+export function sttEngine(env: Record<string, string | undefined>): SttEngine {
+  const v = (env.CEOCHAT_STT_ENGINE || '').trim().toLowerCase();
+  return v === 'gemini-audio' || v === 'deepgram' ? v : 'whisper-local';
+}
+
+export interface CleanupConfig {
+  mode: 'auto' | 'on' | 'off';
+  backendPref: 'gemini' | 'minimax';
+  timeoutMs?: number;
+}
+
+// The dictation cleanup config (report §7):
+//   CEOCHAT_STT_CLEANUP           auto (default) | on | off
+//   CEOCHAT_STT_CLEANUP_BACKEND   gemini (default) | minimax
+//   CEOCHAT_STT_CLEANUP_TIMEOUT_MS  positive int (else the cleanup.ts default)
+// 'auto' means: on whenever a cleanup key (GEMINI or MINIMAX) exists, else off (today's
+// raw behavior) — the makePromptCleaner factory applies that gate. Pure over an env map.
+export function cleanupConfig(env: Record<string, string | undefined>): CleanupConfig {
+  const rawMode = (env.CEOCHAT_STT_CLEANUP || '').trim().toLowerCase();
+  const mode: 'auto' | 'on' | 'off' = rawMode === 'on' || rawMode === 'off' ? rawMode : 'auto';
+  const backendPref: 'gemini' | 'minimax' =
+    (env.CEOCHAT_STT_CLEANUP_BACKEND || '').trim().toLowerCase() === 'minimax' ? 'minimax' : 'gemini';
+  const t = Number(env.CEOCHAT_STT_CLEANUP_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(t) && t > 0 ? t : undefined;
+  return { mode, backendPref, timeoutMs };
+}
