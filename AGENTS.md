@@ -136,7 +136,9 @@ streaming TTS. Decision-ready plan:
 - **Voice-in (browser STT)** is best-effort `webkitSpeechRecognition` in `public/app.js`;
   unsupported → the text input is the reliable fallback. Real cloud/local STT is a later
   phase — do NOT build it here.
-- **Turns are serialized** (one `busy` lock); a concurrent `send` gets an `error` frame.
+- **Turns are serialized** (one `busy` lock); a concurrent `send` gets an `error` frame
+  (since Phase 11 a same-source web follow-up attaches + reinterprets via
+  `submitOrSteer` instead; only a foreign-source busy still errors).
   All turn output is broadcast to every connected client so multiple tabs stay in sync.
 - **Tunnel-ready, host-agnostic.** Serve plain HTTP on `127.0.0.1` (env `CEOCHAT_HOST`/
   `CEOCHAT_PORT`, default `127.0.0.1:8420`); the page upgrades to a RELATIVE same-origin
@@ -349,7 +351,9 @@ streaming TTS. Decision-ready plan:
   cancelled when the initiating socket drops — a refresh mid-turn re-joins the broadcast and
   receives the REMAINING chunks, so it never wedges. Cancel is EXPLICIT only: the `stop`
   client frame (sent on hangup) sets the turn's abort signal → `streamReply`/pipeline stop
-  emitting + synthesizing. Turns stay serialized (one `busy` lock).
+  emitting + synthesizing (since Phase 11 ownership-gated: `cancelIfSource('web', …)`
+  aborts only a WEB-sourced turn - a live phone/SMS turn survives a web hangup). Turns
+  stay serialized (one `busy` lock).
 - **WS protocol additions:** client→server `stop`; server→client `notice`; `narration`/
   `audio` carry an `index` (progressive ordering) and `reply`/`narration`/`audio`/`turn-done`
   an optional `replay`. When chunks streamed (`result.chunks>0`) app.ts SKIPS the aggregate
@@ -610,6 +614,126 @@ streaming TTS. Decision-ready plan:
   MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only,
   the partial-failure note leading the SMS reply), and notify gates (token 403s,
   config-off 404, framing). Live texting stays captain-gated on A2P registration.
+
+## Phase 11 - Call Mode UX: thinking-filler, real-only progress, attach-and-reinterpret
+Three features that make a phone call feel like a human call (plan+decisions:
+`data/ceochat-callux-n7/`). All three live at the phone/turn seam; the pipeline below
+`Driver.send` is UNCHANGED.
+- **F1 - one thinking-filler per turn** (`phone.ts`, `DEFAULT_FILLER`). When a turn is
+  slow to produce its first spoken audio, ONE short varied "give me a second" line is
+  spoken after `fillerThresholdMs` (default 3000). Captain decision D1: EXACTLY ONE per
+  turn - a one-shot timer armed on the `sent` event, fired only if no reply `audio` has
+  played, cancelled by the first audio / `turn-done`. NOT a repeating cadence. The pool
+  is rotated (never canned) and synthesized through the SAME `speak`->`sendPcm` path, so
+  filler inherits half-duplex (`playing=true`) and is never transcribed back; `speak(text,
+  cache=true)` memoizes the finite static pool. `sendQueue` serialization guarantees the
+  filler plays BEFORE the first real chunk (wait-for-gap, never a collision).
+- **F2 - REAL-ONLY progress** (`src/server/activity.ts` + `phone.ts`). Captain decision
+  D2 (override): progress is spoken ONLY when there is NEW real agent activity - there is
+  NO generic layer, no fixed cadence, no "still working on it" pool. The transcript tap
+  already parses `tool_use` (transcript.ts `toolUseAfterAnchor`); `describeToolUse` renders
+  one into a short, screen-safe gerund line ("Still on it. I'm running firstmate
+  bootstrap.") from `Bash.description` / TodoWrite in-progress content / Agent/Skill
+  descriptions, or the bare tool VERB ("reading a file") for path-bearing tools - the path
+  is NEVER spoken (`screenSafe` + `gerundClause`, §7.3). `gerundClause` conjugates ONLY a
+  recognized leading verb (`KNOWN_VERBS` allowlist; 'sync' takes plain +ing, "syncing");
+  a word already ending in -ing passes only when its STEM maps back to a known verb
+  ("reading", "running") - "Bring"/"Ongoing" do not, so they fall back too. A free-text TodoWrite/
+  Agent label that doesn't start with a known verb ("Tests for the parser") falls back
+  to the tool's bare form, never gibberish. Non-narratable internal tools
+  (ToolSearch, TaskGet, ...) return null = silence. The `ActivityTap`
+  (`makeTranscriptActivity`, parallels `verbatim.ts`) is wired in `serve.ts` and started
+  per-turn on the `sent` event; the phone leg throttles to `progressMinGapMs` (default
+  20000), speaks the FRESHEST un-spoken line, NEVER the same statement twice in a turn
+  (`spokenActivity` set), stays SILENT when nothing new, and YIELDS while real reply audio
+  is streaming (`audioThisWindow`).
+- **F3 - attach-and-reinterpret** (`turns.ts` + `phone.ts` + `app.ts` + `text.ts`). A
+  follow-up utterance while a turn is in flight is MERGED into the in-flight prompt and the
+  turn is re-run - primarily to fix STT misreads (decision D4: always attach while in
+  flight). The crux: `runner.cancel` only stops ceo-chat SPEAKING; it does NOT stop the
+  agent. New optional `Driver.interrupt()` (`Broker.interrupt` = send `Escape` to the pane,
+  guarded by the SAME "esc to interrupt" idle latch the reply tap uses) actually
+  interrupts claude. `TurnRunner.steer` = abort the in-flight pipeline -> interrupt the
+  agent -> wait for it to unwind -> re-run `buildSteerPrompt(original, correction, source)`
+  (ONE line, original verbatim; SOURCE-AWARE framing: a SPOKEN phone correction is the
+  authoritative fix of a possible STT misread (D3), a typed web/SMS follow-up is an
+  ADDITION that never invites replacing the original). The abort + the combined-prompt
+  build happen at steer() REQUEST time (before the serialized `steerChain` entry runs),
+  and the runner keeps a per-source `pendingSteers` MERGE-TARGET accumulator (the
+  combined prompt each pending re-run WILL inject, removed the moment that run starts):
+  a SECOND correction merges onto base + all prior corrections wherever it lands - DURING
+  the steered re-run (breaks that run's await immediately) or during the UNWIND window
+  before the re-run starts (supersedes the stale pending entry so it never fires; only
+  the fully-merged turn runs). D4 holds for repeat corrections; the nested framing on
+  the re-merged prompt is an accepted tradeoff. An aborted-for-steer turn leaves NO
+  history/turn-done (no double-speak - it returns before recording) and resolves
+  `TurnResult.superseded` - NOT a failure (a superseded never-ran pending steer resolves
+  `superseded` with turn 0) - so text.ts's `handleInbound` stays silent for it instead of
+  texting a spurious "That turn failed" (only the combined turn's SMS reply goes out; a
+  genuine mid-turn failure still texts the note), and a superseded MMS turn's
+  partial-failure note is CARRIED FORWARD (`carriedNotes`) to lead the combined turn's
+  reply - the captain never assumes a dropped photo was seen. Steering is
+  SAME-SOURCE only, enforced at BOTH ends: `submitOrSteer` attaches only a same-source
+  follow-up, `steer()` never cancels/interrupts a foreign-source in-flight turn (it queues
+  behind it), and the phone leg steers only a phone-sourced turn, a barge-pinned prompt
+  (the pin is itself phone-only), or an ALREADY-PENDING phone steer chain - a spoken line
+  during a web/SMS turn joins the ordered foreign-busy FIFO (`foreignQueue`, ONE drain
+  loop with 250ms ticks; each queued line ages on its OWN 180s budget from its own
+  arrival, so an early item's expiry drops only that item and a late-spoken line keeps
+  its full patience window - per-utterance retry timers would race when the lock
+  frees and run lines out of spoken order) and runs as its OWN turn right after, in
+  spoken order, so typed work is never rewritten. A transport NEVER cancels a turn
+  it does not own - the CENTRAL ownership gate is `runner.cancelIfSource(source,
+  reason)` (no-op unless `source` started the in-flight turn; only the runner's own
+  steer path uses the raw `cancel()`, marking the signal superseded first). The phone
+  leg's `cancelOwnTurn` routes both barge-in AND hangup/teardown through it (only a
+  phone-sourced turn), and the web `stop` handler routes through the same gate with
+  `'web'` - so over a foreign turn barge-in flushes the local Twilio audio (`clear`)
+  and a hangup just tears the call down, letting the turn complete so its transport
+  never texts a spurious "turn failed", and a web voice-hangup never cuts off a live
+  phone/SMS turn. The
+  phone leg coalesces (`steerCoalesceMs`, default 700) + a
+  Twilio `clear` flush; barge-in PINS the in-flight prompt (`steerOriginal`, TTL
+  `STEER_PIN_TTL_MS`) so a mid-speech correction attaches even after the barge aborts the
+  turn, and a `steerPending` counter (incremented around each `runner.steer` until it
+  settles) keeps `routeUtterance` on the attach path across the steer UNWIND window -
+  the aborted turn clears `busy` while the runner is still interrupting the agent, so
+  without it an utterance in that slice would grab the freed lock and run bare AHEAD of
+  the combined re-run (which would then override it). With a phone steer pending,
+  `fireSteer` takes the foreign-busy submit fallback ONLY when `steerPending` is 0: a
+  correction landing while a foreign turn transiently holds the unwind-window lock merges
+  onto the pending phone entry via `runner.steer` (which queues behind the foreign turn
+  without touching it), never a bare submit racing the re-run. Web routes `send` through
+  `submitOrSteer`; SMS `runWhenFree` attaches a
+  same-source follow-up but waits on a phone/web turn. D5 (a correction is NEVER lost):
+  if `Escape` won't interrupt, the combined prompt still injects and runs right after;
+  `_steer` HOLDS it until the aborted turn's lock actually frees (bounded 180s, matching
+  runWhenFree) instead of force-running into a silent "one at a time" busy rejection.
+- **Validation:** `npm run validate` gains `phone - F1` (single filler, one-shot,
+  cancelled by prompt audio), `phone - F2 progress` (pure `describeToolUse`/`screenSafe`/
+  gerund + non-verb fallback + boundary + the -ing stem rule) and `phone - F2: real-only
+  progress` (throttle, no repeats, silence when nothing new, yields to audio), `turns -
+  attach-and-reinterpret` (incl. per-source framing) + `turns - slow-unwind hold` (the
+  correction survives an abort that outlives the wait window) + `turns - second
+  correction` (a correction DURING a steered re-run merges immediately and the superseded
+  turns report `superseded`) + `turns - unwind window` (a second correction landing while
+  the aborted turn is still unwinding merges base + c1 + c2 and the stale pending re-run
+  never fires) + the `phone - F3` legs (merge, interrupt, re-run,
+  same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
+  steered, an utterance in the phone-leg unwind window attaches via `steerPending`
+  instead of running bare ahead of the re-run, a correction merges into the pending
+  phone steer even when a foreign turn holds the lock, utterances queued behind a
+  foreign turn drain in spoken order, a late-queued utterance keeps its own patience
+  budget, a barge-in over a foreign-source turn flushes audio without cancelling it,
+  and a hangup cancels only the caller's own turn - a foreign turn survives the
+  teardown) + `web - stop cancels only a web-sourced turn` (`cancelIfSource` no-ops
+  when idle or foreign: a phone-sourced turn survives a web stop; a web-sourced turn
+  still aborts) + `text - follow-up steers the SMS turn`
+  (no spurious failure SMS for a
+  superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
+  media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable
+  driver - no wall clock; the slow-unwind leg injects a virtual `now`/`sleep`). Real
+  Escape-interrupt over tmux is captain-gated (needs a live claude pane).
 
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.

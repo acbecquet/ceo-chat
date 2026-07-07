@@ -7,8 +7,9 @@
 //   bidirectional Media Streams WS at /phone    (8 kHz mu-law base64 both ways)
 //     inbound : mu-law -> PCM -> whisper transcribe -> TurnRunner.run(text)
 //     outbound: runner audio events (s16le@22k/32k) -> 8 kHz mu-law -> media+mark
-//     barge-in: sustained captain speech during playback -> `clear` + runner.cancel
-//     hangup  : `stop` frame / WS close -> runner.cancel (signal.aborted)
+//     barge-in: sustained captain speech during playback -> `clear` + cancel the
+//               caller's OWN phone-sourced turn (a foreign turn is never cancelled)
+//     hangup  : `stop` frame / WS close -> same phone-owned-only cancel
 //
 // SECURITY (mandatory - the broker fronts a shell-capable agent), layered:
 //   1. Caller-ID allowlist at the webhook: From/To must match CEOCHAT_ALLOWED_CALLER
@@ -51,6 +52,7 @@ import {
   UtteranceDetector, type VadConfig,
 } from './phone-audio.ts';
 import { guardUtterance, looksConsequential } from '../web/confirm.js';
+import type { ActivityTap, ActivityTurnHandle } from './activity.ts';
 
 export const PHONE_WS_PATH = '/phone';
 export const PHONE_TWIML_PATH = '/phone/twiml';
@@ -67,6 +69,14 @@ const TOKEN_TTL_MS = 5 * 60 * 1000;
 // anonymous hits on the tunnel-exposed /phone path from piling up.
 const HANDSHAKE_TIMEOUT_MS = 10 * 1000;
 export const MAX_PENDING_SOCKETS = 8;
+// How long a barge-in keeps the in-flight prompt pinned while waiting for the captain's
+// correction to finish; dropped after this so a barge with no follow-up never strands it.
+const STEER_PIN_TTL_MS = 8 * 1000;
+// Wait budget for the ordered FIFO of utterances queued behind a FOREIGN-source
+// (web/SMS-initiated) turn we must never steer: 720 x 250ms = 180s, matching the SMS
+// runWhenFree wait cap, so a spoken line survives even a long-running foreign turn
+// (D5: never lost).
+const FOREIGN_BUSY_TRIES = 720;
 
 /** Drop expired stream tokens so unconsumed mints never accumulate. Pure. */
 export function pruneExpiredTokens(tokens: Map<string, number>, now: number): void {
@@ -111,6 +121,32 @@ export interface PhonePhrases {
   sttUnavailable: string;
 }
 
+// ── thinking-filler (F1) ─────────────────────────────────────────────────────
+// On a real phone call, dead air after the captain finishes speaking reads as
+// "are you still there?". If the reply is slow to produce its first spoken audio,
+// we say ONE short, natural "give me a sec" line so the line never goes silent
+// waiting. Captain decision D1: EXACTLY ONE filler per turn (never a repeating
+// cadence), fired only if no real reply audio has played within `thresholdMs`.
+export interface FillerConfig {
+  /** Silence after a turn starts before the single filler is spoken. */
+  thresholdMs: number;
+  /** Varied phrasings, rotated so the filler never sounds canned. */
+  phrases: string[];
+}
+
+export const DEFAULT_FILLER: FillerConfig = {
+  thresholdMs: 3000,
+  phrases: [
+    'Give me a second to think about this.',
+    'Let me look into that.',
+    'One moment while I work through it.',
+    'Hang on, let me pull that up.',
+    'Okay, let me dig into this.',
+    'Give me a moment on that.',
+    'Let me check on that for you.',
+  ],
+};
+
 export const DEFAULT_PHRASES: PhonePhrases = {
   pinPrompt: 'First mate here. Enter your PIN on the keypad to continue.',
   pinRetry: 'That PIN did not match. Try again.',
@@ -138,6 +174,13 @@ export interface PhoneAppOptions {
   publicUrl: string;
   promptPolicy?: Partial<PromptPolicy>;
   phrases?: Partial<PhonePhrases>;
+  filler?: Partial<FillerConfig>;
+  /** Real-only mid-turn progress source (the tool-activity tap). Optional. */
+  activity?: ActivityTap;
+  /** Minimum gap between spoken progress lines (throttle). Default 20000ms. */
+  progressMinGapMs?: number;
+  /** Window to coalesce a burst of follow-up utterances into ONE reinterpret. Default 700ms. */
+  steerCoalesceMs?: number;
   vad?: Partial<VadConfig>;
   fetchImpl?: typeof fetch;
   timers?: PhoneTimers;
@@ -179,6 +222,13 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
   const capabilities = phoneCapabilities(secrets);
   const policy: PromptPolicy = { ...DEFAULT_PROMPT_POLICY, ...(opts.promptPolicy ?? {}) };
   const phrases: PhonePhrases = { ...DEFAULT_PHRASES, ...(opts.phrases ?? {}) };
+  const filler: FillerConfig = { ...DEFAULT_FILLER, ...(opts.filler ?? {}) };
+  const progressMinGapMs = opts.progressMinGapMs ?? 20000;
+  const steerCoalesceMs = opts.steerCoalesceMs ?? 700;
+  // Cache synthesized PCM for the FINITE static phrases (filler pool, PIN/greeting) so a
+  // recurring line is synthesized once per server lifetime, not once per call - the
+  // "pre-synthesize the filler pool" cost win. Dynamic progress lines are NOT cached.
+  const phraseCache = new Map<string, { pcm: Buffer; sampleRate: number }>();
   const timers: PhoneTimers = opts.timers ?? {
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (h) => clearTimeout(h as NodeJS.Timeout),
@@ -235,6 +285,31 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     private reAskCount = 0;
     private sttWarned = false;
     private closed = false;
+    // ---- per-turn spoken-status window (filler F1 + real progress F2) ----
+    private currentTurn = 0;             // the in-flight turn (0 = none)
+    private turnHadAudio = false;        // any real reply audio played this turn
+    private fillerTimer: unknown = null; // one-shot; fires the SINGLE filler
+    private fillerFired = false;         // exactly one filler per turn
+    private fillerIdx = 0;               // rotate the pool across turns (never canned)
+    private activityHandle: ActivityTurnHandle | null = null;
+    private progressTimer: unknown = null;
+    private pendingActivity = '';        // freshest un-spoken real activity line
+    private audioThisWindow = false;     // real audio played since the last progress tick
+    private spokenActivity = new Set<string>(); // never speak the same statement twice
+    // ---- attach-and-reinterpret (F3): coalesce follow-up utterances, then steer ----
+    private steerBuffer: string[] = [];
+    private steerTimer: unknown = null;
+    private steerPinTimer: unknown = null;
+    private steerOriginal: string | null = null; // pinned at barge-in so a mid-speech
+                                                  // correction still attaches to that prompt
+    private steerPending = 0; // steers fired but not yet settled - keeps the attach path
+                              // open across the unwind window (busy clears before the
+                              // steered re-run starts; a bare run there would misorder)
+    private foreignQueue: Array<{ text: string; tries: number }> = [];
+                                          // spoken lines waiting out a foreign-source
+                                          // turn, drained strictly in spoken order;
+                                          // each carries its OWN patience budget
+    private foreignDraining = false;      // ONE drain loop at a time
     // Serializes prompt/chunk playback so audio order is preserved.
     private sendQueue: Promise<void> = Promise.resolve();
     private readonly detector: UtteranceDetector;
@@ -392,26 +467,133 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         }
       }
       this.reAskCount = 0;
-      this.submit(text);
+      this.routeUtterance(text);
     }
 
-    /** Hand text to the runner; if a cancelled turn is still settling, retry briefly. */
-    private submit(text: string, tries = 0): void {
+    // A captain utterance: a FRESH turn ONLY when truly idle (immediate, so first audio
+    // stays fast), else attach-and-reinterpret - the follow-up is coalesced with any
+    // others and steers the in-flight turn (Feature 3, decision D4: always attach while in
+    // flight). `steerPending` keeps the attach path open across the whole steer UNWIND
+    // window: the aborted turn clears `busy` while the runner is still interrupting the
+    // agent (before the combined re-run starts), so without it a correction landing in
+    // that slice would run bare ahead of the re-run and be overridden by it. SAME-SOURCE
+    // only: steering interrupts and rewrites the in-flight prompt, so it applies ONLY to
+    // a phone-initiated turn (or a barge-in pinned prompt, which is phone-sourced by
+    // construction). A foreign (web/SMS-initiated) turn is never touched - the utterance
+    // joins the ordered foreign-busy FIFO and runs as its own turn right after (D5).
+    private routeUtterance(text: string): void {
+      if (this.closed) return;
+      const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
+      if (phoneOwnsTurn || this.steerPending > 0
+        || this.steerTimer != null || this.steerOriginal != null) {
+        this.steerBuffer.push(text);
+        this.armSteerTimer();
+      } else if (runner.busy || this.foreignDraining) {
+        this.enqueueForeignBusy(text);
+      } else {
+        this.submit(text);
+      }
+    }
+
+    private armSteerTimer(): void {
+      if (this.steerTimer != null) timers.clearTimeout(this.steerTimer);
+      this.steerTimer = timers.setTimeout(() => this.fireSteer(), steerCoalesceMs);
+    }
+
+    // Fire ONE reinterpret for the coalesced follow-up(s): flush any buffered outbound
+    // audio (so the correction is acted on now, not after the old reply drains) and steer.
+    private fireSteer(): void {
+      this.steerTimer = null;
+      if (this.steerPinTimer != null) { timers.clearTimeout(this.steerPinTimer); this.steerPinTimer = null; }
+      if (this.closed) return;
+      const joined = this.steerBuffer.join(' ').replace(/\s+/g, ' ').trim();
+      this.steerBuffer = [];
+      const original = this.steerOriginal;
+      this.steerOriginal = null;
+      if (!joined) return;
+      // A foreign-source turn grabbed the lock while the buffer coalesced (no pin, not a
+      // phone turn, no phone steer pending): never steer it - queue the utterance to run
+      // as its own turn (D5). With a phone steer PENDING the correction belongs to the
+      // phone chain instead: runner.steer merges it onto the pending combined prompt and
+      // queues behind the foreign turn without ever cancelling or interrupting it.
+      if (!original && this.steerPending === 0 && runner.busy && runner.currentSource !== 'phone') {
+        this.enqueueForeignBusy(joined);
+        return;
+      }
+      this.send({ event: 'clear', streamSid: this.streamSid });
+      this.outstandingMarks = 0;
+      this.detector.playing = false;
+      this.steerPending++;
+      void runner.steer(joined, 'phone', original ? { original } : {})
+        .catch(() => undefined)
+        .finally(() => { this.steerPending--; });
+    }
+
+    /** Hand text to the runner as a fresh turn (captain utterances when nothing phone-
+     *  owned is in flight, and internal injects like the safe-default 'cancel'); if the
+     *  runner is busy - a cancelled turn settling, a busy-flip race, or a foreign-source
+     *  turn we must never interrupt - retry until it frees (bounded by maxTries). */
+    private submit(text: string, tries = 0, maxTries = 20): void {
       if (this.closed) return;
       if (runner.busy) {
-        if (tries >= 20) { log('phone: runner stayed busy - dropping utterance'); return; }
-        timers.setTimeout(() => this.submit(text, tries + 1), 250);
+        if (tries >= maxTries) { log('phone: runner stayed busy - dropping utterance'); return; }
+        timers.setTimeout(() => this.submit(text, tries + 1, maxTries), 250);
         return;
       }
       void runner.run(text, 'phone');
+    }
+
+    /** Queue an utterance behind a FOREIGN (web/SMS-initiated) turn we must never
+     *  steer. ONE shared FIFO with a single drain loop - per-utterance submit()
+     *  retries would race each other's timers when the lock frees and could run the
+     *  captain's lines out of spoken order. Each line runs as its OWN fresh phone
+     *  turn, strictly FIFO; once a drained phone turn is in flight, routeUtterance's
+     *  normal attach path handles any follow-up. */
+    private enqueueForeignBusy(text: string): void {
+      this.foreignQueue.push({ text, tries: 0 });
+      if (!this.foreignDraining) {
+        this.foreignDraining = true;
+        this.drainForeignQueue();
+      }
+    }
+
+    private drainForeignQueue(): void {
+      if (this.closed) { this.foreignQueue = []; this.foreignDraining = false; return; }
+      if (this.foreignQueue.length === 0) { this.foreignDraining = false; return; }
+      // Hold the drain while a phone steer is pending/coalescing too: dispatching a
+      // queued line under an armed coalesce window would hand fireSteer the WRONG
+      // in-flight turn to correct.
+      if (runner.busy || this.steerPending > 0
+        || this.steerTimer != null || this.steerOriginal != null) {
+        // Each queued line ages on its OWN budget from its own arrival: an early
+        // item's timeout drops only that item - a line spoken late into a long
+        // foreign turn keeps its full patience window (D5: never lost early).
+        for (const item of this.foreignQueue) item.tries++;
+        const expired = this.foreignQueue.filter((i) => i.tries >= FOREIGN_BUSY_TRIES).length;
+        if (expired > 0) {
+          log(`phone: runner stayed busy - dropping ${expired} queued utterance(s)`);
+          this.foreignQueue = this.foreignQueue.filter((i) => i.tries < FOREIGN_BUSY_TRIES);
+          if (this.foreignQueue.length === 0) { this.foreignDraining = false; return; }
+        }
+        timers.setTimeout(() => this.drainForeignQueue(), 250);
+        return;
+      }
+      const item = this.foreignQueue.shift()!;
+      void runner.run(item.text, 'phone')
+        .catch(() => undefined)
+        .finally(() => this.drainForeignQueue());
     }
 
     // ---- interactive-prompt fallback (re-ask once, then the safe default) ----
     private onTurnEvent(ev: Parameters<Parameters<TurnRunner['on']>[0]>[0]): void {
       if (this.closed || !this.authed) return;
       if (ev.type === 'audio') {
+        this.turnHadAudio = true;
+        this.audioThisWindow = true;
+        this.cancelFiller(); // real reply audio arrived -> the single filler is moot
         this.playPcm(ev.pcm, ev.sampleRate);
       } else if (ev.type === 'turn-done') {
+        this.endTurnWindow();
         if (runner.awaitingConfirmation && looksConsequential(runner.lastNarration)) {
           this.armAnswerTimer();
         } else {
@@ -421,7 +603,94 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
         // A web-side answer resolves the pending prompt - stop the phone countdown.
         this.clearAnswerTimer();
         this.reAskCount = 0;
+        // Begin the spoken-status window for this turn (single filler + real progress).
+        this.beginTurnWindow(ev.turn, ev.text, ev.ts);
+      } else if (ev.type === 'status' && ev.state === 'idle') {
+        // An aborted turn emits no turn-done; idle closes the window either way.
+        this.endTurnWindow();
       }
+    }
+
+    // ---- spoken-status window: F1 single filler + F2 real-only progress ----
+    private beginTurnWindow(turn: number, prompt: string, ts: number): void {
+      this.endTurnWindow(); // never overlap two windows
+      this.currentTurn = turn;
+      this.turnHadAudio = false;
+      this.fillerFired = false;
+      this.audioThisWindow = false;
+      this.pendingActivity = '';
+      this.spokenActivity = new Set();
+      // F1: one-shot filler if no real reply audio has played by the threshold.
+      this.fillerTimer = timers.setTimeout(() => {
+        this.fillerTimer = null;
+        if (this.closed || !this.authed) return;
+        if (this.turnHadAudio || this.fillerFired) return;
+        this.fillerFired = true;
+        this.speak(this.pickFiller(), true);
+      }, filler.thresholdMs);
+      // F2: tap the tool activity for this turn (real-only progress). The tap reads the
+      // session transcript anchored to THIS prompt; the throttle below decides speaking.
+      if (opts.activity) {
+        try {
+          this.activityHandle = opts.activity({
+            prompt,
+            afterTs: new Date(ts).toISOString(),
+            onActivity: (line) => this.onActivity(line),
+          });
+        } catch (e) {
+          log('phone: activity tap failed to start: ' + (e as Error).message);
+        }
+        this.armProgressTimer();
+      }
+    }
+
+    private endTurnWindow(): void {
+      this.cancelFiller();
+      if (this.progressTimer != null) { timers.clearTimeout(this.progressTimer); this.progressTimer = null; }
+      if (this.activityHandle) { try { this.activityHandle.stop(); } catch { /* ignore */ } this.activityHandle = null; }
+      this.currentTurn = 0;
+      this.pendingActivity = '';
+    }
+
+    private cancelFiller(): void {
+      if (this.fillerTimer != null) { timers.clearTimeout(this.fillerTimer); this.fillerTimer = null; }
+    }
+
+    private pickFiller(): string {
+      const pool = filler.phrases.length ? filler.phrases : DEFAULT_FILLER.phrases;
+      const line = pool[this.fillerIdx % pool.length]!;
+      this.fillerIdx++; // rotate so the filler never repeats back-to-back across turns
+      return line;
+    }
+
+    // A NEW real activity line from the tap: keep only the FRESHEST un-spoken one; the
+    // throttle tick decides whether/when to say it. De-dup so the same statement (e.g.
+    // repeated "reading a file") is never spoken twice in a turn (captain decision D2).
+    private onActivity(line: string): void {
+      if (this.closed || !this.authed || this.currentTurn === 0) return;
+      if (this.spokenActivity.has(line)) return;
+      this.pendingActivity = line;
+    }
+
+    private armProgressTimer(): void {
+      this.progressTimer = timers.setTimeout(() => this.progressTick(), progressMinGapMs);
+    }
+
+    // Every progressMinGapMs: if the agent produced real reply audio in the last window it
+    // is already talking, so stay silent; otherwise, if there is NEW real activity, speak
+    // the freshest line. REAL ONLY - never a generic "still working" when nothing is new.
+    private progressTick(): void {
+      this.progressTimer = null;
+      if (this.closed || !this.authed || this.currentTurn === 0) return;
+      if (this.audioThisWindow) {
+        this.audioThisWindow = false; // the reply is streaming - no progress needed
+      } else if (this.pendingActivity && !this.spokenActivity.has(this.pendingActivity)) {
+        const line = this.pendingActivity;
+        this.pendingActivity = '';
+        this.spokenActivity.add(line);
+        this.speak(line); // dynamic real-progress line - not cached
+      }
+      this.armProgressTimer(); // keep checking until the window ends
     }
 
     private armAnswerTimer(): void {
@@ -456,13 +725,21 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     }
 
     // ---- outbound audio ----
-    private speak(text: string): void {
+    // Speak a canned phrase (PIN prompt / greeting / filler / progress). `cache:true`
+    // memoizes the synth for the finite static phrases (the filler pool) so a recurring
+    // line synthesizes once. Goes through sendQueue -> sendPcm, so it is ordered with the
+    // reply audio and inherits half-duplex (playing=true) - it is never transcribed back.
+    private speak(text: string, cache = false): void {
       if (!opts.synthPrompt || !text) return;
       this.sendQueue = this.sendQueue.then(async () => {
         if (this.closed) return;
         try {
-          const { pcm, sampleRate } = await opts.synthPrompt!(text);
-          this.sendPcm(pcm, sampleRate);
+          let out = cache ? phraseCache.get(text) : undefined;
+          if (!out) {
+            out = await opts.synthPrompt!(text);
+            if (cache) phraseCache.set(text, out);
+          }
+          this.sendPcm(out.pcm, out.sampleRate);
         } catch (e) {
           log('phone: prompt synth failed: ' + (e as Error).message);
         }
@@ -492,14 +769,39 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       this.detector.playing = true; // half-duplex until Twilio echoes the mark back
     }
 
-    /** Sustained captain speech while we're talking: flush the buffer + abort. */
+    /** Sustained captain speech while we're talking: flush the buffer, stop the old reply,
+     *  and pin the in-flight prompt so the ensuing correction attaches + reinterprets. */
     private onBargeIn(): void {
       if (!this.authed) return;
-      log('phone: barge-in - clearing buffered audio + cancelling the turn');
+      log('phone: barge-in - clearing buffered audio; capturing the follow-up to reinterpret');
+      // Pin the in-flight prompt: the barge-in aborts the turn, so busy may clear before the
+      // captain finishes the correction - the pin keeps the attach target (Feature 3).
+      // Phone-sourced turns ONLY: a foreign (web/SMS) turn is never pinned, steered, or
+      // cancelled - it runs to completion and delivers its own reply (cancelling it would
+      // read as a spurious failure on that transport); only its local audio is flushed.
+      const phoneOwnsTurn = runner.busy && runner.currentSource === 'phone';
+      if (phoneOwnsTurn && runner.currentPrompt) {
+        this.steerOriginal = runner.currentPrompt;
+        if (this.steerPinTimer != null) timers.clearTimeout(this.steerPinTimer);
+        // Drop a stale pin if no correction actually follows the barge-in.
+        this.steerPinTimer = timers.setTimeout(() => {
+          this.steerPinTimer = null;
+          if (this.steerTimer == null) this.steerOriginal = null;
+        }, STEER_PIN_TTL_MS);
+      }
       this.send({ event: 'clear', streamSid: this.streamSid });
       this.outstandingMarks = 0;
-      this.detector.playing = false;
-      runner.cancel('phone barge-in');
+      this.detector.playing = false; // start collecting the captain's ongoing speech
+      this.cancelOwnTurn('phone barge-in'); // stop the old reply audio now
+    }
+
+    /** The phone leg must never cancel a turn it does not own: a foreign (web/SMS)
+     *  turn runs to completion and delivers its own reply - aborting it would read
+     *  as a spurious failure on that transport (a "turn failed" text, a dead web
+     *  turn). Every phone-side runner.cancel routes through the runner's central
+     *  ownership gate (shared with the web `stop` handler). */
+    private cancelOwnTurn(reason: string): void {
+      runner.cancelIfSource('phone', reason);
     }
 
     private send(obj: unknown): void {
@@ -522,13 +824,20 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       if (this.closed) return;
       this.closed = true;
       this.clearAnswerTimer();
+      this.endTurnWindow(); // stop the filler/progress timers + the activity tap
+      if (this.steerTimer != null) { timers.clearTimeout(this.steerTimer); this.steerTimer = null; }
+      if (this.steerPinTimer != null) { timers.clearTimeout(this.steerPinTimer); this.steerPinTimer = null; }
+      this.steerBuffer = [];
+      this.steerOriginal = null;
+      this.foreignQueue = [];
       if (this.handshakeTimer != null) { timers.clearTimeout(this.handshakeTimer); this.handshakeTimer = null; }
       this.detector.reset();
       if (this.unsubRunner) { this.unsubRunner(); this.unsubRunner = null; }
-      // Hanging up cancels the in-flight turn (stops speech + synthesis) - but only
-      // an AUTHENTICATED call has a stake in it; an anonymous/refused connection
-      // dropping must never abort the captain's live turn.
-      if (this.authed) runner.cancel('phone hangup (' + reason + ')');
+      // Hanging up cancels the caller's OWN in-flight turn (stops speech + synthesis) -
+      // but only an AUTHENTICATED call has a stake in it, and a foreign (web/SMS)
+      // turn is never the caller's to abort: it runs to completion and delivers its
+      // own reply (audio to the dead call is moot - sendPcm no-ops on a closed socket).
+      if (this.authed) this.cancelOwnTurn('phone hangup (' + reason + ')');
       try { this.ws.close(); } catch { /* ignore */ }
       pending.delete(this);
       if (session === this) session = null;

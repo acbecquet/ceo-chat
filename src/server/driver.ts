@@ -51,6 +51,13 @@ export interface Driver {
   start(): Promise<void>;
   /** Drive one full turn: typed text -> reply -> narration -> spoken PCM. */
   send(text: string, turnIndex: number, hooks: TurnHooks): Promise<DriverTurn>;
+  /**
+   * Interrupt the underlying agent's in-flight turn so the NEXT injected prompt is
+   * re-planned from scratch (attach-and-reinterpret, Feature 3). Best-effort: a driver
+   * with no live agent (the in-memory test driver) omits it; the runner treats a missing
+   * or failed interrupt as "the correction queues and runs right after" (never lost).
+   */
+  interrupt?(): Promise<void>;
   /** Current colour-preserving snapshot of the agent pane (for xterm.js). */
   terminalSnapshot(): string;
   stop(): Promise<void>;
@@ -101,6 +108,10 @@ export class BrokerDriver implements Driver {
       },
       chunks,
     };
+  }
+
+  interrupt(): Promise<void> {
+    return this.broker.interrupt();
   }
 
   terminalSnapshot(): string {

@@ -25,6 +25,8 @@ An SMS turn broadcasts to every connected browser too, labeled "you (by text)".
 ## Using it
 
 - **Text the number.** The Body is injected exactly like a spoken utterance; the reply comes back as an SMS with the same concise summary the voice legs speak.
+- **Follow up while it works.** A quick follow-up text while your previous text's turn is still running attaches to it as an addition and the turn re-runs combined; the superseded turn stays silent (no spurious "That turn failed" text), and a superseded MMS turn's attachment-failure note is carried forward to lead the combined reply.
+  A turn started from the phone or the web is waited on instead - an inbound text never interrupts a live call.
 - **Read the detail on the web.** When the full verbatim reply holds more than the summary, the SMS ends with `Full reply: https://ceo-chat.acb-apps.com`.
   Any reply cut at the 1600-char SMS limit also forces that link - a truncated text always carries the pointer to the full transcript.
 - **Send photos/files by MMS.** Each attachment is fetched with authenticated Twilio requests and stored under the gitignored `inbox/` dir; the injected line references the absolute path so first mate opens and inspects exactly what you sent.
@@ -45,7 +47,7 @@ An SMS turn broadcasts to every connected browser too, labeled "you (by text)".
 - **Sender allowlist** - a signed message whose `From` is not `CEOCHAT_ALLOWED_CALLER` is silently dropped: empty TwiML, nothing injected, no reply, nothing revealed.
 - **MMS intake caps** - https only, at most 10 media items, 10 MB per file, and the account's Basic auth is attached only for Twilio-owned hosts (never leaked to an arbitrary URL).
 - **Notify token** - `/text/notify` requires `x-ceochat-notify: sha256(TWILIO_AUTH_TOKEN)`; the raw Twilio token never rides an HTTP header, and the endpoint can only ever text the captain's allowlisted number.
-- **One turn at a time** - an inbound text waits (bounded) on the same serialized turn engine the web and phone legs share.
+- **One turn at a time** - an inbound text waits (bounded) on the same serialized turn engine the web and phone legs share; a follow-up to your OWN in-flight text attaches + reinterprets instead of waiting, and a phone/web turn is never interrupted by a text.
 
 ## Secrets
 
@@ -70,5 +72,5 @@ So: the captain can text IN (and MMS photos in) the moment the messaging webhook
 
 ## Validation
 
-`npm run validate` includes mock Text Mode legs (no Twilio account, no network): the mandatory signature gate, the sender allowlist (silent drop), Body -> TurnRunner injection through the same seam as speech, the REST reply framing (narration + transcript link, 1600-char boundary behavior, forced link on any truncation), MMS intake (authenticated fetch, inbox storage, injected references, non-Twilio-host credential protection, https-only, partial-failure naming in both the injected line and the SMS reply), and the proactive notify trigger (token gate, config gate, REST framing).
+`npm run validate` includes mock Text Mode legs (no Twilio account, no network): the mandatory signature gate, the sender allowlist (silent drop), Body -> TurnRunner injection through the same seam as speech, the REST reply framing (narration + transcript link, 1600-char boundary behavior, forced link on any truncation), MMS intake (authenticated fetch, inbox storage, injected references, non-Twilio-host credential protection, https-only, partial-failure naming in both the injected line and the SMS reply), follow-up steering (a second text attaches + re-runs the in-flight SMS turn; a superseded turn sends no spurious failure text while a genuine failure still texts; a superseded MMS turn's failure note is carried forward to lead the combined reply), and the proactive notify trigger (token gate, config gate, REST framing).
 Live texting stays captain-gated on A2P registration.

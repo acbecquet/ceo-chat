@@ -5,6 +5,7 @@ Because iOS treats it as a native call, it works across every app - over YouTube
 The web app at `https://ceo-chat.acb-apps.com` is the in-call companion: it shows the **live 1:1 verbatim transcript** of the session while the call speaks the summarized narration.
 
 The build plan behind this is `/home/acbecquet/firstmate/data/ceochat-callmode-cx/report.md`.
+The human-call UX layer (the thinking-filler, real-only progress, and spoken corrections below) was planned and decided in `/home/acbecquet/firstmate/data/ceochat-callux-n7/`.
 
 ## How it works
 
@@ -17,7 +18,8 @@ The build plan behind this is `/home/acbecquet/firstmate/data/ceochat-callmode-c
          src/server/phone.ts (the transport shell; the pipeline below is unchanged)
            inbound : mu-law -> PCM -> whisper -> TurnRunner -> fm-send inject
            outbound: pipeline audio chunks -> 8 kHz mu-law -> media+mark
-           barge-in: speak over first mate -> `clear` + turn abort
+           barge-in: speak over first mate -> `clear` + abort of the call's OWN turn;
+                     your next utterance attaches + reinterprets (steer)
 ```
 
 The phone shell reuses the whole existing stack: whisper STT, Gemini speakability, the captain's cloned MiniMax voice (or piper), the prompt-anchored transcript tap, and fm-send injection.
@@ -58,7 +60,11 @@ MiniMax cloned voice, Gemini, and whisper are already configured - unchanged by 
   Three keypad failures end the call.
   Nothing is ever injected into the session before the PIN passes.
 - Talk normally; pause and first mate answers.
-  **Speak over it to interrupt** (barge-in flushes the audio and cancels the turn).
+  If the first spoken audio is slow, first mate says ONE short "give me a second" line - exactly one per turn, never a repeating cadence.
+  During a long turn it speaks REAL progress only: short lines derived from what the agent is actually doing (its tool activity), throttled to about one every 20 seconds, never repeated, and silent when nothing new happened.
+- **Speak over it to correct it** (barge-in): the audio flushes, and what you say next attaches to the in-flight request as the authoritative fix of a possible mishearing - the agent is interrupted and the turn re-runs with the combined request.
+  A correction is never lost: if the agent will not interrupt, the correction runs right after.
+  Barge-in and hangup only ever cancel the call's own turn; a turn started from the web or by SMS always runs to completion (your spoken lines queue in order and run right after it).
 - Keep the web app open one-handed: the exact reply text streams there verbatim, and questions pin a tappable answer card (tap or speak - both work).
 
 ## Interactive prompts on a call (the safe default)
@@ -93,9 +99,10 @@ The spoken phrases are right next to it.
 ## Validation
 
 `npm run validate` includes mock Call Mode legs (no Twilio account, no network):
-the mu-law wire transcode, the webhook allowlist + signature + token, the keypad-only PIN gate (nothing injected until it passes; pre-auth speech ignored entirely), anonymous-socket hardening (pre-start sockets never hold the call slot; handshake deadline + cap), STT -> send, media+mark framing, barge-in `clear` + turn abort, hangup abort, the interactive-prompt re-ask/safe-default policy, and the byte-exact verbatim web transcript.
+the mu-law wire transcode, the webhook allowlist + signature + token, the keypad-only PIN gate (nothing injected until it passes; pre-auth speech ignored entirely), anonymous-socket hardening (pre-start sockets never hold the call slot; handshake deadline + cap), STT -> send, media+mark framing, barge-in `clear` + own-turn abort, hangup own-turn abort (a web/SMS turn survives both, and a web `stop` never cancels a phone turn), the single thinking-filler (one-shot, cancelled by real audio), real-only progress (throttle, no repeats, silence when nothing new, yields to reply audio), attach-and-reinterpret (merge + interrupt + re-run, source-aware framing, same-source-only, the foreign-busy queue in spoken order with per-item budgets, the barge-in pin, unwind-window attach), the interactive-prompt re-ask/safe-default policy, and the byte-exact verbatim web transcript.
 
 ## Remaining live test (captain-gated)
 
 Everything above is proven against the mock Media Streams client.
-The end-to-end call over a real number needs the captain's Twilio account + secrets, then: `npm run serve`, tap "Call me", and verify greeting/PIN/turn audio latency and barge-in feel on the real phone (ideally while another app plays audio).
+The end-to-end call over a real number needs the captain's Twilio account + secrets, then: `npm run serve`, tap "Call me", and verify greeting/PIN/turn audio latency and barge-in feel on the real phone (ideally while another app plays audio) - plus the thinking-filler, the real progress lines on a long turn, and a spoken mid-turn correction (barge in, then rephrase) landing in the re-run reply.
+The real Escape-interrupt of a live claude pane is part of that same captain-gated test.

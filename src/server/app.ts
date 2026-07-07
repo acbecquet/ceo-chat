@@ -273,7 +273,9 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
       try { msg = JSON.parse(raw.toString()) as ClientMessage; } catch { return; }
       if (msg.type === 'send') {
         const text = (msg.text || '').trim();
-        if (text) void runner.run(text, 'web');
+        // A second line while a web turn is in flight attaches + reinterprets (Feature 3);
+        // a different transport being busy still gets the "one at a time" error.
+        if (text) void runner.submitOrSteer(text, 'web');
       } else if (msg.type === 'listening') {
         broadcast({ type: 'status', state: msg.on ? 'listening' : runner.idleStatus() });
       } else if (msg.type === 'call-me') {
@@ -295,7 +297,11 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         } catch { /* skip bad chunk */ }
         if (typeof msg.sampleRate === 'number' && msg.sampleRate > 0) buf.sampleRate = msg.sampleRate;
       } else if (msg.type === 'stop') {
-        runner.cancel('client stop (barge-in/hangup)');
+        // Ownership-gated: a web stop (voice hangup) aborts only a WEB-sourced turn.
+        // A live phone caller's turn or an SMS-initiated turn must run to completion -
+        // cancelling it would read as a spurious failure on that transport (the same
+        // class the phone leg's barge-in/hangup gates prevent).
+        runner.cancelIfSource('web', 'client stop (barge-in/hangup)');
       } else if (msg.type === 'stt-cancel') {
         sttBuffers.delete(ws);
       } else if (msg.type === 'stt-end') {

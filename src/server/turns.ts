@@ -18,6 +18,11 @@ import type { PipelineStage } from '../broker/pipeline.ts';
 import type { TurnSource, UiStatus } from './protocol.ts';
 import type { VerbatimTap, VerbatimTurnHandle } from './verbatim.ts';
 
+// How long steer keeps holding a correction for the aborted turn to unwind before
+// giving up loudly. Generous - an aborted pipeline can drain a long TTS synth - and
+// matches the SMS runWhenFree wait cap.
+const STEER_UNWIND_TIMEOUT_MS = 180 * 1000;
+
 export type TurnEvent =
   | { type: 'status'; state: UiStatus }
   | { type: 'sent'; turn: number; text: string; source: TurnSource; ts: number }
@@ -28,6 +33,15 @@ export type TurnEvent =
   | { type: 'notice'; message: string }
   | { type: 'turn-done'; turn: number; ttfbMs: number | null; bytes: number }
   | { type: 'error'; message: string };
+
+export interface TurnResult {
+  ok: boolean;
+  turn: number;
+  /** True when a same-source follow-up steered this turn: it was deliberately aborted
+   *  and its prompt re-ran merged with the correction - NOT a genuine failure, so
+   *  transports must never report it as one. */
+  superseded?: boolean;
+}
 
 export interface TurnRecord {
   turn: number;
@@ -54,7 +68,28 @@ export interface TurnRunnerOptions {
   /** How many finished turns to keep for reconnect replay. */
   historyMax?: number;
   now?: () => number;
+  /** Injectable sleep (steer waits for the aborted turn to unwind). Default setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
   log?: (msg: string) => void;
+}
+
+// Merge a follow-up utterance into the in-flight prompt for attach-and-reinterpret
+// (Feature 3, captain decision D3: keep the original verbatim). ONE line - the broker
+// submits via fm-send, where an embedded newline would split the message. Source-aware:
+// only a SPOKEN (phone/STT) follow-up is framed as the authoritative fix of a possible
+// speech-to-text misread; a typed web/SMS follow-up has no STT to misread, so it is
+// framed as an ADDITION that must not invite rewriting the original. Pure.
+export function buildSteerPrompt(original: string, correction: string, source: TurnSource): string {
+  const o = (original || '').replace(/\s+/g, ' ').trim();
+  const c = (correction || '').replace(/\s+/g, ' ').trim();
+  if (!o) return c;
+  if (!c) return o;
+  if (source === 'phone') {
+    return `${o}  [Correction from the captain, spoken just now - treat this as the ` +
+      `authoritative fix of a possible speech-to-text misread in the message above: ${c}]`;
+  }
+  return `${o}  [Additional instruction from the captain, sent just now - treat this as ` +
+    `an addition to the message above, not a replacement of any part of it: ${c}]`;
 }
 
 // Stage -> status mapping (moved verbatim from app.ts). synth = audio is being
@@ -77,10 +112,22 @@ export class TurnRunner {
   private readonly verbatimTap: VerbatimTap | null;
   private readonly historyMax: number;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: (msg: string) => void;
   private readonly listeners = new Set<(ev: TurnEvent) => void>();
   private turnCounter = 0;
-  private currentSignal: { aborted: boolean } | null = null;
+  private currentSignal: { aborted: boolean; superseded?: boolean } | null = null;
+  private _currentPrompt = '';
+  private _currentSource: TurnSource | null = null;
+  // Serialize steers so two rapid corrections can't both interrupt+re-run at once.
+  private steerChain: Promise<TurnResult> = Promise.resolve({ ok: false, turn: 0 });
+  // The merge-target accumulator: one pending steer per source, holding the combined
+  // prompt its re-run WILL inject. A correction arriving while the aborted turn is
+  // still unwinding (before the re-run starts, so _currentPrompt is the stale base)
+  // merges onto THIS instead - base + all prior corrections, never just the base -
+  // and marks the stale entry superseded so its re-run never fires (D4). The entry
+  // is removed the moment its run starts (from then on _currentPrompt covers it).
+  private pendingSteers = new Map<TurnSource, { combined: string; superseded: boolean }>();
 
   busy = false;
   history: TurnRecord[] = [];
@@ -90,8 +137,14 @@ export class TurnRunner {
     this.verbatimTap = opts.verbatim ?? null;
     this.historyMax = opts.historyMax ?? 50;
     this.now = opts.now ?? (() => Date.now());
+    this.sleep = opts.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.log = opts.log ?? (() => {});
   }
+
+  /** The prompt of the in-flight turn (for attach-and-reinterpret). '' when idle. */
+  get currentPrompt(): string { return this._currentPrompt; }
+  /** The transport that started the in-flight turn. null when idle. */
+  get currentSource(): TurnSource | null { return this._currentSource; }
 
   on(fn: (ev: TurnEvent) => void): () => void {
     this.listeners.add(fn);
@@ -123,7 +176,9 @@ export class TurnRunner {
     return this.awaitingConfirmation ? 'awaiting-confirmation' : 'idle';
   }
 
-  /** Explicit barge-in / hangup: abort the in-flight turn (if any). */
+  /** Raw abort of the in-flight turn (if any). Transport barge-in/hangup/stop routes
+   *  through the ownership-gated cancelIfSource below; the steer path calls this
+   *  directly after marking the signal superseded. */
   cancel(reason: string): boolean {
     if (this.currentSignal && !this.currentSignal.aborted) {
       this.currentSignal.aborted = true;
@@ -135,10 +190,23 @@ export class TurnRunner {
   }
 
   /**
+   * Ownership-gated cancel: abort the in-flight turn ONLY when `source` started it.
+   * A transport must never cancel a turn it does not own - aborting a foreign turn
+   * with `superseded` unset reads as a spurious failure on that transport (an SMS
+   * "turn failed" text, a dead web turn, a cut-off phone reply). Every transport-side
+   * barge-in/hangup/stop cancel routes through here; only the runner's own steer path
+   * uses the raw cancel() (a steer marks the signal superseded first).
+   */
+  cancelIfSource(source: TurnSource, reason: string): boolean {
+    if (!this.busy || this._currentSource !== source) return false;
+    return this.cancel(reason);
+  }
+
+  /**
    * Drive one full turn. Serialized: a concurrent call emits an `error` event and
    * returns { ok: false } - one agent session, one turn at a time, any transport.
    */
-  async run(text: string, source: TurnSource): Promise<{ ok: boolean; turn: number }> {
+  async run(text: string, source: TurnSource): Promise<TurnResult> {
     const trimmed = (text || '').trim();
     if (!trimmed) return { ok: false, turn: 0 };
     if (this.busy) {
@@ -146,8 +214,10 @@ export class TurnRunner {
       return { ok: false, turn: 0 };
     }
     this.busy = true;
+    this._currentPrompt = trimmed;
+    this._currentSource = source;
     const myTurn = ++this.turnCounter;
-    const signal = { aborted: false };
+    const signal: { aborted: boolean; superseded?: boolean } = { aborted: false };
     this.currentSignal = signal;
     const sentTs = this.now();
     this.emit({ type: 'sent', turn: myTurn, text: trimmed, source, ts: sentTs });
@@ -190,7 +260,7 @@ export class TurnRunner {
       vb = null;
       if (signal.aborted) {
         this.emit({ type: 'status', state: 'idle' });
-        return { ok: false, turn: myTurn };
+        return { ok: false, turn: myTurn, superseded: signal.superseded === true };
       }
       // The full raw reply lands at the end, then the authoritative byte-exact
       // verbatim text: the tap's final read when it anchored, else the reply.
@@ -226,11 +296,122 @@ export class TurnRunner {
     } catch (e) {
       this.emit({ type: 'error', message: (e as Error).message });
       this.emit({ type: 'status', state: 'idle' });
-      return { ok: false, turn: myTurn };
+      return { ok: false, turn: myTurn, superseded: signal.superseded === true };
     } finally {
       if (vb) { try { vb.stop(); } catch { /* already logged */ } }
       this.busy = false;
       this.currentSignal = null;
+      this._currentPrompt = '';
+      this._currentSource = null;
     }
+  }
+
+  /**
+   * Attach-and-reinterpret (Feature 3): a NEW utterance/line while a turn is in flight is
+   * merged into the in-flight prompt, and the agent turn is interrupted and re-run against
+   * the combined prompt - so a spoken correction of an STT misread steers the reply
+   * instead of being blocked. Not busy (and no explicit `original`): it's a plain new turn.
+   *
+   * The combined prompt is built and the in-flight turn aborted HERE, at request time -
+   * so a correction arriving DURING a steered re-run breaks that run's await immediately
+   * and merges (D4: always attach while in flight), instead of queueing behind the whole
+   * combined turn and then running bare. A correction arriving while the aborted turn is
+   * still UNWINDING (the re-run not yet started) merges onto the pending combined prompt
+   * and supersedes that stale re-run, so no earlier correction is ever lost from the
+   * final prompt. Aborted/superseded turns resolve `superseded`, never a failure.
+   * Serialized (steerChain) so two rapid corrections don't both interrupt+re-run at
+   * once; the returned promise resolves when the FINAL combined run() completes.
+   * `original` pins the prompt to attach to even if the in-flight turn has already settled
+   * (the phone barge-in path captures it before the caller finishes the correction).
+   */
+  steer(text: string, source: TurnSource, opts: { original?: string } = {}): Promise<TurnResult> {
+    const extra = (text || '').trim();
+    if (!extra) return Promise.resolve({ ok: false, turn: 0 });
+    // SAME-SOURCE only: a turn started by a DIFFERENT transport is never cancelled or
+    // interrupted from here - the combined prompt just queues behind it (_steer's wait).
+    const foreign = this.busy && this._currentSource !== source;
+    // Merge target: a same-source PENDING re-run's combined prompt beats everything (it
+    // already holds base + prior corrections; the pin and _currentPrompt would both be
+    // the stale base during the unwind window), then the barge-in pin, then the
+    // in-flight prompt. Empty -> nothing to attach to, just a fresh turn.
+    const prior = this.pendingSteers.get(source) ?? null;
+    const base = prior?.combined ?? opts.original ?? this._currentPrompt;
+    const entry = { combined: buildSteerPrompt(base, extra, source), superseded: false };
+    // The new correction re-merges everything the stale pending re-run carried, so
+    // that re-run must never fire - it would re-answer an outdated prompt.
+    if (prior) prior.superseded = true;
+    this.pendingSteers.set(source, entry);
+    if (this.busy && !foreign && this.currentSignal && !this.currentSignal.aborted) {
+      // Stop speaking the in-flight reply NOW (pipeline abort), marked as deliberately
+      // superseded so its transport never mistakes the abort for a failure.
+      this.currentSignal.superseded = true;
+      this.cancel('steer: attaching a correction and reinterpreting');
+    }
+    this.steerChain = this.steerChain
+      .catch(() => ({ ok: false, turn: 0 }))
+      .then(() => this._steer(entry, source, { interrupt: !foreign && base !== '' }));
+    return this.steerChain;
+  }
+
+  private async _steer(
+    entry: { combined: string; superseded: boolean },
+    source: TurnSource,
+    opts: { interrupt: boolean },
+  ): Promise<TurnResult> {
+    // A newer same-source correction re-merged this one into its own combined prompt -
+    // running it now would inject a stale prompt missing that correction.
+    if (entry.superseded) return { ok: false, turn: 0, superseded: true };
+    if (opts.interrupt) {
+      // Interrupt the underlying agent so it re-plans against the combined prompt. Best
+      // effort (D5): if it will not interrupt, the combined prompt still injects and the
+      // agent runs it right after the current turn - the correction is never lost.
+      try {
+        await this.driver.interrupt?.();
+      } catch (e) {
+        this.log('steer: agent interrupt failed (' + (e as Error).message + ') - queueing instead');
+      }
+    }
+    // Wait for the aborted turn to unwind (busy clears), then run the combined prompt
+    // as a fresh turn (fresh transcript anchor, fresh audio). The interrupt is
+    // best-effort and a draining pipeline can hold the lock well past a few seconds -
+    // HOLD the correction and keep retrying until the lock frees (bounded), never
+    // force run() into a silent busy rejection (D5: a correction is never lost).
+    const deadline = this.now() + STEER_UNWIND_TIMEOUT_MS;
+    while (this.now() < deadline) {
+      if (entry.superseded) return { ok: false, turn: 0, superseded: true };
+      if (!(await this.waitUntilFree(Math.min(8000, deadline - this.now())))) {
+        this.log('steer: prior turn still unwinding - holding the correction');
+        continue;
+      }
+      if (entry.superseded) return { ok: false, turn: 0, superseded: true };
+      if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
+      const r = await this.run(entry.combined, source);
+      if (r.turn !== 0) return r; // it actually ran - done (lost lock races retry)
+    }
+    this.log('steer: the prior turn never unwound - the correction could not run');
+    if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
+    this.emit({ type: 'error', message: 'could not apply the follow-up - the previous turn never finished unwinding' });
+    return { ok: false, turn: 0 };
+  }
+
+  /**
+   * Run a new turn, or - if a turn from the SAME transport is in flight OR a same-source
+   * steered re-run is still pending (the aborted turn unwinding) - attach the text and
+   * reinterpret. A DIFFERENT transport being busy falls through to run(), which
+   * rejects with the "one at a time" error rather than interrupting the other channel (an
+   * inbound SMS must never cut off a live phone-call turn). The phone leg drives steer()
+   * directly for its own barge-in/coalesce path.
+   */
+  submitOrSteer(text: string, source: TurnSource): Promise<TurnResult> {
+    if ((this.busy && this._currentSource === source) || this.pendingSteers.has(source)) {
+      return this.steer(text, source);
+    }
+    return this.run(text, source);
+  }
+
+  private async waitUntilFree(timeoutMs: number): Promise<boolean> {
+    const start = this.now();
+    while (this.busy && this.now() - start < timeoutMs) await this.sleep(50);
+    return !this.busy;
   }
 }

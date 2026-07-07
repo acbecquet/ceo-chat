@@ -51,6 +51,8 @@ export type ClientMessage =
   // Discard any buffered STT audio without transcribing (barge-in / mic released).
   | { type: 'stt-cancel' }
   // Barge-in / hangup: cancel the in-flight turn (stop pending speech + synthesis).
+  // Ownership-gated server-side: it aborts only a WEB-sourced turn - a live phone or
+  // SMS turn is never cut off by a web stop.
   | { type: 'stop' }
   // Outbound Call Mode: ask the broker to ring the captain's phone (Twilio REST).
   | { type: 'call-me' }

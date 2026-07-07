@@ -131,12 +131,15 @@ insets, ≥44px targets). Open the printed URL and you get:
   become buttons that submit the number, yes/no is detected; tap or speak, both work;
 - a **composer** that sends your typed line to firstmate (via the same `fm-send`
   verified submit), plus one-thumb bottom controls: **Call me** (ring your phone - see
-  Call Mode below), **Voice**, push-to-talk mic;
+  Call Mode below), **Voice**, push-to-talk mic; a follow-up line sent while your
+  previous turn is still running **attaches to it as an addition** and the turn
+  re-runs combined (attach-and-reinterpret);
 - **auto-spoken replies** — tap **Voice** once and every reply is read aloud
   automatically, **topic-block-by-block as it streams** (gapless, ordered; Web Audio
   decodes raw PCM). The local piper voice speaks real words with no key; MiniMax streams
   the same way once paired; the mock tone is for tests. **Replay** re-speaks the whole
-  last turn; **End** (or a barge-in) cancels the in-flight turn server-side;
+  last turn; **End** (or a barge-in) cancels the in-flight turn server-side (only a
+  turn the web itself started - a live phone or SMS turn is never cut off);
 - **status indicators** — listening / thinking / speaking / awaiting-confirmation —
   driven off real pipeline stages;
 - **hands-free voice input** — robust `webkitSpeechRecognition` (re-armed for iOS),
@@ -251,6 +254,18 @@ the web app is the **in-call companion** showing the exact reply text.
 - **Safe interactive prompts:** an unclear or absent spoken answer to a consequential
   question is re-asked once, then times out to a default that takes **no consequential
   action** - silence can never approve anything (`PromptPolicy` in `phone.ts`).
+- **Feels like a human call:** if the first spoken audio is slow, ONE short varied
+  "give me a second" filler line plays (exactly one per turn, never a repeating
+  cadence); during long turns the call speaks **REAL progress only** - short
+  screen-safe lines derived from the agent's actual tool activity
+  ([`src/server/activity.ts`](./src/server/activity.ts)), throttled, never repeated,
+  silent when nothing new happened. **Speak over it to correct it:** barge-in flushes
+  the audio and your next utterance **attaches to the in-flight prompt** as the
+  authoritative fix of a possible STT misread - the agent is interrupted (Escape to
+  the pane) and the turn re-runs with the combined prompt; a correction is never
+  lost (if the agent won't interrupt, it runs right after). Steering is same-source
+  only: the phone never cancels or rewrites a web/SMS-started turn - spoken lines
+  queue in spoken order and run right after it.
 
 Call Mode mounts only when `CEOCHAT_ALLOWED_CALLER` + `CEOCHAT_PHONE_PIN` are in
 `~/.config/ceo-chat/secrets.env`; outbound "Call me" also needs the
@@ -273,7 +288,11 @@ When the captain cannot talk, **text the Call Mode number** instead
   `Full reply:` link to the web transcript whenever the verbatim reply holds more
   detail. Any truncation FORCES that link (a cut-off text always carries the
   pointer), and the link itself always survives the cut. SMS turns broadcast to
-  every connected browser too, labeled "you (by text)".
+  every connected browser too, labeled "you (by text)". A quick follow-up text while
+  your previous text's turn is still running **attaches to it as an addition** and
+  the turn re-runs combined; the superseded turn stays silent (no spurious
+  "turn failed" text), and a superseded MMS turn's attachment-failure note is
+  carried forward to lead the combined reply.
 - **MMS attachments land in `inbox/`.** Photos/files are fetched (https-only,
   Basic auth attached only for Twilio hosts, capped at 10 items / 10 MB each) into
   the gitignored `inbox/` dir and referenced by absolute path in the injected line,
@@ -327,8 +346,8 @@ It covers:
 | **Speakability drift** | root cause (sentence fragments lose context, topic blocks keep it) · `runStreamingPipeline` summarizes blocks with the reply-so-far as context · mock-contract summaries cover every topic, name the recommended option, strip paths/URLs/PIDs (real reply-shape fixtures); `validate:live` adds a real-Gemini quality report (PENDING, never red) |
 | **Edge cases** | speakability drops code/paths/URLs & keeps questions/decisions · confirmation flow for consequential actions · long-op / "thinking" handling |
 | **Mobile** | pcm codec (browser↔node) · WAV header (HTMLAudio fallback) · audio auto-speak (unlock/queue/barge-in) · audio keep-alive + HTMLAudioElement fallback (iOS idle-suspend) · diagnostics ring buffer · STT controller (iOS restart/half-duplex/errors) · confirmation guard (§3.5) · server-STT seam over the WS · server-STT empty/failed surfaces a clear signal · **REAL audio e2e** (reply → speakify → piper TTS → whisper STT, "merge" survives; PENDING without `npm run voice`) |
-| **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
-| **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary and is FORCED by any truncation; one-line inject incl. the partial-MMS `WARNING`; ordinal failure naming; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only, the failure note leads the SMS reply) · notify gates (bad token 403, config-off 404, REST framing) |
+| **Call Mode (phone, mock Media Streams client - no Twilio account)** | mu-law codec + 8 kHz transcode (the exact Twilio wire bytes) · TwiML webhook (allowlist / signature / stream token / Call-me REST shape) · **keypad-only PIN gate** (nothing injected until it passes; pre-auth speech ignored entirely; hangup mid-transcription leaks nothing) · STT→send · media+mark framing round-trip · barge-in `clear`+abort / hangup abort (both **ownership-gated**: only a phone-sourced turn; a web/SMS turn survives, as does a foreign turn on a web `stop`) · unauth-WS hardening (anonymous sockets never hold the call slot; handshake deadline + pre-start cap) · interactive-prompt re-ask/safe-default policy · **human-call UX** (single thinking-filler per turn, one-shot, cancelled by real audio · real-only progress: throttle / no repeats / silence when nothing new / yields to reply audio · attach-and-reinterpret: merge + interrupt + re-run, source-aware framing, same-source-only, foreign-busy FIFO in spoken order with per-item budgets, barge-in pin, unwind-window attach) · **byte-exact verbatim transcript** (pure tap + over the WS) · iPhone UI (lossless fenced segments, answer card, PWA assets, reconnect resume) |
+| **Text Mode (SMS/MMS, mock Twilio - no account, no network)** | reply framing (narration leads; the `Full reply:` link survives the 1600-char boundary and is FORCED by any truncation; one-line inject incl. the partial-MMS `WARNING`; ordinal failure naming; notify-token parity with `bin/text-captain.sh`) · webhook e2e over the real endpoint (**403 unsigned**, silent stranger drop, Body→send through the same seam as speech, REST reply framing, `sent` frame source `'sms'`) · MMS intake (byte-exact inbox files, Twilio-scoped credentials, https-only, the failure note leads the SMS reply) · follow-up steering (a second text attaches + re-runs the in-flight SMS turn; a superseded turn sends NO spurious failure text while a genuine failure still texts; a superseded MMS turn's failure note is carried forward) · notify gates (bad token 403, config-off 404, REST framing) |
 
 ### Regression guards (the 3 fixed bugs cannot silently return)
 
@@ -450,8 +469,9 @@ src/
   cli/dev.ts               the CLI driver entrypoint
   server/protocol.ts       the browser <-> broker WS message contract
   server/driver.ts         Driver interface + BrokerDriver (decouples web from tmux)
-  server/turns.ts          ONE turn engine shared by web + phone + SMS (busy lock, history, verbatim tap)
+  server/turns.ts          ONE turn engine shared by web + phone + SMS (busy lock, history, verbatim tap, attach-and-reinterpret steering)
   server/verbatim.ts       the live 1:1 verbatim transcript source (byte-exact tap)
+  server/activity.ts       REAL-only mid-turn progress from the agent's tool activity (screen-safe spoken lines)
   server/app.ts            HTTP + WS transport (static UI, status, terminal, STT seam)
   server/phone.ts          Call Mode transport shell (Twilio webhook + Media Streams WS bridge)
   server/phone-audio.ts    pure G.711 mu-law codec + 8k↔16k resample + utterance VAD

@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { PhoneSecrets } from '../config/secrets.ts';
 import { textCapabilities } from '../config/secrets.ts';
-import type { TurnRunner } from './turns.ts';
+import type { TurnResult, TurnRunner } from './turns.ts';
 import { parseFormBody, validateTwilioSignature, sameNumber, sendSms, timingSafeEqualStr } from './twilio.ts';
 
 export const TEXT_WEBHOOK_PATH = '/text/webhook';
@@ -281,20 +281,30 @@ export function createTextApp(opts: TextAppOptions): TextApp {
     return { path, contentType, bytes: bytes.length };
   }
 
-  /** Run the injected text once the shared turn lock frees up (bounded wait). */
-  async function runWhenFree(text: string): Promise<{ ok: boolean; turn: number }> {
+  /** Run the injected text once the shared turn lock frees up (bounded wait). A quick
+   *  follow-up text while ANOTHER SMS turn is in flight attaches + reinterprets (Feature
+   *  3); a phone/web turn holding the lock is WAITED on, never interrupted - an inbound
+   *  text must never cut off a live call. */
+  async function runWhenFree(text: string): Promise<TurnResult> {
     const t0 = now();
     for (;;) {
-      if (!runner.busy) {
-        const r = await runner.run(text, 'sms');
-        // ok, or it genuinely ran and failed mid-turn (turn > 0): both are final.
+      if (!runner.busy || runner.currentSource === 'sms') {
+        const r = await runner.submitOrSteer(text, 'sms');
+        // ok, genuinely failed mid-turn, or superseded by a follow-up: all final
+        // (a superseded steer can resolve with turn 0 when its pending re-run was
+        // re-merged before ever starting - the combined turn answers it). A plain
         // turn === 0 means the run never started (lost a busy race) - keep waiting.
-        if (r.ok || r.turn > 0) return r;
+        if (r.ok || r.turn > 0 || r.superseded) return r;
       }
       if (now() - t0 >= busyTimeoutMs) return { ok: false, turn: 0 };
       await sleep(250);
     }
   }
+
+  // Media-failure notes from turns that were superseded by a follow-up before they
+  // could reply: the note must still reach the captain (a dropped photo is never
+  // silently assumed seen), so it rides the front of the next outbound reply.
+  let carriedNotes = '';
 
   /** The full inbound flow, detached from the webhook response. */
   async function handleInbound(params: Record<string, string>): Promise<void> {
@@ -339,17 +349,28 @@ export function createTextApp(opts: TextAppOptions): TextApp {
       : '';
 
     const result = await runWhenFree(text);
+    if (result.superseded) {
+      // The captain's own follow-up text steered this turn: the combined turn answers
+      // both messages, so the superseded one stays silent - no failure text, no wasted
+      // outbound message. Its media-failure note is NOT dropped with it: the note is
+      // carried forward and leads the combined turn's reply instead.
+      if (failNote) carriedNotes += failNote;
+      log(`text: turn ${result.turn} superseded by a follow-up - the combined turn replies`);
+      return;
+    }
+    const notes = carriedNotes + failNote;
+    carriedNotes = '';
     if (result.turn === 0) {
-      await textCaptain(failNote + 'first mate is mid-turn and stayed busy - text again in a minute.');
+      await textCaptain(notes + 'first mate is mid-turn and stayed busy - text again in a minute.');
       return;
     }
     if (!result.ok) {
-      await textCaptain(failNote + `That turn failed - check the transcript at ${publicUrl}`);
+      await textCaptain(notes + `That turn failed - check the transcript at ${publicUrl}`);
       return;
     }
     const rec = runner.history.find((r) => r.turn === result.turn);
-    const replyBody = (failNote + formatSmsReply(
-      rec?.narration ?? '', rec?.verbatim || rec?.reply || '', publicUrl, SMS_BODY_LIMIT - failNote.length,
+    const replyBody = (notes + formatSmsReply(
+      rec?.narration ?? '', rec?.verbatim || rec?.reply || '', publicUrl, SMS_BODY_LIMIT - notes.length,
     )).trimEnd();
     if (replyBody) await textCaptain(replyBody);
   }
