@@ -16,13 +16,13 @@ The human-call UX layer (the thinking-filler, real-only progress, and spoken cor
          -> TwiML <Connect><Stream url="wss://ceo-chat.acb-apps.com/phone">
    <-> bidirectional Media Streams WS (8 kHz mu-law base64)
          src/server/phone.ts (the transport shell; the pipeline below is unchanged)
-           inbound : mu-law -> PCM -> whisper -> TurnRunner -> fm-send inject
+           inbound : mu-law -> PCM -> whisper -> dictation cleanup -> TurnRunner -> fm-send inject
            outbound: pipeline audio chunks -> 8 kHz mu-law -> media+mark
            barge-in: speak over first mate -> `clear` + abort of the call's OWN turn;
                      your next utterance attaches + reinterprets (steer)
 ```
 
-The phone shell reuses the whole existing stack: whisper STT, Gemini speakability, the captain's cloned MiniMax voice (or piper), the prompt-anchored transcript tap, and fm-send injection.
+The phone shell reuses the whole existing stack: whisper STT (`base.en`), the LLM dictation cleanup, Gemini speakability, the captain's cloned MiniMax voice (or piper), the prompt-anchored transcript tap, and fm-send injection.
 Nothing below `Broker.send` changed.
 
 ## Captain setup checklist
@@ -60,6 +60,8 @@ MiniMax cloned voice, Gemini, and whisper are already configured - unchanged by 
   Three keypad failures end the call.
   Nothing is ever injected into the session before the PIN passes.
 - Talk normally; pause and first mate answers.
+  What you said is cleaned up before it is injected: one fast LLM pass (Gemini by default, when its key is paired) fixes speech-to-text misreads like "pole request" -> "pull request" and drops filler.
+  On any cleanup error or timeout the raw transcript is used instead, so the call never stalls.
   If the first spoken audio is slow, first mate says ONE short "give me a second" line - exactly one per turn, never a repeating cadence.
   During a long turn it speaks REAL progress only: short lines derived from what the agent is actually doing (its tool activity), throttled to about one every 20 seconds, never repeated, and silent when nothing new happened.
 - **Speak over it to correct it** (barge-in): the audio flushes, and what you say next attaches to the in-flight request as the authoritative fix of a possible mishearing - the agent is interrupted and the turn re-runs with the combined request.
@@ -79,6 +81,8 @@ This lives in one small config - `PromptPolicy` in `src/server/phone.ts` (`DEFAU
 `reAsks` (how many re-asks), `answerTimeoutMs` (the silence window), and `onUnresolved` (`'no-action'` or `'send-cancel'` to answer an explicit "cancel" instead).
 The spoken phrases are right next to it.
 
+Your answer to a consequential question is always classified on the RAW transcript - it never passes through the dictation-cleanup LLM, so a model can never turn a "no" into a "yes".
+
 ## Security model
 
 - **Caller-ID allowlist** - the webhook rejects any call where neither `From` nor `To` is `CEOCHAT_ALLOWED_CALLER` (`<Reject/>`, the call never connects).
@@ -94,12 +98,12 @@ The spoken phrases are right next to it.
 - Number: **$1.15/mo**.
 - Inbound: $0.0085/min + $0.004/min Media Streams = **$0.0125/min** (~$0.75/hr).
 - Outbound: $0.0140/min + $0.004/min = **$0.0180/min** (~$1.08/hr).
-- STT/speakability/TTS: no new fees (self-hosted whisper, existing Gemini + MiniMax/piper).
+- STT/speakability/TTS: no new fees (self-hosted whisper, existing Gemini + MiniMax/piper; the dictation cleanup rides the same free-tier Gemini key - only the optional MiniMax cleanup backend spends credits).
 
 ## Validation
 
 `npm run validate` includes mock Call Mode legs (no Twilio account, no network):
-the mu-law wire transcode, the webhook allowlist + signature + token, the keypad-only PIN gate (nothing injected until it passes; pre-auth speech ignored entirely), anonymous-socket hardening (pre-start sockets never hold the call slot; handshake deadline + cap), STT -> send, media+mark framing, barge-in `clear` + own-turn abort, hangup own-turn abort (a web/SMS turn survives both, and a web `stop` never cancels a phone turn), the single thinking-filler (one-shot, cancelled by real audio), real-only progress (throttle, no repeats, silence when nothing new, yields to reply audio), attach-and-reinterpret (merge + interrupt + re-run, source-aware framing, same-source-only, the foreign-busy queue in spoken order with per-item budgets, the barge-in pin, unwind-window attach), the interactive-prompt re-ask/safe-default policy, and the byte-exact verbatim web transcript.
+the mu-law wire transcode, the webhook allowlist + signature + token, the keypad-only PIN gate (nothing injected until it passes; pre-auth speech ignored entirely), anonymous-socket hardening (pre-start sockets never hold the call slot; handshake deadline + cap), STT -> send, media+mark framing, barge-in `clear` + own-turn abort, hangup own-turn abort (a web/SMS turn survives both, and a web `stop` never cancels a phone turn), the single thinking-filler (one-shot, cancelled by real audio), real-only progress (throttle, no repeats, silence when nothing new, yields to reply audio), attach-and-reinterpret (merge + interrupt + re-run, source-aware framing, same-source-only, the foreign-busy queue in spoken order with per-item budgets, the barge-in pin, unwind-window attach), the interactive-prompt re-ask/safe-default policy, the byte-exact verbatim web transcript, and the dictation-cleanup legs (mock contract + sanitize, fail-safe raw fallback on error/timeout/empty/truncated output, spoken-order utterance serialization, and the D4 guard: a consequential confirmation is injected RAW and the cleanup LLM is never called).
 
 ## Remaining live test (captain-gated)
 

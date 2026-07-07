@@ -7,7 +7,7 @@
 //   2. the round-trip audio e2e gate (`npm run validate`): piper TTS -> this STT,
 //      proving the voice loop with REAL generated audio, headless, no creds.
 //
-// `bin/setup-local-voice.sh` builds whisper-cli + downloads ggml-tiny.en into
+// `bin/setup-local-voice.sh` builds whisper-cli + downloads ggml-base.en into
 // $CEOCHAT_VOICE_DIR. whisper.cpp requires 16 kHz mono WAV, so we resample with the
 // SAME pure helper the browser uses (src/web/pcm.js#downsampleFloat32) — one
 // resampler, asserted by the harness — then wrap the result in a WAV header.
@@ -26,7 +26,7 @@ export const WHISPER_SAMPLE_RATE = 16000;
 export interface Transcriber {
   /** Transcribe s16le mono PCM at `sampleRate` into text (best-effort, may be ''). */
   transcribe(pcm: Buffer, sampleRate: number): Promise<string>;
-  /** Human label for logs / the UI (e.g. "whisper.cpp tiny.en"). */
+  /** Human label for logs / the UI (e.g. "whisper.cpp base.en"). */
   readonly label: string;
 }
 
