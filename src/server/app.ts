@@ -67,6 +67,12 @@ export interface WebAppOptions {
    * confirmation guard applies before it reaches firstmate. Undefined -> disabled.
    */
   transcribe?: (pcm: Buffer, sampleRate: number) => Promise<string>;
+  /**
+   * Optional dictation cleanup for the server-STT transcript (report ceochat-stt-w4).
+   * When present, the transcribed text is cleaned before it is handed back to the
+   * client to confirm. NEVER throws (raw on failure). Absent -> the raw transcript.
+   */
+  cleanPrompt?: (raw: string) => Promise<string>;
   /** Human label for the STT backend (advertised in `hello`). */
   sttLabel?: string;
   /** Live 1:1 verbatim transcript source (the transcript tap). Optional. */
@@ -137,6 +143,7 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
   const log = opts.log ?? (() => {});
   const driver = opts.driver;
   const transcribe = opts.transcribe;
+  const cleanPrompt = opts.cleanPrompt;
   const sttLabel = opts.sttLabel ?? '';
   const phone = opts.phone ?? null;
   const text = opts.text ?? null;
@@ -317,8 +324,13 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         const rate = buf.sampleRate;
         log(`stt: transcribing ${pcm.length} bytes @ ${rate}Hz`);
         void transcribe(pcm, rate)
-          .then((text) => {
-            const t = (text || '').trim();
+          .then(async (text) => {
+            let t = (text || '').trim();
+            // Optional dictation cleanup before the human confirms (report §5: safe here
+            // because the client still confirms). Never blocks - raw on any failure.
+            if (t && cleanPrompt) {
+              try { t = (await cleanPrompt(t)).trim() || t; } catch { /* keep raw */ }
+            }
             // ALWAYS return a transcript frame - even empty - so the client can SHOW
             // "heard nothing" rather than the mic silently swallowing the utterance.
             if (!t) {

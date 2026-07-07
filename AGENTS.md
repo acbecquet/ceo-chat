@@ -735,6 +735,56 @@ Three features that make a phone call feel like a human call (plan+decisions:
   driver - no wall clock; the slow-unwind leg injects a virtual `now`/`sleep`). Real
   Escape-interrupt over tmux is captain-gated (needs a live claude pane).
 
+## Phase 12 - Wispr-Flow dictation: better STT model + LLM cleanup pass
+The captain hit frequent phone misreads. Root cause (scout `data/ceochat-stt-w4/`):
+the STT was whisper.cpp **tiny.en** fed 8 kHz telephony - it mangles "pull request" ->
+"pole request". This phase raises accuracy at the SOURCE (bump the local model) AND
+adds the Wispr-Flow signature: a raw transcript -> one fast LLM call -> a cleaned,
+well-formed prompt, before it reaches the agent. Pipeline below `Broker.send` is UNCHANGED.
+- **Local model bumped tiny.en -> base.en** (`src/server/stt.ts#findWhisper`, decision D1):
+  ~2s/utterance on this CPU-only box vs tiny's misreads. `findWhisper` now RESOLVES the
+  model (env `CEOCHAT_WHISPER_MODEL` > `ggml-base.en.bin` > `ggml-tiny.en.bin`) so a stale
+  voice dir with only tiny.en still works; the label reflects the chosen model
+  (`whisper.cpp base.en`). `bin/setup-local-voice.sh` now fetches base.en by default
+  (`CEOCHAT_WHISPER_MODEL_NAME` overrides). GPU-era claims do NOT hold here: on this
+  CPU-only VM medium.en (~16s) and large-v3-turbo (~23s) are SLOWER than real-time -
+  base.en is the accuracy/latency sweet spot; the report has the full benchmark.
+- **The cleanup pass = `src/stt/cleanup.ts`** (mirrors the speakability fail-safe).
+  `cleanPrompt(raw, opts)` NEVER throws and NEVER blocks: on any error/timeout/sanity
+  failure it returns the RAW transcript (report §4.4). Backends (D2): **gemini** DEFAULT
+  (fast ~0.6s, free-tier, the same key speakability uses), **minimax** configurable
+  (slower ~2s, costs credits - captain okayed it), **mock** (deterministic offline
+  reference the harness asserts). `mockCleanup` = the §4.3 contract as code (obvious ASR
+  fixes, filler removal, repeat-collapse, single line, sentence case) - conservative on
+  purpose (never change meaning / drop a specific). `sanitizeCleaned` enforces the output
+  invariants: flatten newlines + strip backticks/quotes IN PLACE, but REJECT (-> raw) an
+  empty or ballooned (> 2.5x word-count) result (hallucination guard). Gemini body reuses
+  the `thinkingBudget:0` gotcha; MiniMax is `chatcompletion_v2` (Bearer + GroupId-in-query,
+  model `MiniMax-Text-01`).
+- **Selection/config** (`src/config/secrets.ts`): `cleanupConfig(env)` reads
+  `CEOCHAT_STT_CLEANUP` (auto|on|off, default **auto**), `CEOCHAT_STT_CLEANUP_BACKEND`
+  (gemini|minimax, default gemini), `CEOCHAT_STT_CLEANUP_TIMEOUT_MS` (default 1500).
+  `makePromptCleaner(...)` returns a cleaner or **null** when disabled; D3: `auto` = ON iff
+  a cleanup key (GEMINI or MINIMAX) exists (else null = today's raw behavior). `sttEngine(env)`
+  reads `CEOCHAT_STT_ENGINE` (whisper-local default; gemini-audio/deepgram are RESERVED
+  names, not yet wired - a request for them logs a note and uses whisper-local).
+  `serve.ts` builds ONE cleaner and injects it into BOTH the phone leg and the web
+  server-STT path.
+- **Where it runs (composes with Phase 11)**: `phone.ts#onUtterance` cleans the transcript
+  UPSTREAM of `handleCommand`/`routeUtterance`/`submitOrSteer`, so a fresh turn AND an
+  attach-and-reinterpret correction both inject cleaned text. **SAFETY (decision D4,
+  non-negotiable):** a consequential CONFIRMATION (yes/no) NEVER passes through the cleanup
+  LLM - `onUtterance` skips cleanup when `awaitingConfirmation && looksConsequential`, and
+  `handleCommand` classifies + injects the RAW transcript for the guard-send path. An LLM
+  can never flip a "no" to a "yes". The web STT path cleans only the transcript the human
+  still confirms (report §5). Absent config -> `cleanPrompt` is undefined -> verbatim inject
+  (today's behavior).
+- **Validate legs (mock, no network):** cleanup mock contract + sanitize, request bodies +
+  backend/config selection, the fail-safe (error/non-200/timeout/empty all return raw), and
+  the explicit **D4 guard-safety leg** over the real phone WS (a normal command IS cleaned;
+  a consequential confirmation is injected RAW and the cleanup spy is never called). A
+  `--live` leg reports Gemini cleanup quality as PENDING (never red) without a key.
+
 ## Validation / shipping
 - Validate and ship via **no-mistakes** (`/no-mistakes`); never push to `main` or self-merge.
 - **CI:** `.github/workflows/validate.yml` runs `npm ci` + `npm run typecheck` +

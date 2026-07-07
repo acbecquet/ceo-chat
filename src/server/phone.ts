@@ -167,6 +167,14 @@ export interface PhoneAppOptions {
   runner: TurnRunner;
   /** whisper STT (absent -> spoken commands unavailable; the PIN is keypad-only). */
   transcribe?: (pcm: Buffer, sampleRate: number) => Promise<string>;
+  /**
+   * Dictation cleanup (report ceochat-stt-w4): raw transcript -> a cleaned, well-formed
+   * prompt. NEVER throws and NEVER blocks (returns the raw transcript on any failure).
+   * Absent -> commands inject verbatim (today's behavior). It is applied UPSTREAM of
+   * submitOrSteer so corrections/steers get cleaned too, and it is SKIPPED for
+   * consequential confirmations (decision D4 - an LLM must never flip a "no" to "yes").
+   */
+  cleanPrompt?: (raw: string) => Promise<string>;
   /** TTS for canned phrases (PIN prompt / greeting / re-asks). Absent -> silent. */
   synthPrompt?: (text: string) => Promise<{ pcm: Buffer; sampleRate: number }>;
   secrets: PhoneSecrets;
@@ -446,15 +454,27 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       }
       if (this.closed) return;
       if (!text) return;
-      this.handleCommand(text);
+      // Dictation cleanup (report ceochat-stt-w4 §4): fix ASR misreads + structure the
+      // request BEFORE it reaches the runner, so both a fresh turn and an attach-and-
+      // reinterpret correction inject the cleaned text. SKIPPED for a consequential
+      // confirmation (D4): a yes/no is classified on the RAW transcript so the cleanup
+      // LLM can never turn a "no" into a "yes" (handleCommand also guards on raw).
+      let cleaned = text;
+      const guardActive = runner.awaitingConfirmation && looksConsequential(runner.lastNarration);
+      if (opts.cleanPrompt && !guardActive) {
+        try { cleaned = await opts.cleanPrompt(text); } catch { cleaned = text; }
+        if (this.closed) return;
+      }
+      this.handleCommand(text, cleaned);
     }
 
-    /** An authenticated spoken line: §3.5 guard, then into the shared runner. */
-    private handleCommand(text: string): void {
+    /** An authenticated spoken line: §3.5 guard on the RAW transcript (D4), then the
+     *  cleaned text into the shared runner. */
+    private handleCommand(raw: string, cleaned: string): void {
       this.clearAnswerTimer();
       if (runner.awaitingConfirmation && looksConsequential(runner.lastNarration)) {
         const decision = guardUtterance({
-          source: 'voice', text,
+          source: 'voice', text: raw,
           awaitingConfirmation: true, lastNarration: runner.lastNarration,
         });
         if (decision.action === 'reprompt') {
@@ -465,9 +485,13 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
           this.armAnswerTimer();
           return;
         }
+        // A clear confirm/cancel: inject the RAW validated reply, never a cleaned rewrite.
+        this.reAskCount = 0;
+        this.routeUtterance(raw);
+        return;
       }
       this.reAskCount = 0;
-      this.routeUtterance(text);
+      this.routeUtterance(cleaned);
     }
 
     // A captain utterance: a FRESH turn ONLY when truly idle (immediate, so first audio
