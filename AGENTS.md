@@ -136,7 +136,9 @@ streaming TTS. Decision-ready plan:
 - **Voice-in (browser STT)** is best-effort `webkitSpeechRecognition` in `public/app.js`;
   unsupported → the text input is the reliable fallback. Real cloud/local STT is a later
   phase — do NOT build it here.
-- **Turns are serialized** (one `busy` lock); a concurrent `send` gets an `error` frame.
+- **Turns are serialized** (one `busy` lock); a concurrent `send` gets an `error` frame
+  (since Phase 11 a same-source web follow-up attaches + reinterprets via
+  `submitOrSteer` instead; only a foreign-source busy still errors).
   All turn output is broadcast to every connected client so multiple tabs stay in sync.
 - **Tunnel-ready, host-agnostic.** Serve plain HTTP on `127.0.0.1` (env `CEOCHAT_HOST`/
   `CEOCHAT_PORT`, default `127.0.0.1:8420`); the page upgrades to a RELATIVE same-origin
@@ -349,7 +351,9 @@ streaming TTS. Decision-ready plan:
   cancelled when the initiating socket drops — a refresh mid-turn re-joins the broadcast and
   receives the REMAINING chunks, so it never wedges. Cancel is EXPLICIT only: the `stop`
   client frame (sent on hangup) sets the turn's abort signal → `streamReply`/pipeline stop
-  emitting + synthesizing. Turns stay serialized (one `busy` lock).
+  emitting + synthesizing (since Phase 11 ownership-gated: `cancelIfSource('web', …)`
+  aborts only a WEB-sourced turn - a live phone/SMS turn survives a web hangup). Turns
+  stay serialized (one `busy` lock).
 - **WS protocol additions:** client→server `stop`; server→client `notice`; `narration`/
   `audio` carry an `index` (progressive ordering) and `reply`/`narration`/`audio`/`turn-done`
   an optional `replay`. When chunks streamed (`result.chunks>0`) app.ts SKIPS the aggregate
@@ -678,12 +682,16 @@ Three features that make a phone call feel like a human call (plan+decisions:
   arrival, so an early item's expiry drops only that item and a late-spoken line keeps
   its full patience window - per-utterance retry timers would race when the lock
   frees and run lines out of spoken order) and runs as its OWN turn right after, in
-  spoken order, so typed work is never rewritten. The phone leg NEVER cancels a turn
-  it does not own (`cancelOwnTurn`: no-op unless `runner.currentSource === 'phone'`) -
-  both barge-in AND hangup/teardown cancel only a phone-sourced turn; over a foreign
-  turn barge-in flushes the local Twilio audio (`clear`) and a hangup just tears the
-  call down, letting the turn complete so its transport never texts a spurious
-  "turn failed". The
+  spoken order, so typed work is never rewritten. A transport NEVER cancels a turn
+  it does not own - the CENTRAL ownership gate is `runner.cancelIfSource(source,
+  reason)` (no-op unless `source` started the in-flight turn; only the runner's own
+  steer path uses the raw `cancel()`, marking the signal superseded first). The phone
+  leg's `cancelOwnTurn` routes both barge-in AND hangup/teardown through it (only a
+  phone-sourced turn), and the web `stop` handler routes through the same gate with
+  `'web'` - so over a foreign turn barge-in flushes the local Twilio audio (`clear`)
+  and a hangup just tears the call down, letting the turn complete so its transport
+  never texts a spurious "turn failed", and a web voice-hangup never cuts off a live
+  phone/SMS turn. The
   phone leg coalesces (`steerCoalesceMs`, default 700) + a
   Twilio `clear` flush; barge-in PINS the in-flight prompt (`steerOriginal`, TTL
   `STEER_PIN_TTL_MS`) so a mid-speech correction attaches even after the barge aborts the
@@ -718,7 +726,9 @@ Three features that make a phone call feel like a human call (plan+decisions:
   foreign turn drain in spoken order, a late-queued utterance keeps its own patience
   budget, a barge-in over a foreign-source turn flushes audio without cancelling it,
   and a hangup cancels only the caller's own turn - a foreign turn survives the
-  teardown) + `text - follow-up steers the SMS turn`
+  teardown) + `web - stop cancels only a web-sourced turn` (`cancelIfSource` no-ops
+  when idle or foreign: a phone-sourced turn survives a web stop; a web-sourced turn
+  still aborts) + `text - follow-up steers the SMS turn`
   (no spurious failure SMS for a
   superseded turn; a genuine failure still texts) + `text - superseded MMS turn` (its
   media-failure note is carried forward and leads the combined reply). All deterministic (injected `PhoneTimers` + fake taps + a controllable

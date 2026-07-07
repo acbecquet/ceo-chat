@@ -176,7 +176,9 @@ export class TurnRunner {
     return this.awaitingConfirmation ? 'awaiting-confirmation' : 'idle';
   }
 
-  /** Explicit barge-in / hangup: abort the in-flight turn (if any). */
+  /** Raw abort of the in-flight turn (if any). Transport barge-in/hangup/stop routes
+   *  through the ownership-gated cancelIfSource below; the steer path calls this
+   *  directly after marking the signal superseded. */
   cancel(reason: string): boolean {
     if (this.currentSignal && !this.currentSignal.aborted) {
       this.currentSignal.aborted = true;
