@@ -188,6 +188,19 @@ export class TurnRunner {
   }
 
   /**
+   * Ownership-gated cancel: abort the in-flight turn ONLY when `source` started it.
+   * A transport must never cancel a turn it does not own - aborting a foreign turn
+   * with `superseded` unset reads as a spurious failure on that transport (an SMS
+   * "turn failed" text, a dead web turn, a cut-off phone reply). Every transport-side
+   * barge-in/hangup/stop cancel routes through here; only the runner's own steer path
+   * uses the raw cancel() (a steer marks the signal superseded first).
+   */
+  cancelIfSource(source: TurnSource, reason: string): boolean {
+    if (!this.busy || this._currentSource !== source) return false;
+    return this.cancel(reason);
+  }
+
+  /**
    * Drive one full turn. Serialized: a concurrent call emits an `error` event and
    * returns { ok: false } - one agent session, one turn at a time, any transport.
    */

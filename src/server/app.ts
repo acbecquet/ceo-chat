@@ -297,7 +297,11 @@ export async function createWebApp(opts: WebAppOptions): Promise<WebApp> {
         } catch { /* skip bad chunk */ }
         if (typeof msg.sampleRate === 'number' && msg.sampleRate > 0) buf.sampleRate = msg.sampleRate;
       } else if (msg.type === 'stop') {
-        runner.cancel('client stop (barge-in/hangup)');
+        // Ownership-gated: a web stop (voice hangup) aborts only a WEB-sourced turn.
+        // A live phone caller's turn or an SMS-initiated turn must run to completion -
+        // cancelling it would read as a spurious failure on that transport (the same
+        // class the phone leg's barge-in/hangup gates prevent).
+        runner.cancelIfSource('web', 'client stop (barge-in/hangup)');
       } else if (msg.type === 'stt-cancel') {
         sttBuffers.delete(ws);
       } else if (msg.type === 'stt-end') {

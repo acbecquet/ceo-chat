@@ -3537,6 +3537,59 @@ await reporter.leg('phone - hangup cancels only the caller\'s own turn - a forei
   }
 });
 
+// F3 (round 8) - the LAST ungated cancel site: the web `stop` frame. A web voice-hangup
+// must abort only a WEB-sourced turn; a live phone caller's or SMS-initiated turn keeps
+// running (cancelling it would be the same spurious-failure class the phone leg's
+// barge-in/hangup ownership gates prevent). Centralized in runner.cancelIfSource.
+await reporter.leg('web - stop cancels only a web-sourced turn - a foreign (phone/SMS) turn survives', async (t) => {
+  let sawAborted = 0;
+  const runs: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'done', narration: 'Done.', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) { sawAborted++; done(); } }, 5);
+    }),
+    terminalSnapshot: () => 'ceo-chat',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const app = await createWebApp({ driver, runner, host: '127.0.0.1', port: 0, terminalPollMs: 0, log: () => {} });
+  try {
+    const web = new WsClient(`ws://127.0.0.1:${app.port}${WS_PATH}`);
+    await new Promise<void>((resolve, reject) => { web.on('open', () => resolve()); web.on('error', reject); });
+
+    // ---- pure gate: cancelIfSource refuses a wrong-source / idle cancel
+    t.ok(!runner.cancelIfSource('web', 'idle probe'), 'cancelIfSource is a no-op when idle');
+
+    // ---- a foreign (phone-sourced) turn is in flight: web stop must NOT cancel it
+    const phoneP = runner.run('phone: check the deploy', 'phone');
+    t.ok(await until(() => runner.busy && runs.length === 1), 'a foreign phone-sourced turn is in flight');
+    web.send(JSON.stringify({ type: 'stop' }));
+    await realSleep(80);
+    t.eq(sawAborted, 0, 'the web stop did NOT cancel the phone-sourced turn');
+    t.ok(runner.busy, 'the foreign turn keeps running');
+    releases[0]!();
+    const phoneR = await phoneP;
+    t.ok(phoneR.ok, 'the foreign turn completed ok - no spurious failure on its transport');
+
+    // ---- a web-sourced turn: web stop still cancels it (explicit same-source hangup)
+    const webP = runner.run('web: long job', 'web');
+    t.ok(await until(() => runner.busy && runs.length === 2), 'a web-sourced turn is in flight');
+    web.send(JSON.stringify({ type: 'stop' }));
+    t.ok(await until(() => sawAborted === 1), 'the web stop still aborts a web-sourced turn');
+    await webP;
+    web.close();
+  } finally {
+    await app.close();
+  }
+});
+
 // V1 - the 1:1 VERBATIM transcript, byte-exact. The tap streams the exact assistant
 // text (code fences, odd whitespace and all) while the reply grows, and the final
 // read equals the session transcript text byte-for-byte.

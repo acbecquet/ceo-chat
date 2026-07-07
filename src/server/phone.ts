@@ -798,9 +798,10 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
     /** The phone leg must never cancel a turn it does not own: a foreign (web/SMS)
      *  turn runs to completion and delivers its own reply - aborting it would read
      *  as a spurious failure on that transport (a "turn failed" text, a dead web
-     *  turn). Every phone-side runner.cancel routes through here. */
+     *  turn). Every phone-side runner.cancel routes through the runner's central
+     *  ownership gate (shared with the web `stop` handler). */
     private cancelOwnTurn(reason: string): void {
-      if (runner.busy && runner.currentSource === 'phone') runner.cancel(reason);
+      runner.cancelIfSource('phone', reason);
     }
 
     private send(obj: unknown): void {
