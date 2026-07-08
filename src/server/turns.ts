@@ -390,9 +390,11 @@ export class TurnRunner {
    * so a correction arriving DURING a steered re-run breaks that run's await immediately
    * and merges (D4: always attach while in flight), instead of queueing behind the whole
    * combined turn and then running bare. A correction arriving while the aborted turn is
-   * still UNWINDING (the re-run not yet started) merges onto the pending combined prompt
-   * and supersedes that stale re-run, so no earlier correction is ever lost from the
-   * final prompt. Aborted/superseded turns resolve `superseded`, never a failure.
+   * still UNWINDING (the re-run not yet started) extends the SAME active chain (true base
+   * + prior corrections) and supersedes that stale re-run, so no earlier correction is
+   * ever lost from the final prompt - which is always the base + exactly ONE frame
+   * carrying every correction once, in spoken order (buildSteerPrompt never re-wraps).
+   * Aborted/superseded turns resolve `superseded`, never a failure.
    * Serialized (steerChain) so two rapid corrections don't both interrupt+re-run at
    * once; the returned promise resolves when the FINAL combined run() completes.
    * `original` pins the prompt to attach to even if the in-flight turn has already settled
@@ -489,8 +491,8 @@ export class TurnRunner {
 
   /**
    * Run a new turn, or - if a turn from the SAME transport is in flight OR a same-source
-   * steered re-run is still pending (the aborted turn unwinding) - attach the text and
-   * reinterpret. A DIFFERENT transport being busy falls through to run(), which
+   * steer chain is active (the aborted turn unwinding or its re-run in flight) - attach
+   * the text and reinterpret. A DIFFERENT transport being busy falls through to run(), which
    * rejects with the "one at a time" error rather than interrupting the other channel (an
    * inbound SMS must never cut off a live phone-call turn). The phone leg drives steer()
    * directly for its own barge-in/coalesce path.

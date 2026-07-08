@@ -714,7 +714,7 @@ Three features that make a phone call feel like a human call (plan+decisions:
   the combined re-run (which would then override it). With a phone steer pending,
   `fireSteer` takes the foreign-busy submit fallback ONLY when `steerPending` is 0: a
   correction landing while a foreign turn transiently holds the unwind-window lock merges
-  onto the pending phone entry via `runner.steer` (which queues behind the foreign turn
+  onto the active phone chain via `runner.steer` (which queues behind the foreign turn
   without touching it), never a bare submit racing the re-run. Web routes `send` through
   `submitOrSteer`; SMS `runWhenFree` attaches a
   same-source follow-up but waits on a phone/web turn. D5 (a correction is NEVER lost):

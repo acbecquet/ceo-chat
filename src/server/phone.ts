@@ -545,8 +545,9 @@ export function createPhoneApp(opts: PhoneAppOptions): PhoneApp {
       // A foreign-source turn grabbed the lock while the buffer coalesced (no pin, not a
       // phone turn, no phone steer pending): never steer it - queue the utterance to run
       // as its own turn (D5). With a phone steer PENDING the correction belongs to the
-      // phone chain instead: runner.steer merges it onto the pending combined prompt and
-      // queues behind the foreign turn without ever cancelling or interrupting it.
+      // phone chain instead: runner.steer extends the active chain (base + prior
+      // corrections) and queues behind the foreign turn without ever cancelling or
+      // interrupting it.
       if (!original && this.steerPending === 0 && runner.busy && runner.currentSource !== 'phone') {
         this.enqueueForeignBusy(joined);
         return;
