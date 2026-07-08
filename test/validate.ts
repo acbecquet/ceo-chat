@@ -101,7 +101,7 @@ import {
   createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY, DEFAULT_FILLER,
   PHONE_WS_PATH, PHONE_TWIML_PATH, MAX_PENDING_SOCKETS, type PhoneTimers,
 } from '../src/server/phone.ts';
-import { TurnRunner, buildSteerPrompt, stripSteerFrames } from '../src/server/turns.ts';
+import { TurnRunner, buildSteerPrompt, stripSteerFrames, decomposeSteerPrompt } from '../src/server/turns.ts';
 import { makeTranscriptVerbatim } from '../src/server/verbatim.ts';
 import { phoneSecrets, phoneCapabilities, type PhoneSecrets } from '../src/config/secrets.ts';
 import { splitFencedSegments, extractPrompt } from '../src/web/prompt-card.js';
@@ -2949,6 +2949,18 @@ await reporter.leg('turns - attach-and-reinterpret: buildSteerPrompt + steer (in
   t.eq((webList.match(/open the dashboard/g) || []).length, 1, 'web: the base appears exactly once');
   t.includes(webList, 'then the logs; and the metrics', 'web: additions joined "; " in order');
 
+  // decomposeSteerPrompt is the exact inverse of the composition: a combined prompt yields
+  // the bare base + the ordered corrections; a frame-free base yields no corrections. This
+  // is what lets a correction with NO active chain (barge-in pin) keep earlier corrections.
+  for (const src of ['phone', 'web'] as const) {
+    const rt = decomposeSteerPrompt(buildSteerPrompt('deploy the app', ['to staging', 'skip the cache'], src));
+    t.eq(rt.base, 'deploy the app', `${src}: decompose(build(...)) round-trips the base`);
+    t.eq(rt.corrections.join(' | '), 'to staging | skip the cache', `${src}: decompose(build(...)) round-trips the corrections in order`);
+  }
+  const bare = decomposeSteerPrompt('just a plain utterance');
+  t.eq(bare.base, 'just a plain utterance', 'a bare base decomposes to itself');
+  t.eq(bare.corrections.length, 0, 'a bare base decomposes to NO corrections');
+
   const runs: string[] = [];
   let interrupts = 0;
   let aborts = 0;
@@ -3244,6 +3256,65 @@ await reporter.leg('turns - rapid corrections compose base + ONE frame, no re-wr
   const s = await s4;
   t.ok(s.ok && s.turn === 4, 'the final fully-merged turn is the one that completes');
   t.eq(runner.history.length, 1, 'only the final combined turn is in history (superseded re-runs left none)');
+});
+
+// F3 (barge-in over a steered re-run) - the phone barge-in cancels via cancelIfSource
+// (signal.superseded stays UNSET), so the aborted re-run resolves with a real turn number
+// and _steer drops the chain - yet the barge-in pin still carries the COMBINED prompt
+// (base + frame carrying c1). The captain's follow-up c2 arrives seconds later with NO
+// active chain: steer must DECOMPOSE the pin back into base + [c1] and append c2 - merely
+// stripping the frame silently dropped c1 from the merged prompt.
+await reporter.leg('turns - a correction after a barge-in over a steered re-run keeps earlier corrections (decompose the pin)', async (t) => {
+  const runs: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => {},
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const count = (s: string, re: RegExp): number => (s.match(re) || []).length;
+
+  const BASE = 'deploy the app';
+  const C1 = 'to staging';
+  const C2 = 'and skip the cache';
+
+  void runner.run(BASE, 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the base turn is in flight');
+  const steer1 = runner.steer(C1, 'phone');
+  t.ok(await until(() => runs.length === 2 && runner.currentPrompt === runs[1]), 'the c1-combined re-run is in flight');
+  const pinned = runner.currentPrompt; // what phone.ts pins at barge-in: the COMBINED prompt
+
+  // Barge-in: the transport cancels its own turn (superseded stays unset), the aborted
+  // re-run resolves with a real turn number, and _steer drops the chain.
+  t.ok(runner.cancelIfSource('phone', 'barge-in'), 'barge-in cancels the in-flight steered re-run');
+  const s1 = await steer1;
+  t.ok(!s1.ok && s1.turn === 2 && s1.superseded !== true, 'the barged re-run resolves as a plain abort (chain dropped)');
+  await until(() => !runner.busy);
+
+  // The follow-up correction attaches to the PIN - no active chain exists anymore.
+  const steer2 = runner.steer(C2, 'phone', { original: pinned });
+  t.ok(await until(() => runs.length === 3), 'the follow-up re-ran the merged prompt');
+  const combined = runs[2]!;
+  t.eq(count(combined, /deploy the app/g), 1, 'the base appears exactly once');
+  t.eq(count(combined, /to staging/g), 1, 'the EARLIER correction survives the barge-in (was dropped when only the frame was stripped)');
+  t.eq(count(combined, /and skip the cache/g), 1, 'the new correction appears exactly once');
+  t.eq(count(combined, /\[Correction from the captain/g), 1, 'exactly ONE frame');
+  t.includes(combined, `${C1}; ${C2}`, 'corrections joined "; " in spoken order inside the single frame');
+
+  releases[2]!();
+  const s2 = await steer2;
+  t.ok(s2.ok && s2.turn === 3, 'the fully-merged turn completes');
+  await until(() => !runner.busy);
 });
 
 // F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced

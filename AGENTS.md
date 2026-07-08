@@ -668,8 +668,12 @@ Three features that make a phone call feel like a human call (plan+decisions:
   runs). D4 holds for repeat corrections. **Composition is always base + exactly ONE frame
   carrying every correction once, in spoken order, joined "; " - it NEVER re-wraps an
   already-combined prompt** (`buildSteerPrompt` takes `string | string[]` and runs
-  `stripSteerFrames` on `original` so even a pinned/in-flight combined prompt decomposes
-  back to the bare base). This fixes the captain's LIVE 2026-07-08 four-utterance bug:
+  `stripSteerFrames` on `original`; a steer with NO active chain runs
+  `decomposeSteerPrompt` on the pinned/in-flight prompt so a combined pin yields base +
+  its PRIOR corrections - a correction after a barge-in aborted the steered re-run keeps
+  every earlier correction, never just the bare base; the frame templates and the
+  strip/parse regexes derive from SHARED lead/body constants so the emitted wording can
+  never drift from the matcher). This fixes the captain's LIVE 2026-07-08 four-utterance bug:
   rapid corrections used to stack a NEW `[Correction...]` frame each time (re-embedding the
   base and re-framing earlier corrections inside later ones) because the accumulator stored
   a combined string and was dropped at re-run start - a mid-re-run correction then re-derived
@@ -729,7 +733,9 @@ Three features that make a phone call feel like a human call (plan+decisions:
   never fires) + `turns - rapid corrections compose base + ONE frame` (the captain's LIVE
   four-utterance repro: base once, each correction once, in spoken order, inside a SINGLE
   frame - no re-wrap/duplication; plus `buildSteerPrompt` list-composition +
-  `stripSteerFrames` unit checks) + the `phone - F3` legs (merge, interrupt, re-run,
+  `stripSteerFrames`/`decomposeSteerPrompt` round-trip unit checks) + `turns - barge-in
+  over a steered re-run` (a follow-up attaching to the barge-in PIN after the chain
+  dropped decomposes it and keeps the earlier correction) + the `phone - F3` legs (merge, interrupt, re-run,
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
   steered, an utterance in the phone-leg unwind window attaches via `steerPending`
   instead of running bare ahead of the re-run, a correction merges into the pending

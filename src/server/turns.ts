@@ -84,17 +84,55 @@ export interface TurnRunnerOptions {
   log?: (msg: string) => void;
 }
 
+// The frame wording lives in these shared constants: buildSteerPrompt composes with them
+// and the strip/parse regexes below are DERIVED from them, so the emitted frame and its
+// matcher can never drift apart - a wording tweak on either side updates both at once.
+const PHONE_FRAME_LEAD = 'Correction from the captain, spoken just now';
+const PHONE_FRAME_BODY =
+  'treat this as the authoritative fix of a possible speech-to-text misread in the message above';
+const TYPED_FRAME_LEAD = 'Additional instruction from the captain, sent just now';
+const TYPED_FRAME_BODY =
+  'treat this as an addition to the message above, not a replacement of any part of it';
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // The frame-lead markers a combined prompt appends after the base (exactly one, whatever
 // the source). stripSteerFrames cuts from the first marker to the end to recover the TRUE
 // base, so a prompt that is already combined is never re-wrapped as if it were a fresh
 // base utterance - the correction-merge duplication the captain hit on a rapid
 // four-utterance call (base re-embedded, each correction re-framed inside the next).
-const STEER_FRAME_LEAD_RE =
-  /\s*\[(?:Correction from the captain, spoken just now|Additional instruction from the captain, sent just now)\b[\s\S]*$/;
+const STEER_FRAME_LEAD_RE = new RegExp(
+  `\\s*\\[(?:${escapeRe(PHONE_FRAME_LEAD)}|${escapeRe(TYPED_FRAME_LEAD)})\\b[\\s\\S]*$`,
+);
+
+// The exact inverse of the frame composition: captures the "; "-joined corrections a
+// single trailing frame carries, so a combined prompt decomposes back to base +
+// corrections[] instead of the frame's contents being discarded with the frame.
+const STEER_FRAME_PARSE_RE = new RegExp(
+  `\\s*\\[(?:${escapeRe(PHONE_FRAME_LEAD)} - ${escapeRe(PHONE_FRAME_BODY)}` +
+  `|${escapeRe(TYPED_FRAME_LEAD)} - ${escapeRe(TYPED_FRAME_BODY)}): ([\\s\\S]*)\\]\\s*$`,
+);
 
 /** Recover the true base utterance from a prompt that may already carry steer frame(s). */
 export function stripSteerFrames(prompt: string): string {
   return (prompt || '').replace(STEER_FRAME_LEAD_RE, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Decompose a prompt that may carry a steer frame back into the TRUE base utterance and
+ * the ordered corrections inside the frame. The inverse of buildSteerPrompt: a bare
+ * (frame-free) prompt yields corrections=[]. This is how a correction with NO active
+ * chain preserves the corrections a pinned/in-flight COMBINED prompt already carries
+ * (barge-in over a steered re-run drops the chain when the abort resolves the run, yet
+ * the pin still holds base + earlier corrections) - stripping the frame alone would
+ * silently lose them. Pure.
+ */
+export function decomposeSteerPrompt(prompt: string): { base: string; corrections: string[] } {
+  const base = stripSteerFrames(prompt);
+  const m = (prompt || '').match(STEER_FRAME_PARSE_RE);
+  if (!m) return { base, corrections: [] };
+  const corrections = m[1]!.split('; ').map((x) => x.trim()).filter((x) => x.length > 0);
+  return { base, corrections };
 }
 
 // Merge a follow-up utterance - or the whole ordered LIST of them across a steer chain -
@@ -121,11 +159,9 @@ export function buildSteerPrompt(
   if (!o) return c;
   if (!c) return o;
   if (source === 'phone') {
-    return `${o}  [Correction from the captain, spoken just now - treat this as the ` +
-      `authoritative fix of a possible speech-to-text misread in the message above: ${c}]`;
+    return `${o}  [${PHONE_FRAME_LEAD} - ${PHONE_FRAME_BODY}: ${c}]`;
   }
-  return `${o}  [Additional instruction from the captain, sent just now - treat this as ` +
-    `an addition to the message above, not a replacement of any part of it: ${c}]`;
+  return `${o}  [${TYPED_FRAME_LEAD} - ${TYPED_FRAME_BODY}: ${c}]`;
 }
 
 // Stage -> status mapping (moved verbatim from app.ts). synth = audio is being
@@ -370,13 +406,16 @@ export class TurnRunner {
     const foreign = this.busy && this._currentSource !== source;
     // Extend the active chain if one exists (its re-run may be in flight OR still pending
     // in the unwind window): reuse its TRUE base and append this correction in spoken
-    // order. Only when there is NO active chain is the base taken from the barge-in pin or
-    // the in-flight prompt - and stripSteerFrames (inside buildSteerPrompt too) guarantees
-    // even that is the bare base, never a combined prompt re-wrapped. So the composition is
-    // always base + ONE frame with every correction, once, in order.
+    // order. Only when there is NO active chain is the seed taken from the barge-in pin or
+    // the in-flight prompt - DECOMPOSED, not merely stripped: a barge-in over a steered
+    // re-run drops the chain when the abort resolves the run, so the pin is a COMBINED
+    // prompt whose earlier corrections must be recovered, never discarded with the frame.
+    // Either way the composition is always the bare base + ONE frame with every
+    // correction, once, in order.
     const prior = this.activeSteers.get(source) ?? null;
-    const base = prior ? prior.base : stripSteerFrames(opts.original ?? this._currentPrompt);
-    const corrections = prior ? [...prior.corrections, extra] : [extra];
+    const seed = prior ?? decomposeSteerPrompt(opts.original ?? this._currentPrompt);
+    const base = seed.base;
+    const corrections = [...seed.corrections, extra];
     const entry: SteerChain = {
       base, corrections, superseded: false,
       combined: buildSteerPrompt(base, corrections, source),
