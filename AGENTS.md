@@ -654,18 +654,30 @@ Three features that make a phone call feel like a human call (plan+decisions:
   agent. New optional `Driver.interrupt()` (`Broker.interrupt` = send `Escape` to the pane,
   guarded by the SAME "esc to interrupt" idle latch the reply tap uses) actually
   interrupts claude. `TurnRunner.steer` = abort the in-flight pipeline -> interrupt the
-  agent -> wait for it to unwind -> re-run `buildSteerPrompt(original, correction, source)`
-  (ONE line, original verbatim; SOURCE-AWARE framing: a SPOKEN phone correction is the
+  agent -> wait for it to unwind -> re-run `buildSteerPrompt(base, corrections[], source)`
+  (ONE line, base verbatim; SOURCE-AWARE framing: a SPOKEN phone correction is the
   authoritative fix of a possible STT misread (D3), a typed web/SMS follow-up is an
   ADDITION that never invites replacing the original). The abort + the combined-prompt
   build happen at steer() REQUEST time (before the serialized `steerChain` entry runs),
-  and the runner keeps a per-source `pendingSteers` MERGE-TARGET accumulator (the
-  combined prompt each pending re-run WILL inject, removed the moment that run starts):
-  a SECOND correction merges onto base + all prior corrections wherever it lands - DURING
-  the steered re-run (breaks that run's await immediately) or during the UNWIND window
-  before the re-run starts (supersedes the stale pending entry so it never fires; only
-  the fully-merged turn runs). D4 holds for repeat corrections; the nested framing on
-  the re-merged prompt is an accepted tradeoff. An aborted-for-steer turn leaves NO
+  and the runner keeps a per-source `activeSteers` accumulator that tracks the TRUE base
+  utterance + the ORDERED list of corrections (NOT a pre-baked combined string). It lives
+  for the WHOLE chain - it is NOT dropped when a re-run starts - so a SECOND correction
+  merges onto base + all prior corrections wherever it lands: DURING the steered re-run
+  (breaks that run's await immediately) or during the UNWIND window before the re-run
+  starts (supersedes the stale pending entry so it never fires; only the fully-merged turn
+  runs). D4 holds for repeat corrections. **Composition is always base + exactly ONE frame
+  carrying every correction once, in spoken order, joined "; " - it NEVER re-wraps an
+  already-combined prompt** (`buildSteerPrompt` takes `string | string[]` and runs
+  `stripSteerFrames` on `original`; a steer with NO active chain runs
+  `decomposeSteerPrompt` on the pinned/in-flight prompt so a combined pin yields base +
+  its PRIOR corrections - a correction after a barge-in aborted the steered re-run keeps
+  every earlier correction, never just the bare base; the frame templates and the
+  strip/parse regexes derive from SHARED lead/body constants so the emitted wording can
+  never drift from the matcher). This fixes the captain's LIVE 2026-07-08 four-utterance bug:
+  rapid corrections used to stack a NEW `[Correction...]` frame each time (re-embedding the
+  base and re-framing earlier corrections inside later ones) because the accumulator stored
+  a combined string and was dropped at re-run start - a mid-re-run correction then re-derived
+  its base from the combined in-flight prompt. An aborted-for-steer turn leaves NO
   history/turn-done (no double-speak - it returns before recording) and resolves
   `TurnResult.superseded` - NOT a failure (a superseded never-ran pending steer resolves
   `superseded` with turn 0) - so text.ts's `handleInbound` stays silent for it instead of
@@ -702,7 +714,7 @@ Three features that make a phone call feel like a human call (plan+decisions:
   the combined re-run (which would then override it). With a phone steer pending,
   `fireSteer` takes the foreign-busy submit fallback ONLY when `steerPending` is 0: a
   correction landing while a foreign turn transiently holds the unwind-window lock merges
-  onto the pending phone entry via `runner.steer` (which queues behind the foreign turn
+  onto the active phone chain via `runner.steer` (which queues behind the foreign turn
   without touching it), never a bare submit racing the re-run. Web routes `send` through
   `submitOrSteer`; SMS `runWhenFree` attaches a
   same-source follow-up but waits on a phone/web turn. D5 (a correction is NEVER lost):
@@ -718,7 +730,12 @@ Three features that make a phone call feel like a human call (plan+decisions:
   correction` (a correction DURING a steered re-run merges immediately and the superseded
   turns report `superseded`) + `turns - unwind window` (a second correction landing while
   the aborted turn is still unwinding merges base + c1 + c2 and the stale pending re-run
-  never fires) + the `phone - F3` legs (merge, interrupt, re-run,
+  never fires) + `turns - rapid corrections compose base + ONE frame` (the captain's LIVE
+  four-utterance repro: base once, each correction once, in spoken order, inside a SINGLE
+  frame - no re-wrap/duplication; plus `buildSteerPrompt` list-composition +
+  `stripSteerFrames`/`decomposeSteerPrompt` round-trip unit checks) + `turns - barge-in
+  over a steered re-run` (a follow-up attaching to the barge-in PIN after the chain
+  dropped decomposes it and keeps the earlier correction) + the `phone - F3` legs (merge, interrupt, re-run,
   same-source-only, queue fallback, barge-in pin, foreign-source turns queued not
   steered, an utterance in the phone-leg unwind window attaches via `steerPending`
   instead of running bare ahead of the re-run, a correction merges into the pending
