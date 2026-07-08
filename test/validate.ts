@@ -101,7 +101,7 @@ import {
   createPhoneApp, pruneExpiredTokens, DEFAULT_PHRASES, DEFAULT_PROMPT_POLICY, DEFAULT_FILLER,
   PHONE_WS_PATH, PHONE_TWIML_PATH, MAX_PENDING_SOCKETS, type PhoneTimers,
 } from '../src/server/phone.ts';
-import { TurnRunner, buildSteerPrompt } from '../src/server/turns.ts';
+import { TurnRunner, buildSteerPrompt, stripSteerFrames } from '../src/server/turns.ts';
 import { makeTranscriptVerbatim } from '../src/server/verbatim.ts';
 import { phoneSecrets, phoneCapabilities, type PhoneSecrets } from '../src/config/secrets.ts';
 import { splitFencedSegments, extractPrompt } from '../src/web/prompt-card.js';
@@ -2929,6 +2929,26 @@ await reporter.leg('turns - attach-and-reinterpret: buildSteerPrompt + steer (in
   t.eq(buildSteerPrompt('', 'x', 'phone'), 'x', 'no original -> just the correction');
   t.eq(buildSteerPrompt('o', '', 'phone'), 'o', 'no correction -> just the original');
 
+  // A whole ORDERED LIST of corrections composes into ONE frame joined "; " in order -
+  // never a frame per correction (the duplication the captain hit on rapid corrections).
+  const listMerged = buildSteerPrompt('deploy the app', ['to staging', 'the blue env', 'skip the cache'], 'phone');
+  t.eq((listMerged.match(/\[Correction from the captain/g) || []).length, 1, 'a list of corrections -> exactly ONE frame');
+  t.eq((listMerged.match(/deploy the app/g) || []).length, 1, 'the base appears exactly once');
+  t.includes(listMerged, 'to staging; the blue env; skip the cache', 'corrections joined "; " in spoken order');
+  // stripSteerFrames recovers the true base, so an already-combined prompt is NEVER
+  // re-wrapped as a fresh base (base stays single, corrections accumulate in one frame).
+  t.eq(stripSteerFrames(listMerged), 'deploy the app', 'stripSteerFrames recovers the bare base from a combined prompt');
+  t.eq(stripSteerFrames('just a plain utterance'), 'just a plain utterance', 'stripSteerFrames leaves a frame-free base untouched');
+  const reWrapped = buildSteerPrompt(listMerged, 'and one more thing', 'phone');
+  t.eq((reWrapped.match(/\[Correction from the captain/g) || []).length, 1, 're-wrapping a combined prompt still yields ONE frame');
+  t.eq((reWrapped.match(/deploy the app/g) || []).length, 1, 're-wrapping never duplicates the base');
+  // The single-frame composition applies to EVERY source; only the frame TEXT is
+  // source-aware (a typed follow-up is an ADDITION, not an STT-misread correction).
+  const webList = buildSteerPrompt('open the dashboard', ['then the logs', 'and the metrics'], 'web');
+  t.eq((webList.match(/\[Additional instruction from the captain/g) || []).length, 1, 'web: a list -> exactly ONE addition frame');
+  t.eq((webList.match(/open the dashboard/g) || []).length, 1, 'web: the base appears exactly once');
+  t.includes(webList, 'then the logs; and the metrics', 'web: additions joined "; " in order');
+
   const runs: string[] = [];
   let interrupts = 0;
   let aborts = 0;
@@ -3161,6 +3181,69 @@ await reporter.leg('turns - a second correction during the unwind window keeps t
   await until(() => !runner.busy);
   t.eq(runs.length, 2, 'no stale or bare re-run ever fired - only base, then base + c1 + c2');
   t.eq(runner.history.length, 1, 'only the merged turn is in history');
+});
+
+// F3 (correction-merge composition) - the captain's LIVE four-utterance bug (2026-07-08):
+// four quick spoken corrections on a call produced a nested, duplicated prompt because each
+// steer re-wrapped the previous COMBINED prompt as its "original" - stacking a new
+// [Correction...] frame every time and re-deriving the base from the combined in-flight
+// prompt once the pending entry was dropped at re-run start. The chain must instead track
+// the TRUE base + an ORDERED list of corrections: the composed prompt is ALWAYS base once +
+// ONE frame with every correction once, in spoken order (joined "; "). Reproduced here with
+// each correction landing DURING the prior steered re-run - the exact snowball interleave.
+await reporter.leg('turns - rapid corrections compose base + ONE frame, no re-wrap (captain 4-utterance repro)', async (t) => {
+  const runs: string[] = [];
+  const releases: Array<() => void> = [];
+  const driver: Driver = {
+    meta: () => ({ ttsMode: 'mock', ttsVoice: 'mock tone', speakBackend: 'mock', sampleRate: 8000 }),
+    start: async () => {},
+    interrupt: async () => {},
+    // Stay in flight until aborted, so each new correction lands DURING the prior steered
+    // re-run (the interleave that stacked a frame per correction in the bug).
+    send: (text, _i, hooks) => new Promise((resolve) => {
+      runs.push(text);
+      let iv: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => { if (iv) clearInterval(iv); resolve({ reply: 'r', narration: 'ok', speakBackend: 'mock', audio: { pcm: Buffer.alloc(0), sampleRate: 8000, ttfbMs: null, bytes: 0 }, chunks: 0 }); };
+      releases.push(done);
+      iv = setInterval(() => { if (hooks.signal?.aborted) done(); }, 5);
+    }),
+    terminalSnapshot: () => '',
+    stop: async () => {},
+  };
+  const runner = new TurnRunner({ driver });
+  const count = (s: string, re: RegExp): number => (s.match(re) || []).length;
+
+  // The captain's exact four utterances.
+  const BASE = 'Okay, nice.';
+  const C1 = "It looks like it's working, so I can use this.";
+  const C2 = 'Thank you.';
+  const C3 = 'Do some software development.';
+
+  void runner.run(BASE, 'phone');
+  t.ok(await until(() => runner.busy && runs.length === 1), 'the base utterance is in flight');
+  void runner.steer(C1, 'phone');
+  t.ok(await until(() => runs.length === 2 && runner.currentPrompt === runs[1]), 'first correction re-ran the combined prompt');
+  void runner.steer(C2, 'phone'); // lands DURING the C1 re-run (an already-steered re-run)
+  t.ok(await until(() => runs.length === 3 && runner.currentPrompt === runs[2]), 'second correction attached to the already-steered re-run');
+  const s4 = runner.steer(C3, 'phone'); // lands DURING the C2 re-run
+  t.ok(await until(() => runs.length === 4 && runner.currentPrompt === runs[3]), 'third correction attached to the already-steered re-run');
+
+  const combined = runs[3]!;
+  t.eq(count(combined, /Okay, nice\./g), 1, 'the base appears EXACTLY once (was re-embedded repeatedly in the bug)');
+  t.eq(count(combined, /It looks like it's working/g), 1, 'correction 1 appears exactly once');
+  t.eq(count(combined, /Thank you\./g), 1, 'correction 2 appears exactly once');
+  t.eq(count(combined, /Do some software development\./g), 1, 'correction 3 appears exactly once');
+  t.eq(count(combined, /\[Correction from the captain/g), 1, 'exactly ONE correction frame (was one frame per correction)');
+  t.ok(!combined.includes('\n'), 'still ONE line (fm-send submits on newline)');
+  const iBase = combined.indexOf(BASE), i1 = combined.indexOf(C1), i2 = combined.indexOf(C2), i3 = combined.indexOf(C3);
+  t.ok(iBase < i1 && i1 < i2 && i2 < i3, 'base then corrections in spoken order');
+  t.includes(combined, `${C1}; ${C2}; ${C3}`, 'corrections joined "; " inside the single frame');
+
+  releases.forEach((fn) => fn());
+  await until(() => !runner.busy);
+  const s = await s4;
+  t.ok(s.ok && s.turn === 4, 'the final fully-merged turn is the one that completes');
+  t.eq(runner.history.length, 1, 'only the final combined turn is in history (superseded re-runs left none)');
 });
 
 // F3 (phone happy-path) - a follow-up utterance while the turn is thinking is coalesced

@@ -43,6 +43,17 @@ export interface TurnResult {
   superseded?: boolean;
 }
 
+// The active attach-and-reinterpret chain for one transport: the TRUE base utterance and
+// the ordered corrections merged into it. `combined` is the single-frame prompt the re-run
+// injects (base + one frame, corrections joined "; "). `superseded` marks a chain a newer
+// correction re-merged - its pending/in-flight re-run must not fire.
+interface SteerChain {
+  base: string;
+  corrections: string[];
+  combined: string;
+  superseded: boolean;
+}
+
 export interface TurnRecord {
   turn: number;
   source: TurnSource;
@@ -73,15 +84,40 @@ export interface TurnRunnerOptions {
   log?: (msg: string) => void;
 }
 
-// Merge a follow-up utterance into the in-flight prompt for attach-and-reinterpret
-// (Feature 3, captain decision D3: keep the original verbatim). ONE line - the broker
-// submits via fm-send, where an embedded newline would split the message. Source-aware:
-// only a SPOKEN (phone/STT) follow-up is framed as the authoritative fix of a possible
-// speech-to-text misread; a typed web/SMS follow-up has no STT to misread, so it is
-// framed as an ADDITION that must not invite rewriting the original. Pure.
-export function buildSteerPrompt(original: string, correction: string, source: TurnSource): string {
-  const o = (original || '').replace(/\s+/g, ' ').trim();
-  const c = (correction || '').replace(/\s+/g, ' ').trim();
+// The frame-lead markers a combined prompt appends after the base (exactly one, whatever
+// the source). stripSteerFrames cuts from the first marker to the end to recover the TRUE
+// base, so a prompt that is already combined is never re-wrapped as if it were a fresh
+// base utterance - the correction-merge duplication the captain hit on a rapid
+// four-utterance call (base re-embedded, each correction re-framed inside the next).
+const STEER_FRAME_LEAD_RE =
+  /\s*\[(?:Correction from the captain, spoken just now|Additional instruction from the captain, sent just now)\b[\s\S]*$/;
+
+/** Recover the true base utterance from a prompt that may already carry steer frame(s). */
+export function stripSteerFrames(prompt: string): string {
+  return (prompt || '').replace(STEER_FRAME_LEAD_RE, '').replace(/\s+/g, ' ').trim();
+}
+
+// Merge a follow-up utterance - or the whole ordered LIST of them across a steer chain -
+// into the in-flight prompt for attach-and-reinterpret (Feature 3, captain decision D3:
+// keep the original verbatim). The composition is ALWAYS the true base + exactly ONE frame
+// carrying the corrections in spoken order (joined "; "); the base is stripped of any
+// existing frame first, so it NEVER re-wraps an already-combined prompt. However many rapid
+// corrections arrive and however they interleave with steered re-runs, the base appears
+// once and each correction once inside a single frame. ONE line - the broker submits via
+// fm-send, where an embedded newline would split the message. Source-aware: only a SPOKEN
+// (phone/STT) follow-up is framed as the authoritative fix of a possible speech-to-text
+// misread; a typed web/SMS follow-up has no STT to misread, so it is framed as an ADDITION
+// that must not invite rewriting the original. Pure.
+export function buildSteerPrompt(
+  original: string,
+  correction: string | string[],
+  source: TurnSource,
+): string {
+  const o = stripSteerFrames(original);
+  const c = (Array.isArray(correction) ? correction : [correction])
+    .map((x) => (x || '').replace(/\s+/g, ' ').trim())
+    .filter((x) => x.length > 0)
+    .join('; ');
   if (!o) return c;
   if (!c) return o;
   if (source === 'phone') {
@@ -121,13 +157,15 @@ export class TurnRunner {
   private _currentSource: TurnSource | null = null;
   // Serialize steers so two rapid corrections can't both interrupt+re-run at once.
   private steerChain: Promise<TurnResult> = Promise.resolve({ ok: false, turn: 0 });
-  // The merge-target accumulator: one pending steer per source, holding the combined
-  // prompt its re-run WILL inject. A correction arriving while the aborted turn is
-  // still unwinding (before the re-run starts, so _currentPrompt is the stale base)
-  // merges onto THIS instead - base + all prior corrections, never just the base -
-  // and marks the stale entry superseded so its re-run never fires (D4). The entry
-  // is removed the moment its run starts (from then on _currentPrompt covers it).
-  private pendingSteers = new Map<TurnSource, { combined: string; superseded: boolean }>();
+  // The active steer chain per source: the TRUE base utterance + the ordered list of
+  // corrections merged into it. It lives for the WHOLE lifetime of the chain - it is NOT
+  // dropped when a re-run starts. So a correction arriving mid-re-run, or while the aborted
+  // turn is still unwinding, extends the SAME base + list (marking the stale entry
+  // superseded so its re-run never fires, D4) instead of re-deriving the base from the
+  // already-combined in-flight prompt - which stacked another frame each time (the
+  // duplication the captain hit). Removed only when its final turn settles un-superseded,
+  // so submitOrSteer then routes a fresh utterance to run() rather than a stale attach.
+  private activeSteers = new Map<TurnSource, SteerChain>();
 
   busy = false;
   history: TurnRecord[] = [];
@@ -330,17 +368,23 @@ export class TurnRunner {
     // SAME-SOURCE only: a turn started by a DIFFERENT transport is never cancelled or
     // interrupted from here - the combined prompt just queues behind it (_steer's wait).
     const foreign = this.busy && this._currentSource !== source;
-    // Merge target: a same-source PENDING re-run's combined prompt beats everything (it
-    // already holds base + prior corrections; the pin and _currentPrompt would both be
-    // the stale base during the unwind window), then the barge-in pin, then the
-    // in-flight prompt. Empty -> nothing to attach to, just a fresh turn.
-    const prior = this.pendingSteers.get(source) ?? null;
-    const base = prior?.combined ?? opts.original ?? this._currentPrompt;
-    const entry = { combined: buildSteerPrompt(base, extra, source), superseded: false };
-    // The new correction re-merges everything the stale pending re-run carried, so
-    // that re-run must never fire - it would re-answer an outdated prompt.
+    // Extend the active chain if one exists (its re-run may be in flight OR still pending
+    // in the unwind window): reuse its TRUE base and append this correction in spoken
+    // order. Only when there is NO active chain is the base taken from the barge-in pin or
+    // the in-flight prompt - and stripSteerFrames (inside buildSteerPrompt too) guarantees
+    // even that is the bare base, never a combined prompt re-wrapped. So the composition is
+    // always base + ONE frame with every correction, once, in order.
+    const prior = this.activeSteers.get(source) ?? null;
+    const base = prior ? prior.base : stripSteerFrames(opts.original ?? this._currentPrompt);
+    const corrections = prior ? [...prior.corrections, extra] : [extra];
+    const entry: SteerChain = {
+      base, corrections, superseded: false,
+      combined: buildSteerPrompt(base, corrections, source),
+    };
+    // The new correction re-merges everything the prior chain carried, so its
+    // pending/in-flight re-run must never fire - it would re-answer an outdated prompt.
     if (prior) prior.superseded = true;
-    this.pendingSteers.set(source, entry);
+    this.activeSteers.set(source, entry);
     if (this.busy && !foreign && this.currentSignal && !this.currentSignal.aborted) {
       // Stop speaking the in-flight reply NOW (pipeline abort), marked as deliberately
       // superseded so its transport never mistakes the abort for a failure.
@@ -354,7 +398,7 @@ export class TurnRunner {
   }
 
   private async _steer(
-    entry: { combined: string; superseded: boolean },
+    entry: SteerChain,
     source: TurnSource,
     opts: { interrupt: boolean },
   ): Promise<TurnResult> {
@@ -384,12 +428,22 @@ export class TurnRunner {
         continue;
       }
       if (entry.superseded) return { ok: false, turn: 0, superseded: true };
-      if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
+      // Keep this chain in the map DURING its re-run: a correction landing mid-re-run
+      // finds it (prior) and extends the SAME base + list, never re-deriving the base from
+      // the combined in-flight prompt. It is removed only once the re-run settles below.
       const r = await this.run(entry.combined, source);
-      if (r.turn !== 0) return r; // it actually ran - done (lost lock races retry)
+      if (r.turn !== 0) {
+        // The re-run actually ran. Drop the chain iff it is still the active one and was
+        // not superseded mid-flight (a newer correction already replaced it in the map and
+        // owns the follow-on re-run). A lost-lock race returns turn 0 -> retry.
+        if (!entry.superseded && this.activeSteers.get(source) === entry) {
+          this.activeSteers.delete(source);
+        }
+        return r; // it actually ran - done (lost lock races retry)
+      }
     }
     this.log('steer: the prior turn never unwound - the correction could not run');
-    if (this.pendingSteers.get(source) === entry) this.pendingSteers.delete(source);
+    if (this.activeSteers.get(source) === entry) this.activeSteers.delete(source);
     this.emit({ type: 'error', message: 'could not apply the follow-up - the previous turn never finished unwinding' });
     return { ok: false, turn: 0 };
   }
@@ -403,7 +457,7 @@ export class TurnRunner {
    * directly for its own barge-in/coalesce path.
    */
   submitOrSteer(text: string, source: TurnSource): Promise<TurnResult> {
-    if ((this.busy && this._currentSource === source) || this.pendingSteers.has(source)) {
+    if ((this.busy && this._currentSource === source) || this.activeSteers.has(source)) {
       return this.steer(text, source);
     }
     return this.run(text, source);
